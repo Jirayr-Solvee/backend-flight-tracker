@@ -17,19 +17,6 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-# TODO: remove
-@router.get("/")
-def get_all_users(session: Session = Depends(get_session)):
-    users = session.exec(select(User)).all()
-    return users
-
-
-@router.get("/devices")
-def get_all_users_devices(session: Session = Depends(get_session)):
-    users = session.exec(select(Device)).all()
-    return users
-
-
 @router.get("/me/flights", response_model=list[FlightRead])
 def get_user_flights(user: User = Depends(get_current_user)):
     return user.flights

@@ -1,7 +1,6 @@
 import logging
 
-from fastapi import (APIRouter, BackgroundTasks, Depends, HTTPException, Query,
-                     status)
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlmodel import Session, select
 
 from ..background_tasks import create_webhook_for_flight
@@ -16,58 +15,6 @@ from ..utils import user_has_active_subscription
 router = APIRouter()
 
 logger = logging.getLogger(__name__)
-
-
-# TODO: delete
-@router.get("/", summary="List all flights from DB", response_model=list[FlightRead])
-def list_flights(session: Session = Depends(get_session)):
-    try:
-        flights = session.exec(select(Flight)).all()
-        return flights
-    except Exception:
-        session.rollback()
-        logger.exception(f"Unable to fetch all flights from db")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal server error",
-        )
-
-
-@router.get("/all", summary="List all flights from DB")
-def list_flights(session: Session = Depends(get_session)):
-    try:
-        flights = session.exec(select(Flight)).all()
-        return flights
-    except Exception:
-        session.rollback()
-        logger.exception(f"Unable to fetch all flights from db")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal server error",
-        )
-
-
-@router.get("/11", summary="List all flights from DB")
-def list_flights2(session: Session = Depends(get_session)):
-    try:
-        status_1 = ""
-        status_2 = ""
-
-        f = session.get(Flight, 1)
-        status_1 = f.status
-
-        f.status = "Unkown"
-
-        flights = session.exec(select(Flight)).all()
-
-        return {"old_status": status_1, "hopfully_updated": [f.status for f in flights]}
-    except Exception:
-        session.rollback()
-        logger.exception(f"Unable to fetch all flights from db")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal server error",
-        )
 
 
 @router.delete("/{flight_id}/delete", response_model=dict)
