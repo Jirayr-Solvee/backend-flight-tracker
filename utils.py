@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
@@ -35,9 +34,9 @@ def has_passed(time_str: str) -> bool:
 def get_s3_client() -> S3Client:
     return boto3.client(
         "s3",
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.getenv("AWS_REGION"),
+        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+        region_name=settings.AWS_REGION,
     )
 
 
