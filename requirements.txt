@@ -37,6 +37,7 @@ google-resumable-media==2.8.0
 googleapis-common-protos==1.72.0
 grpcio==1.76.0
 grpcio-status==1.76.0
+gunicorn==25.1.0
 h11==0.16.0
 h2==4.3.0
 hpack==4.1.0
@@ -52,12 +53,14 @@ MarkupSafe==3.0.3
 mdurl==0.1.2
 msgpack==1.1.2
 mypy-boto3-s3==1.42.37
+packaging==26.0
 proto-plus==1.26.1
 protobuf==6.33.1
 pyasn1==0.6.1
 pyasn1_modules==0.4.2
 pycparser==2.23
 pydantic==2.12.5
+pydantic-settings==2.13.1
 pydantic_core==2.41.5
 Pygments==2.19.2
 PyJWT==2.10.1
