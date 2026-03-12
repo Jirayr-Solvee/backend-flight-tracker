@@ -18,15 +18,23 @@ ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 with open(settings.APN_KEY_PATH, "r") as f:
     key_content = f.read()
 
-apns_client = APNs(
-    key=key_content,
-    key_id=settings.KEY_ID,
-    team_id=settings.TEAM_ID,
-    topic=settings.BUNDLE_ID,
-    use_sandbox=False,
-    ssl_context=ssl_ctx,
-)
+apns_client: APNs | None = None
 
+
+def get_apns_client() -> APNs:
+    global apns_client
+
+    if apns_client is None:
+        apns_client = APNs(
+            key=key_content,
+            key_id=settings.KEY_ID,
+            team_id=settings.TEAM_ID,
+            topic=settings.BUNDLE_ID,
+            use_sandbox=False,
+            ssl_context=ssl_ctx,
+        )
+
+    return apns_client
 
 class ApnService:
     """
@@ -56,7 +64,7 @@ class ApnService:
             push_type=PushType.ALERT,
         )
 
-        await apns_client.send_notification(request)
+        await get_apns_client().send_notification(request)
 
     @staticmethod
     async def send_multiple_push_notification(notification_batch: NotificationBatch):
@@ -81,7 +89,7 @@ class ApnService:
                 time_to_live=3600,
                 push_type=PushType.ALERT,
             )
-            tasks.append(apns_client.send_notification(request))
+            tasks.append(get_apns_client().send_notification(request))
 
         if not tasks:
             return

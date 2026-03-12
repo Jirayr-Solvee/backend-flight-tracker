@@ -9,7 +9,7 @@ from typing import Any, Dict
 import boto3
 import fitz
 import jwt
-import requests
+import httpx
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from jwt.algorithms import RSAAlgorithm
 from mypy_boto3_s3 import S3Client
@@ -19,16 +19,6 @@ from .models.email import EmailRead
 from .models.user import User
 
 logger = logging.getLogger(__name__)
-
-
-def has_passed(time_str: str) -> bool:
-    """
-    Check if a UTC datetime is in the past.
-    """
-    dt = datetime.strptime(time_str, "%Y-%m-%d %H:%MZ").replace(tzinfo=timezone.utc)
-    now = datetime.now(timezone.utc)
-
-    return dt < now
 
 
 def get_s3_client() -> S3Client:
@@ -167,9 +157,10 @@ def calculate_premium_valid_until(
     return int(final_expiration.timestamp() * 1000)
 
 
-def verify_apple_identity_token(identity_token: str) -> dict:
-    # 1️⃣ Get Apple public keys
-    apple_keys = requests.get(settings.APPLE_KEYS_URL).json()["keys"]
+async def verify_apple_identity_token(identity_token: str) -> dict:
+    async with httpx.AsyncClient() as client:
+        response = await client.get(settings.APPLE_KEYS_URL)
+        apple_keys = response.json()["keys"]
 
     # 2️⃣ Decode header to find the correct key
     header = jwt.get_unverified_header(identity_token)

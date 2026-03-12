@@ -83,6 +83,10 @@ class FlightPersistence:
             for f in flights:
                 if not f.airline:
                     continue
+                
+                # there is a tempo bug on aerodatabox
+                if f.airline.iata:
+                    airline_iata = f.airline.iata
 
                 if airline_name == "" and f.airline.name:
                     airline_name = f.airline.name

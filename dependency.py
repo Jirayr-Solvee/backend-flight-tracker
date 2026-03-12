@@ -8,6 +8,9 @@ from .config import settings
 from .models import get_session
 from .models.user import User
 from .utils import decode_jwt
+import logging
+
+logger = logging.getLogger(__name__)
 
 user_security = HTTPBearer(
     scheme_name="User Bearer Token", description="Enter your firebase Bearer token"
@@ -37,6 +40,7 @@ def get_current_user(
         uid = decoded_token.get("sub")
 
         if not uid:
+            logger.warning(f"Invalid JWT without a uid, decoded token={decoded_token}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Authorization required",
@@ -45,13 +49,14 @@ def get_current_user(
         # get user
         user = session.get(User, uid)
 
-        if user:
-            return user
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authorization required",
-        )
+        if not user:
+            logger.warning(f"Unable to find user with id={uid}, decoded token={decoded_token}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authorization required",
+            )
+    
+        return user
     except Exception:
         session.rollback()
         raise HTTPException(

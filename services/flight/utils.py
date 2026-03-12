@@ -17,11 +17,11 @@ def append_iatas(
                     iata=iata
                 )
                 new_flights_list.append(f)
-        return flights
+        return new_flights_list
     else:
         # append iata into arrivals
         for f in flights:
             if f.departure and f.arrival:
                 f.arrival.airport = AerodataboxAirportDetailForAirportResult(iata=iata)
                 new_flights_list.append(f)
-        return flights
+        return new_flights_list
