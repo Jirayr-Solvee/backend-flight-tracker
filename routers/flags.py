@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 
 from ..dependency import get_current_user
+import re
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -22,6 +23,11 @@ async def get_flag(country_code: str):
     Get country flag from flags dir based on provided country code in two letter format eg: MA
     """
     try:
+        COUNTRY_CODE_PATTERN = re.compile(r"^[a-zA-Z]{2}$")
+
+        if not COUNTRY_CODE_PATTERN.match(country_code):
+            raise HTTPException(status_code=400, detail="Invalid code")
+
         filename = f"{country_code.lower()}.png"
         file_path = os.path.join(FLAGS_DIR, filename)
 
