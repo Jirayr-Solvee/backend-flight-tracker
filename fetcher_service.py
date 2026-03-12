@@ -131,7 +131,7 @@ class AerodataboxFetcherService:
                 )
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    async def delete_webhook(self, subscription_id: str) -> bool:
+    async def delete_webhook(self, subscription_id: str) -> dict:
         """
         Delete webhook subscription
         """
@@ -146,7 +146,7 @@ class AerodataboxFetcherService:
                     )
                     raise HTTPException(status_code=response.status_code)
 
-                raise HTTPException(status_code=status.HTTP_200_OK)
+                return {"detail": "deleted"}
             except HTTPException:
                 raise
             except Exception:
