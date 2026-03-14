@@ -119,14 +119,9 @@ backend for ios flight tracker app, restfull api that relays on fastapi and sqli
 
     ```
     - Check the detailed setup guide [AWS Setup PDF](docs/aws-setup.pdf)
-3. **Prepare Firebase service:**
-
-    - **Prerequisite**: Firebase initial setup already done (check ios repo)
-
-    - go to firebase console → select your project → project settings → service accounts → Click on **Generate new private key** button ![1](docs/assets/1.png) ![2](docs/assets/2.png)
-
-    - rename downloaded private key to **serviceAccountKey.json** → move it to the root of this project ![3](docs/assets/3.png)
-4. **Prepare local project:**
+3. **Prepare local project:**
+    - Pre-request: move **AppleRoot.cer** and **AuthKey_R7G482Y6WP.p8** to root folder
+    
     - Python virtual environment
     ``` bash
     python3 -m venv venv
@@ -143,9 +138,11 @@ backend for ios flight tracker app, restfull api that relays on fastapi and sqli
 
     vi .env      # fill each env with its value
     ```
-    - Start dev server:
+    - Start dev server (fetcher server on port 8001 otherwise add correct port in .env):
     ```
-    fastapi dev main.py
+    fastapi dev main.py --port 8000
+
+    fastapi dev fetcher_service.py --port 8001
     ```
 
 ### Deployment ( using nginx )
