@@ -42,6 +42,22 @@ class ApnService:
     """
 
     @staticmethod
+    async def send_silent_push_notification(apn_token: str):
+        request = NotificationRequest(
+            device_token=apn_token,
+            message={
+                "aps": {
+                    "content-available": 1
+                }
+            },
+            notification_id=str(uuid.uuid4()),
+            time_to_live=3600,
+            push_type=PushType.BACKGROUND,
+        )
+
+        await get_apns_client().send_notification(request)
+
+    @staticmethod
     async def send_single_push_notification(
         notification: Notification, fcm_token: str, badge_count: int
     ):
@@ -110,7 +126,7 @@ class ApnService:
             .join(Flight)  # type: ignore
             .where(
                 Flight.id == flight_id,
-                Device.apn_token != None,
+                Device.apn_token.is_not(None), # type: ignore
                 Device.apn_token_active == True,
                 Device.user_id == User.id,
                 UserFlightLink.user_id == User.id,
