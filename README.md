@@ -146,9 +146,9 @@ backend for ios flight tracker app, restfull api that relays on fastapi and sqli
 
     # prod
     gunicorn -k uvicorn.workers.UvicornWorker -w 4 core.main:app
-    gunicorn -k uvicorn.workers.UvicornWorker -w 4 core.fetcher_service:app # try it on linux first
+    gunicorn -k uvicorn.workers.UvicornWorker -w 1 -b 0.0.0.0:8001 core.fetcher_service:app # works on linux
 
-    # in case above produce same infinite loop on linux use uvicorn temporary
+    # use in macos temporary
     uvicorn core.fetcher_service:app --host 127.0.0.1 --port 8001
     ```
 
