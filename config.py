@@ -53,5 +53,7 @@ class Settings(BaseSettings):
     APN_KEY_PATH: str
     APPLE_ROOT_CERT_PATH: str
 
+    AIRLINE_MAP_JSON: str
+
 
 settings = Settings()  # type: ignore
