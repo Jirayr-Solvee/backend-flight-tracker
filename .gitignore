@@ -210,3 +210,7 @@ __marimo__/
 database.db
 .DS_Store
 app.log
+.env
+
+AuthKey_R7G482Y6WP.p8
+AppleRoot.cer

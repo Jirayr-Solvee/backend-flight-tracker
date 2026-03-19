@@ -140,9 +140,16 @@ backend for ios flight tracker app, restfull api that relays on fastapi and sqli
     ```
     - Start dev server (fetcher server on port 8001 otherwise add correct port in .env):
     ```
-    fastapi dev main.py --port 8000
+    # dev
+    fastapi dev core/main.py --port 8000
+    fastapi dev core/fetcher_service.py --port 8001
 
-    fastapi dev fetcher_service.py --port 8001
+    # prod
+    gunicorn -k uvicorn.workers.UvicornWorker -w 4 core.main:app
+    gunicorn -k uvicorn.workers.UvicornWorker -w 4 core.fetcher_service:app # try it on linux first
+
+    # in case above produce same infinite loop on linux use uvicorn temporary
+    uvicorn core.fetcher_service:app --host 127.0.0.1 --port 8001
     ```
 
 ### Deployment ( using nginx )
