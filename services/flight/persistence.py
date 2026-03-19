@@ -2,7 +2,7 @@ import json
 import logging
 from typing import Sequence
 
-from sqlmodel import Session, select
+from sqlmodel import Session, select, case
 
 from ...models.aerodatabox import (
     AerodataboxAirport, AerodataboxFlight,
@@ -256,3 +256,40 @@ class FlightPersistence:
 
         for key, val in fields.items():
             setattr(db_obj, key, val)
+    
+    @staticmethod
+    def get_random_flight(session: Session) -> Flight | None:
+        STATUSES_PRIORITY: list[str] = [
+            "Expected",
+            "CheckIn",
+            "Boarding",
+            "GateClosed",
+            "Departed",
+            "EnRoute",
+            "Approaching",
+        ]
+
+        status_priority = case(
+            {status: i for i, status in enumerate(STATUSES_PRIORITY)},
+            value=Flight.status,
+            else_=100,
+        )
+
+        live_score = case(
+            (
+                (Departure.quality.like("%live%")) &
+                (Arrival.quality.like("%live%")),
+                0,
+            ),
+            else_=1,
+        )
+
+        statement = (
+            select(Flight)
+            .where(Flight.status.in_(STATUSES_PRIORITY)) # type: ignore
+            .join(Departure, isouter=True)
+            .join(Arrival, isouter=True)
+            .order_by(live_score, status_priority)
+        )
+
+        return session.exec(statement).first()

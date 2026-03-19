@@ -37,6 +37,10 @@ REQUIRED_FIELDS: dict[str, FunctionDefinition] = {
         ],
         handler=FlightQueryHandler.extract_flight_info_via_airport_single_derection,
     ),
+    "extract_random_flight": FunctionDefinition(
+        required_fields=["random"],
+        handler=FlightQueryHandler.extract_random_flight,
+    ),
 }
 
 # a single config to see where a flight is going into
@@ -95,6 +99,24 @@ extract_flight_function = FunctionDeclaration(
             ),
         },
         required=REQUIRED_FIELDS["extract_flight_info"].required_fields,
+    ),
+)
+
+extract_random_flight_function = FunctionDeclaration(
+    name="extract_random_flight",
+    description=(
+        "When the user requests a random flight, always call this function. "
+    ),
+    parameters=Schema(
+        type=Type.OBJECT,
+        properties={
+            "random": Schema(
+                type=Type.BOOLEAN,
+                description="boolean as true",
+                nullable=False,
+            ),
+        },
+        required=REQUIRED_FIELDS["extract_random_flight"].required_fields,
     ),
 )
 
@@ -186,6 +208,7 @@ query_tools = Tool(
         extract_flight_function,
         extract_airport_route_function,
         extract_airport_route_single_derection_function,
+        extract_random_flight_function,
     ]
 )
 query_config = GenerateContentConfig(tools=[query_tools])

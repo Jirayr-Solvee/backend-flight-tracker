@@ -64,6 +64,16 @@ class AirportSearchDirection(str, Enum):
 
 class FlightQueryHandler:
     @staticmethod
+    async def extract_random_flight(
+        random: bool,
+        session: Session
+    ):
+        flight = FlightPersistence.get_random_flight(session=session)
+        return QuerySearchResponse(
+            flights_result=[FlightRead.model_validate(flight, from_attributes=True)] if flight else []
+        )
+
+    @staticmethod
     async def extract_flight_info(
         departure_date: str,
         flight_number: str,

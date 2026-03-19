@@ -104,8 +104,8 @@ class GeminiService:
                 function_def = REQUIRED_FIELDS.get(
                     extracted_function_call.function_name
                 )
-                assert function_def  # already checked its a valid function in _validate_function_args
-                handler = function_def.handler
+
+                handler = function_def.handler # type: ignore
 
                 return ResolvedFunctionCall(
                     function_name=extracted_function_call.function_name,
