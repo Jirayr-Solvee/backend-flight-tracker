@@ -177,3 +177,8 @@ async def delete_webhook(
     async with httpx.AsyncClient() as client:
         fetcher_url = f"{settings.AERODATABOX_SERVICE_URL}delete-webhook?subscription_id={subscription_id}"
         await client.delete(fetcher_url)
+
+async def confirm_webhook():
+    async with httpx.AsyncClient() as client:
+        fetcher_url = f"{settings.AERODATABOX_SERVICE_URL}confirm-webhook-notification"
+        await client.put(fetcher_url)

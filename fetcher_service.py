@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel
 
 from .config import settings
+from contextlib import asynccontextmanager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,7 +18,7 @@ logging.basicConfig(
 logger = logging.getLogger()
 
 
-app = FastAPI()
+
 
 
 class BalanceResponse(BaseModel):
@@ -38,6 +39,9 @@ class AerodataboxFetcherService:
                 pool=5.0,
             ),
         )
+
+
+        self.balance: int = 0
 
     async def fetch_single_flight(self, full_number: str, departure_date: str) -> Any:
         async with self.limiter:
@@ -156,6 +160,9 @@ class AerodataboxFetcherService:
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     async def is_subscription_balance_low(self) -> bool:
+        return self.balance <= settings.BALANCE_REFILL_THRESHOLD
+
+    async def get_balance(self) -> int:
         async with self.limiter:
             try:
                 url = f"{self.base_url}/api/v1/aedbx/aerodatabox/subscriptions/balance"
@@ -168,14 +175,14 @@ class AerodataboxFetcherService:
                     raise HTTPException(status_code=response.status_code)
 
                 data = BalanceResponse.model_validate(response.json())
-
-                return data.creditsRemaining <= settings.BALANCE_REFILL_THRESHOLD
+                return data.creditsRemaining
             except HTTPException:
                 raise
-            except Exception:
-                logger.exception(f"Error while checking balance of subscription credit")
+            except:
+                logger.exception(f"Error while retriving balance")
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+        return 0
     async def refill_subscription_balance(self):
         async with self.limiter:
             try:
@@ -201,6 +208,13 @@ class AerodataboxFetcherService:
 
 aerodatabox_fetcher_service = AerodataboxFetcherService()
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    aerodatabox_fetcher_service.balance = await aerodatabox_fetcher_service.get_balance()
+    print(f"aerodatabox balance: {aerodatabox_fetcher_service.balance}")
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/flights")
 async def fetch_single_flight(
@@ -243,3 +257,7 @@ async def delete_webhook(subscription_id: str = Query(...)):
     return await aerodatabox_fetcher_service.delete_webhook(
         subscription_id=subscription_id
     )
+
+@app.put("/confirm-webhook-notification")
+async def confirm_webhook_notification():
+    aerodatabox_fetcher_service.balance = aerodatabox_fetcher_service.balance - 1

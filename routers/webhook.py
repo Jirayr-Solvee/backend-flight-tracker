@@ -4,7 +4,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
-from ..background_tasks import delete_webhook
+from ..background_tasks import delete_webhook, confirm_webhook
 from ..models import get_session
 from ..models.aerodatabox import FlightNotificationContract, FlightStatusEnum
 from ..models.flight import Departure, Flight
@@ -121,6 +121,7 @@ async def receive_aerodatabox_update(
         if global_notification_batchs:
             background_tasks.add_task(send_mutiple_batches, global_notification_batchs)
 
+        background_tasks.add_task(confirm_webhook)
         return {"detail": "ok"}
     except Exception:
         logger.exception(f"Unable to update flights with following payload={payload}")
