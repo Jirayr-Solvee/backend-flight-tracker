@@ -255,7 +255,8 @@ class FlightPersistence:
         }
 
         for key, val in fields.items():
-            setattr(db_obj, key, val)
+            if val is not None:
+                setattr(db_obj, key, val)
     
     @staticmethod
     def get_random_flight(session: Session) -> Flight | None:
