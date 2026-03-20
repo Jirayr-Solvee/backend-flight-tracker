@@ -12,6 +12,14 @@ from ...models.device import Device
 from ...models.flight import Flight, TimestampTypes
 from ...models.notification import DeviceInfo, Notification, NotificationBatch
 from ...models.user import User, UserFlightLink
+from enum import Enum
+
+class NotificationTimestampTypes(str, Enum):
+    ACTUAL = "Actual"
+    ESTIMATED = "Estimated"
+    SCHEDULED = "Scheduled"
+    UPDATED = "Updated"
+
 
 ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 
@@ -198,29 +206,65 @@ class ApnService:
     @staticmethod
     def create_time_stamp_change_notification(
         location_type: str,
-        time_stamp_type: TimestampTypes,
+        time_stamp_type: NotificationTimestampTypes,
         old_time_stamp: str | None,
-        new_time_stamp: str | None,
+        new_time_stamp: str,
         flight_number: str,
     ) -> Notification:
         """
         Return Notification object with proper title and body for a new time stamp availability or change
         """
-        if not old_time_stamp and new_time_stamp:
+        if old_time_stamp is None:
             title = f"{location_type} {time_stamp_type.value.lower()} time available"
-            body = f"A new {time_stamp_type.value.lower()} time is now available for flight {flight_number}."
+            body = (
+                f"A new {time_stamp_type} {location_type.lower()} time is now available "
+                f"for flight {flight_number}."
+            )
+            return Notification(title=title, body=body)
+
+        from .utils import calculate_difference_in_minutes
+
+        difference_in_minutes = calculate_difference_in_minutes(old_timestamp=old_time_stamp, new_timestamp=new_time_stamp)
+        if difference_in_minutes is None:
+            title = f"{location_type} {time_stamp_type.value.lower()} time available"
+            body = (
+                f"A new {time_stamp_type} {location_type.lower()} time is now available "
+                f"for flight {flight_number}."
+            )
+            return Notification(title=title, body=body)
+
+        # delay
+        if difference_in_minutes > 0:
+            title = f"Flight {flight_number} {location_type.lower()} delayed"
+            body = (
+                f"Your flight {flight_number} {location_type.lower()} is delayed by "
+                f"{difference_in_minutes} min ({time_stamp_type})."
+            )
+
+        # early
+        elif difference_in_minutes < 0:
+            title = f"Flight {flight_number} {location_type.lower()} moved earlier"
+            body = (
+                f"Your flight {flight_number} {location_type.lower()} is now "
+                f"{difference_in_minutes} min earlier ({time_stamp_type})."
+            )
+
+        # on time
         else:
-            title = f"{location_type} {time_stamp_type.value.lower()} time updated"
-            body = f"The {time_stamp_type.value.lower()} time has changed for flight {flight_number}."
+            title = f"Flight {flight_number} {location_type.lower()} on time"
+            body = (
+                f"Your flight {flight_number} {location_type.lower()} is on time "
+                f"({time_stamp_type.value.lower()})."
+            )
 
         return Notification(title=title, body=body)
 
     @staticmethod
     def create_time_stamp_change_notification_batch(
         location_type: str,
-        time_stamp_type: TimestampTypes,
+        time_stamp_type: NotificationTimestampTypes,
         old_time_stamp: str | None,
-        new_time_stamp: str | None,
+        new_time_stamp: str,
         flight_number: str,
         devices_info: list[DeviceInfo],
     ) -> NotificationBatch:

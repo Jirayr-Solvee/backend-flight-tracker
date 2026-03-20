@@ -7,16 +7,21 @@ from ...models.aerodatabox import (
     AerodataboxOriginAndDestinationInformationWebhook,
     FlightNotificationContractItem)
 from ...models.device import Device
-from ...models.flight import Arrival, Departure, Flight, TimestampTypes
+from ...models.flight import Arrival, Departure, Flight
 from ...models.notification import DeviceInfo, NotificationBatch
 from ...models.user import User, UserFlightLink
 from ...utils import get_time
-from .service import ApnService
+from .service import ApnService, NotificationTimestampTypes
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class DirectionType(str, Enum):
     DEPARTURE = "Departure"
     ARRIVAL = "Arrival"
+
 
 
 def extract_all_notifications_for_flight(
@@ -125,34 +130,34 @@ def extract_nested_notifications_for_flight(
             notification_batches.append(batch)
 
     class TimeStampModel(BaseModel):
-        type: TimestampTypes
+        type: NotificationTimestampTypes
         old: str | None
         new: str | None
 
     time_stamps = [
         TimeStampModel(
-            type=TimestampTypes.SCHEDULED,
+            type=NotificationTimestampTypes.SCHEDULED,
             old=db_info.scheduled_time_utc,
             new=get_time(webhook_data.scheduledTime, "utc"),
         ),
         TimeStampModel(
-            type=TimestampTypes.ESTIMATED,
+            type=NotificationTimestampTypes.ESTIMATED,
             old=db_info.predicted_time_utc,
             new=get_time(webhook_data.predictedTime, "utc"),
         ),
         TimeStampModel(
-            type=TimestampTypes.REVISED,
+            type=NotificationTimestampTypes.UPDATED,
             old=db_info.revised_time_utc,
             new=get_time(webhook_data.revisedTime, "utc"),
         ),
         TimeStampModel(
-            type=TimestampTypes.ACTUAL,
+            type=NotificationTimestampTypes.ACTUAL,
             old=db_info.runway_time_utc,
             new=get_time(webhook_data.runwayTime, "utc"),
         ),
     ]
     for t in time_stamps:
-        if t.old != t.new:
+        if t.new is not None and t.old != t.new:
             batch = ApnService.create_time_stamp_change_notification_batch(
                 location_type=direction,
                 time_stamp_type=t.type,
@@ -177,3 +182,16 @@ def increase_notifications_of_users(
         .where(User.id.in_(user_ids))
         .values(notification_count=User.notification_count + by_amount)
     )
+
+def calculate_difference_in_minutes(old_timestamp: str, new_timestamp: str) -> int | None:
+    try:
+        format_str = "%Y-%m-%d %H:%MZ"
+
+        t1 = datetime.strptime(old_timestamp, format_str)
+        t2 = datetime.strptime(new_timestamp, format_str)
+
+        difference = t2 - t1
+        return int(difference.total_seconds() / 60)
+    except Exception:
+        logger.exception(f"unable to caluclate defference in minutes for old_timestamp={old_timestamp}, new_timestamp={new_timestamp}")
+        return None
