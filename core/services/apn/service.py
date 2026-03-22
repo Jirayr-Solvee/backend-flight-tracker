@@ -217,7 +217,7 @@ class ApnService:
         if old_time_stamp is None:
             title = f"{location_type} {time_stamp_type.value.lower()} time available"
             body = (
-                f"A new {time_stamp_type} {location_type.lower()} time is now available "
+                f"A new {time_stamp_type.value.lower()} {location_type.lower()} time is now available "
                 f"for flight {flight_number}."
             )
             return Notification(title=title, body=body)
@@ -228,7 +228,7 @@ class ApnService:
         if difference_in_minutes is None:
             title = f"{location_type} {time_stamp_type.value.lower()} time available"
             body = (
-                f"A new {time_stamp_type} {location_type.lower()} time is now available "
+                f"A new {time_stamp_type.value.lower()} {location_type.lower()} time is now available "
                 f"for flight {flight_number}."
             )
             return Notification(title=title, body=body)
@@ -238,7 +238,7 @@ class ApnService:
             title = f"Flight {flight_number} {location_type.lower()} delayed"
             body = (
                 f"Your flight {flight_number} {location_type.lower()} is delayed by "
-                f"{difference_in_minutes} min ({time_stamp_type})."
+                f"{difference_in_minutes} min ({time_stamp_type.value.lower()})."
             )
 
         # early
@@ -246,7 +246,7 @@ class ApnService:
             title = f"Flight {flight_number} {location_type.lower()} moved earlier"
             body = (
                 f"Your flight {flight_number} {location_type.lower()} is now "
-                f"{difference_in_minutes} min earlier ({time_stamp_type})."
+                f"{difference_in_minutes} min earlier ({time_stamp_type.value.lower()})."
             )
 
         # on time
