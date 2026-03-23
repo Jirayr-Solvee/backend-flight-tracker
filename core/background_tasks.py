@@ -1,11 +1,16 @@
+import asyncio
 import logging
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from typing import DefaultDict
 
 import httpx
 from sqlmodel import select, update
 
 from .config import settings
 from .models import Session, engine
-from .models.aerodatabox import FlightNotificationContractSubscription
+from .models.aerodatabox import (FlightNotificationContractSubscription,
+                                 FlightStatusEnum)
 from .models.device import Device
 from .models.email import S3EmailNotification
 from .models.flight import Flight, FlightStatusEnum, UserFlightLink
@@ -126,7 +131,9 @@ async def create_webhook_for_flight(
             eligible_flights = [
                 f
                 for f in flights
-                if f.status not in NOT_ELIGIBLE_STATUS and f.subscription_id is None
+                if f.status not in NOT_ELIGIBLE_STATUS
+                and f.subscription_id is None
+                and f.has_subscribed == False
             ]
             if not eligible_flights:
                 return
@@ -156,7 +163,7 @@ async def create_webhook_for_flight(
                     subscription_id = (
                         FlightNotificationContractSubscription.model_validate(data).id
                     )
-                    session.exec(update(Flight).where(Flight.id.in_(eligible_ids)).values(subscription_id=subscription_id))  # type: ignore
+                    session.exec(update(Flight).where(Flight.id.in_(eligible_ids)).values(subscription_id=subscription_id, has_subscribed=True))  # type: ignore
                     session.commit()
                     return
 
@@ -174,11 +181,69 @@ async def create_webhook_for_flight(
 async def delete_webhook(
     subscription_id: str,
 ):
-    async with httpx.AsyncClient() as client:
-        fetcher_url = f"{settings.AERODATABOX_SERVICE_URL}delete-webhook?subscription_id={subscription_id}"
-        await client.delete(fetcher_url)
+    try:
+        async with httpx.AsyncClient() as client:
+            fetcher_url = f"{settings.AERODATABOX_SERVICE_URL}delete-webhook?subscription_id={subscription_id}"
+            res = await client.delete(fetcher_url)
+            if res.status_code == 200:
+                with Session(engine) as session:
+                    session.exec(update(Flight).where(Flight.subscription_id == subscription_id).values(subscription_id=None))  # type: ignore
+                    session.commit()
+                    return
+            logger.warning(
+                f"response code={res.status_code} returned while removing webhook sub id={subscription_id}"
+            )
+    except Exception:
+        logger.exception(f"Error while removing webhook sub id={subscription_id}")
+
 
 async def confirm_webhook():
     async with httpx.AsyncClient() as client:
         fetcher_url = f"{settings.AERODATABOX_SERVICE_URL}confirm-webhook-notification"
         await client.put(fetcher_url)
+
+
+async def remove_hanging_webhooks():
+    def should_delete_webhook(flights: list[Flight]):
+        for f in flights:
+            if not f.arrival:
+                continue
+
+            arrival_utc = (
+                f.arrival.runway_time_utc
+                or f.arrival.predicted_time_utc
+                or f.arrival.revised_time_utc
+                or f.arrival.scheduled_time_utc
+            )
+            if not arrival_utc:
+                continue
+
+            dt = datetime.fromisoformat(arrival_utc.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+
+            is_older_than_24h = now - dt > timedelta(hours=24)
+            if not is_older_than_24h:
+                return False
+
+        return True
+
+    while True:
+        with Session(engine) as session:
+            flights = session.exec(
+                select(Flight).where(
+                    Flight.subscription_id != None,
+                    Flight.has_subscribed == True,
+                    Flight.status != FlightStatusEnum.ARRIVED,
+                )
+            ).all()
+
+            flight_groups: DefaultDict[str, list[Flight]] = defaultdict(list)
+            for flight in flights:
+                if flight.subscription_id is not None:
+                    flight_groups[flight.subscription_id].append(flight)
+
+            for sub_id, flight_group in flight_groups.items():
+                if should_delete_webhook(flights=flight_group):
+                    await delete_webhook(subscription_id=sub_id)
+
+        await asyncio.sleep(3600)

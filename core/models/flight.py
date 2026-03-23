@@ -24,6 +24,7 @@ class Flight(SQLModel, table=True):
     distance_km: float | None = None
     distance_mile: float | None = None
     subscription_id: str | None = None
+    has_subscribed: bool = False
     aircraft_reg: str | None = None
     aircraft_modeS: str | None = None
     aircraft_model: str | None = None

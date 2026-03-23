@@ -1,4 +1,6 @@
+import asyncio
 import logging
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 import httpx
@@ -6,8 +8,8 @@ from aiolimiter import AsyncLimiter
 from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel
 
+from .background_tasks import remove_hanging_webhooks
 from .config import settings
-from contextlib import asynccontextmanager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,9 +18,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger()
-
-
-
 
 
 class BalanceResponse(BaseModel):
@@ -124,7 +123,7 @@ class AerodataboxFetcherService:
                     return {
                         "id": self.latest_webhook_id,
                         "isActive": True,
-                        "createdOnUtc": "maybe a moment ago ;)"
+                        "createdOnUtc": "maybe a moment ago ;)",
                     }
 
                 response = await self.client.post(url=url, json=payload)
@@ -202,7 +201,6 @@ class AerodataboxFetcherService:
                 logger.exception(f"Error while retriving balance")
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        return 0
     async def refill_subscription_balance(self):
         async with self.limiter:
             try:
@@ -228,13 +226,27 @@ class AerodataboxFetcherService:
 
 aerodatabox_fetcher_service = AerodataboxFetcherService()
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    aerodatabox_fetcher_service.balance = await aerodatabox_fetcher_service.get_balance()
+    aerodatabox_fetcher_service.balance = (
+        await aerodatabox_fetcher_service.get_balance()
+    )
     print(f"aerodatabox balance: {aerodatabox_fetcher_service.balance}")
-    yield
+
+    task = asyncio.create_task(remove_hanging_webhooks())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
 
 app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/flights")
 async def fetch_single_flight(
@@ -277,6 +289,7 @@ async def delete_webhook(subscription_id: str = Query(...)):
     return await aerodatabox_fetcher_service.delete_webhook(
         subscription_id=subscription_id
     )
+
 
 @app.put("/confirm-webhook-notification")
 async def confirm_webhook_notification():
