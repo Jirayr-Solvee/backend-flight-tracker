@@ -40,8 +40,9 @@ class AerodataboxFetcherService:
             ),
         )
 
-
         self.balance: int = 0
+        self.latest_webhook_flight_number: str | None = None
+        self.latest_webhook_id: str | None = None
 
     async def fetch_single_flight(self, full_number: str, departure_date: str) -> Any:
         async with self.limiter:
@@ -119,6 +120,13 @@ class AerodataboxFetcherService:
 
         async with self.limiter:
             try:
+                if flight_full_number == self.latest_webhook_flight_number:
+                    return {
+                        "id": self.latest_webhook_id,
+                        "isActive": True,
+                        "createdOnUtc": "maybe a moment ago ;)"
+                    }
+
                 response = await self.client.post(url=url, json=payload)
                 if response.status_code != 200:
                     logger.warning(
@@ -126,7 +134,15 @@ class AerodataboxFetcherService:
                     )
                     raise HTTPException(status_code=response.status_code)
 
-                return response.json()
+                respnose_data = response.json()
+                if respnose_data:
+                    webhook_id = respnose_data.get("id")
+                    if webhook_id:
+                        self.latest_webhook_id = webhook_id
+                        self.latest_webhook_flight_number = flight_full_number
+
+                return respnose_data
+
             except HTTPException:
                 raise
             except Exception:
@@ -149,6 +165,10 @@ class AerodataboxFetcherService:
                         f"Aerodatabox responded with status code={response.status_code} while deleting a webhook sub for subscription_id={subscription_id}"
                     )
                     raise HTTPException(status_code=response.status_code)
+
+                if self.latest_webhook_id == subscription_id:
+                    self.latest_webhook_id = None
+                    self.latest_webhook_flight_number = None
 
                 return {"detail": "deleted"}
             except HTTPException:
