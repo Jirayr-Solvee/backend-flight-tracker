@@ -56,7 +56,6 @@ async def receive_aerodatabox_update(
         global_notification_batchs: list[NotificationBatch] = []
 
         for f in payload.flights:
-            print("1. started")
             if not flight_full_number:
                 flight_full_number = f.number.strip().replace(" ", "")
 
@@ -83,9 +82,7 @@ async def receive_aerodatabox_update(
             notification_batchs = extract_all_notifications_for_flight(
                 flight=db_flight, webhook_flight=f, devices_info=devices_info
             )
-            print(
-                f"how many notificaions {len(notification_batchs)}, notification_batchs = {notification_batchs}"
-            )
+            logger.info(f"how many notificaions {len(notification_batchs)}, notification_batchs = {notification_batchs}")
             global_notification_batchs.extend(notification_batchs)
 
             FlightPersistence.update_flight_from_webhook_data(
@@ -113,10 +110,27 @@ async def receive_aerodatabox_update(
         session.commit()
 
         async def send_mutiple_batches(notification_batchs: list[NotificationBatch]):
+            tokens = set()
+            review_tokens = set()
+
             for batch in notification_batchs:
+                tks = [dv.token for dv in batch.devices]
+                if batch.invoke_review:
+                    tokens.update(tks)
+                else:
+                    review_tokens.update(tks)
+
                 await ApnService.send_multiple_push_notification(
                     notification_batch=batch
                 )
+
+            tokens -= review_tokens
+
+            if tokens:
+                await ApnService.send_multiple_silent_push_notification(tokens=list(tokens), invoke_review=False)
+
+            if review_tokens:
+                await ApnService.send_multiple_silent_push_notification(tokens=list(review_tokens), invoke_review=True)
 
         if global_notification_batchs:
             background_tasks.add_task(send_mutiple_batches, global_notification_batchs)

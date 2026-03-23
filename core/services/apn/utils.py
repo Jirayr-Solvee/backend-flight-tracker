@@ -179,7 +179,7 @@ def increase_notifications_of_users(
 
     session.exec(
         update(User)
-        .where(User.id.in_(user_ids))
+        .where(User.id.in_(user_ids)) # type: ignore
         .values(notification_count=User.notification_count + by_amount)
     )
 

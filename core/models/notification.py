@@ -16,3 +16,4 @@ class DeviceInfo(BaseModel):
 class NotificationBatch(BaseModel):
     notification: Notification
     devices: list[DeviceInfo] = []
+    invoke_review: bool = False

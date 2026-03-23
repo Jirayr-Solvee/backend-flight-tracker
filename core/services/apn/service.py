@@ -13,6 +13,7 @@ from ...models.flight import Flight, TimestampTypes
 from ...models.notification import DeviceInfo, Notification, NotificationBatch
 from ...models.user import User, UserFlightLink
 from enum import Enum
+from typing import Tuple
 
 class NotificationTimestampTypes(str, Enum):
     ACTUAL = "Actual"
@@ -46,17 +47,18 @@ def get_apns_client() -> APNs:
 
 class ApnService:
     """
-    Firebase Cloud Messaging service class that handles push notifications
+    Apm service class that handles push notifications
     """
 
     @staticmethod
-    async def send_silent_push_notification(apn_token: str):
+    async def send_silent_push_notification(apn_token: str, invoke_review: bool):
         request = NotificationRequest(
             device_token=apn_token,
             message={
                 "aps": {
                     "content-available": 1
-                }
+                },
+                "invoke_review": invoke_review,
             },
             notification_id=str(uuid.uuid4()),
             time_to_live=3600,
@@ -64,6 +66,29 @@ class ApnService:
         )
 
         await get_apns_client().send_notification(request)
+
+    @staticmethod
+    async def send_multiple_silent_push_notification(tokens: list[str], invoke_review: bool):
+        tasks = []
+
+        for tk in tokens:
+            request = NotificationRequest(
+                device_token=tk,
+                message={
+                    "aps": {
+                        "content-available": 1
+                    },
+                    "invoke_review": invoke_review,
+                },
+                notification_id=str(uuid.uuid4()),
+                time_to_live=3600,
+                push_type=PushType.BACKGROUND,
+            )
+            tasks.append(get_apns_client().send_notification(request))
+        if not tasks:
+            return
+
+        await asyncio.gather(*tasks)
 
     @staticmethod
     async def send_single_push_notification(
@@ -191,7 +216,12 @@ class ApnService:
             status=status, flight_full_number=flight_full_number
         )
 
-        return NotificationBatch(notification=notification, devices=devices_info)
+        batch = NotificationBatch(notification=notification, devices=devices_info)
+
+        if status == FlightStatusEnum.ARRIVED:
+            batch.invoke_review = True
+
+        return batch
 
     @staticmethod
     def create_new_flight_added_notification(flight_full_number: str) -> Notification:
@@ -210,7 +240,7 @@ class ApnService:
         old_time_stamp: str | None,
         new_time_stamp: str,
         flight_number: str,
-    ) -> Notification:
+    ) -> Tuple[Notification, bool]:
         """
         Return Notification object with proper title and body for a new time stamp availability or change
         """
@@ -220,7 +250,7 @@ class ApnService:
                 f"A new {time_stamp_type.value.lower()} {location_type.lower()} time is now available "
                 f"for flight {flight_number}."
             )
-            return Notification(title=title, body=body)
+            return (Notification(title=title, body=body), False)
 
         from .utils import calculate_difference_in_minutes
 
@@ -231,7 +261,7 @@ class ApnService:
                 f"A new {time_stamp_type.value.lower()} {location_type.lower()} time is now available "
                 f"for flight {flight_number}."
             )
-            return Notification(title=title, body=body)
+            return (Notification(title=title, body=body), False)
 
         # delay
         if difference_in_minutes > 0:
@@ -240,6 +270,7 @@ class ApnService:
                 f"Your flight {flight_number} {location_type.lower()} is delayed by "
                 f"{difference_in_minutes} min ({time_stamp_type.value.lower()})."
             )
+            return (Notification(title=title, body=body), True)
 
         # early
         elif difference_in_minutes < 0:
@@ -248,6 +279,7 @@ class ApnService:
                 f"Your flight {flight_number} {location_type.lower()} is now "
                 f"{difference_in_minutes} min earlier ({time_stamp_type.value.lower()})."
             )
+            return (Notification(title=title, body=body), False)
 
         # on time
         else:
@@ -256,8 +288,8 @@ class ApnService:
                 f"Your flight {flight_number} {location_type.lower()} is on time "
                 f"({time_stamp_type.value.lower()})."
             )
-
-        return Notification(title=title, body=body)
+            return (Notification(title=title, body=body), False)
+        
 
     @staticmethod
     def create_time_stamp_change_notification_batch(
@@ -271,7 +303,7 @@ class ApnService:
         """
         Return Batch of Notifications of a new time stamp availability or change
         """
-        notification = ApnService.create_time_stamp_change_notification(
+        notification, invoke_review = ApnService.create_time_stamp_change_notification(
             location_type=location_type,
             time_stamp_type=time_stamp_type,
             old_time_stamp=old_time_stamp,
@@ -279,7 +311,9 @@ class ApnService:
             flight_number=flight_number,
         )
 
-        return NotificationBatch(notification=notification, devices=devices_info)
+        batch = NotificationBatch(notification=notification, devices=devices_info) 
+        batch.invoke_review = invoke_review
+        return batch
 
     @staticmethod
     def create_gate_change_notification(
