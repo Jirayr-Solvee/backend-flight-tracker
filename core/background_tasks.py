@@ -95,8 +95,6 @@ async def handle_incoming_email(notification: S3EmailNotification):
                             badge_count=user.notification_count,
                         )
 
-                await create_webhook_for_flight(flight_full_number=flights[0].number)
-
                 session.commit()
 
         except Exception:
@@ -108,49 +106,37 @@ async def handle_incoming_email(notification: S3EmailNotification):
 
 async def create_webhook_for_flight(
     flight_full_number: str,
+    flight_id: str,
 ):
-    NOT_ELIGIBLE_STATUS = {
-        FlightStatusEnum.UNKNOWN,
-        FlightStatusEnum.CANCELED,
-        FlightStatusEnum.DIVERTED,
-        FlightStatusEnum.CANCELEDUNCERTAIN,
-        FlightStatusEnum.ARRIVED,
-    }
-
     if settings.DEV_ENV:
         return
 
     with Session(engine) as session:
         try:
-            flights = session.exec(
+            flight = session.exec(
                 select(Flight).where(Flight.number == flight_full_number)
-            ).all()
-            if not flights:
+            ).first()
+
+            if not flight:
+                logger.warning(
+                    f"Unable to find flight number={flight_full_number}, id={flight_id} while creating a webhook"
+                )
                 return
 
-            eligible_flights = [
-                f
-                for f in flights
-                if f.status not in NOT_ELIGIBLE_STATUS
-                and f.subscription_id is None
-                and f.has_subscribed == False
-            ]
-            if not eligible_flights:
-                return
+            similar_flight_with_subscription = session.exec(
+                select(Flight).where(
+                    Flight.number == flight_full_number,
+                    Flight.id != flight_id,
+                    Flight.subscription_id != None,
+                    Flight.has_subscribed == True,
+                )
+            ).first()
 
-            subscription_id = next(
-                (
-                    flight.subscription_id
-                    for flight in flights
-                    if flight.subscription_id
-                ),
-                None,
-            )
-
-            eligible_ids = [f.id for f in eligible_flights]
-
-            if subscription_id:
-                session.exec(update(Flight).where(Flight.id.in_(eligible_ids)).values(subscription_id=subscription_id))  # type: ignore
+            if similar_flight_with_subscription:
+                flight.has_subscribed = True
+                flight.subscription_id = (
+                    similar_flight_with_subscription.subscription_id
+                )
                 session.commit()
                 return
 
@@ -163,7 +149,8 @@ async def create_webhook_for_flight(
                     subscription_id = (
                         FlightNotificationContractSubscription.model_validate(data).id
                     )
-                    session.exec(update(Flight).where(Flight.id.in_(eligible_ids)).values(subscription_id=subscription_id, has_subscribed=True))  # type: ignore
+                    flight.subscription_id = subscription_id
+                    flight.has_subscribed = True
                     session.commit()
                     return
 
@@ -204,6 +191,14 @@ async def confirm_webhook():
 
 
 async def remove_hanging_webhooks():
+    NOT_ELIGIBLE_STATUS = {
+        FlightStatusEnum.UNKNOWN,
+        FlightStatusEnum.CANCELED,
+        FlightStatusEnum.DIVERTED,
+        FlightStatusEnum.CANCELEDUNCERTAIN,
+        FlightStatusEnum.ARRIVED,
+    }
+
     def should_delete_webhook(flights: list[Flight]):
         for f in flights:
             if not f.arrival:
@@ -233,7 +228,7 @@ async def remove_hanging_webhooks():
                 select(Flight).where(
                     Flight.subscription_id != None,
                     Flight.has_subscribed == True,
-                    Flight.status != FlightStatusEnum.ARRIVED,
+                    Flight.status.notin_(NOT_ELIGIBLE_STATUS),  # type: ignore
                 )
             ).all()
 
@@ -247,3 +242,77 @@ async def remove_hanging_webhooks():
                     await delete_webhook(subscription_id=sub_id)
 
         await asyncio.sleep(3600)
+
+
+async def check_and_create_webhook_for_flight():
+    NOT_ELIGIBLE_STATUS = {
+        FlightStatusEnum.UNKNOWN,
+        FlightStatusEnum.CANCELED,
+        FlightStatusEnum.DIVERTED,
+        FlightStatusEnum.CANCELEDUNCERTAIN,
+        FlightStatusEnum.ARRIVED,
+    }
+
+    def should_create_webhook(dep_utc: str, arr_utc: str) -> bool:
+        dt = datetime.strptime(dep_utc, "%Y-%m-%d %H:%MZ").replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+
+        dep_diff = dt - now
+        dep_diff = int(dep_diff.total_seconds() // 3600)
+        if 0 < dep_diff <= 72:
+            return True
+        elif dep_diff > 72:
+            return False
+
+        at = datetime.strptime(arr_utc, "%Y-%m-%d %H:%MZ").replace(tzinfo=timezone.utc)
+        arr_diff = at - now
+        arr_diff = int(arr_diff.total_seconds() // 3600)
+
+        if arr_diff > -24:
+            return True
+
+        return False
+
+    while True:
+        with Session(engine) as session:
+            flights = session.exec(
+                select(Flight).where(
+                    Flight.status.notin_(NOT_ELIGIBLE_STATUS),  # type: ignore
+                    Flight.subscription_id == None,
+                    Flight.has_subscribed == False,
+                )
+            ).all()
+
+            flight_groups: DefaultDict[str, list[Flight]] = defaultdict(list)
+            for flight in flights:
+                flight_groups[flight.number].append(flight)
+
+            # TODO: send them as a btach so no dupliacte db query
+            # create_webhook_for_flight should expect list of flight ids
+            for flight_number, flight_group in flight_groups.items():
+                for f in flight_group:
+                    if not f.departure or not f.arrival:
+                        continue
+
+                    departure_utc = (
+                        f.departure.runway_time_utc
+                        or f.departure.predicted_time_utc
+                        or f.departure.revised_time_utc
+                        or f.departure.scheduled_time_utc
+                    )
+                    arrival_utc = (
+                        f.arrival.runway_time_utc
+                        or f.arrival.predicted_time_utc
+                        or f.arrival.revised_time_utc
+                        or f.arrival.scheduled_time_utc
+                    )
+                    if not departure_utc or not arrival_utc:
+                        continue
+
+                    create_webhook = should_create_webhook(
+                        dep_utc=departure_utc, arr_utc=arrival_utc
+                    )
+                    if create_webhook:
+                        await create_webhook_for_flight(flight_full_number=flight_number, flight_id=flight.id)  # type: ignore
+
+        await asyncio.sleep(600)

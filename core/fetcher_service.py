@@ -8,7 +8,8 @@ from aiolimiter import AsyncLimiter
 from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel
 
-from .background_tasks import remove_hanging_webhooks
+from .background_tasks import (check_and_create_webhook_for_flight,
+                               remove_hanging_webhooks)
 from .config import settings
 
 logging.basicConfig(
@@ -234,15 +235,20 @@ async def lifespan(app: FastAPI):
     )
     print(f"aerodatabox balance: {aerodatabox_fetcher_service.balance}")
 
-    task = asyncio.create_task(remove_hanging_webhooks())
+    background_fn = [remove_hanging_webhooks(), check_and_create_webhook_for_flight()]
+    tasks = [asyncio.create_task(fn) for fn in background_fn]
+
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        for t in tasks:
+            t.cancel()
+
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(lifespan=lifespan)

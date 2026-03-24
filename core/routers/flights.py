@@ -1,6 +1,7 @@
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import (APIRouter, BackgroundTasks, Depends, HTTPException, Query,
+                     status)
 from sqlmodel import Session, select
 
 from ..background_tasks import create_webhook_for_flight
@@ -75,8 +76,6 @@ def assign_flight_to_a_user(
         FlightPersistence.create_user_flight_link(
             session=session, flight_id=flight_id, user_id=user.id
         )
-
-        background_tasks.add_task(create_webhook_for_flight, flight.number)
 
         user.has_searched = True
         session.commit()
@@ -195,7 +194,6 @@ async def get_exact_flight(
                 FlightPersistence.link_flight_and_user(
                     session=session, flight_id=flight.id, user_id=user.id  # type: ignore
                 )
-                background_tasks.add_task(create_webhook_for_flight, flight.number)
 
                 user.has_searched = True
                 session.commit()
