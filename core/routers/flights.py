@@ -145,7 +145,7 @@ async def get_exact_flight(
         ..., description="Departure airport IATA code e.g. EVN"
     ),
     # arrival_airport_iata: str = Query(..., description="Arrival airport IATA code e.g. EVN"),
-    scheduled_time_utc: str | None = Query(
+    scheduled_time_local: str | None = Query(
         None, description="Scheduled UTC departure time, can be null"
     ),
     session: Session = Depends(get_session),
@@ -163,7 +163,7 @@ async def get_exact_flight(
 
     # NOTE: check case of flight spaning for two days
     new_departure_data = (
-        scheduled_time_utc.split(" ")[0] if scheduled_time_utc else departure_date
+        scheduled_time_local.split(" ")[0] if scheduled_time_local else departure_date
     )
 
     try:
@@ -176,7 +176,7 @@ async def get_exact_flight(
 
         if not flights:
             logger.warning(
-                f"Unable to fetch exact flight for departure_date={departure_date}, flight_number={flight_number}, airline_iata={airline_iata}, departure_airport_iata={departure_airport_iata}, scheduled_time_utc={scheduled_time_utc} from user id={user}"
+                f"Unable to fetch exact flight for departure_date={departure_date}, flight_number={flight_number}, airline_iata={airline_iata}, departure_airport_iata={departure_airport_iata}, scheduled_time_utc={scheduled_time_local} from user id={user}"
             )
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Exact flight not found"
@@ -189,18 +189,24 @@ async def get_exact_flight(
                 dep
                 and dep.airport
                 and dep.airport.iata == departure_airport_iata
-                and dep.scheduled_time_utc == scheduled_time_utc
+                and dep.scheduled_time_local == scheduled_time_local
             ):
-                FlightPersistence.link_flight_and_user(
-                    session=session, flight_id=flight.id, user_id=user.id  # type: ignore
-                )
+                existing_link = session.exec(select(UserFlightLink).where(
+                    UserFlightLink.user_id == user.id,
+                    UserFlightLink.flight_id == flight.id
+                )).first()
+
+                if not existing_link:
+                    FlightPersistence.link_flight_and_user(
+                        session=session, flight_id=flight.id, user_id=user.id  # type: ignore
+                    )
 
                 user.has_searched = True
                 session.commit()
 
                 return flight
         logger.warning(
-            f"Unable to find exact flight for departure_date={departure_date}, flight_number={flight_number}, airline_iata={airline_iata}, departure_airport_iata={departure_airport_iata}, scheduled_time_utc={scheduled_time_utc} from user id={user} after filtering fetched flights"
+            f"Unable to find exact flight for departure_date={departure_date}, flight_number={flight_number}, airline_iata={airline_iata}, departure_airport_iata={departure_airport_iata}, scheduled_time_local={scheduled_time_local} from user id={user} after filtering fetched flights"
         )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Exact flight not found"
@@ -211,6 +217,6 @@ async def get_exact_flight(
     except Exception:
         session.rollback()
         logger.exception(
-            f"Unable to find exact flight for departure_date={departure_date}, flight_number={flight_number}, airline_iata={airline_iata}, departure_airport_iata={departure_airport_iata}, scheduled_time_utc={scheduled_time_utc} from user id={user}."
+            f"Unable to find exact flight for departure_date={departure_date}, flight_number={flight_number}, airline_iata={airline_iata}, departure_airport_iata={departure_airport_iata}, scheduled_time_local={scheduled_time_local} from user id={user}."
         )
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)

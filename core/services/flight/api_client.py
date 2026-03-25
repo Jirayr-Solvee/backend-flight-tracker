@@ -47,14 +47,17 @@ class AerodataboxClient:
             self.client.get(fetcher_url + f"&time_window={timewindows[1]}"),
         )
 
-        if r1.status_code != 200 or r2.status_code != 200:
-            return AirportFidsContract()
+        dep_1 = AirportFidsContract()
+        dep_2 = AirportFidsContract()
 
-        dep1 = AirportFidsContract.model_validate(r1.json())
-        dep2 = AirportFidsContract.model_validate(r2.json())
+        if r1.status_code == 200:
+            dep_1 = AirportFidsContract.model_validate(r1.json())
+        
+        if r2.status_code == 200:
+            dep_2 = AirportFidsContract.model_validate(r2.json())
 
-        combined_departures = (dep1.departures or []) + (dep2.departures or [])
-        combined_arrivals = (dep1.arrivals or []) + (dep2.arrivals or [])
+        combined_departures = (dep_1.departures or []) + (dep_2.departures or [])
+        combined_arrivals = (dep_1.arrivals or []) + (dep_2.arrivals or [])
         return AirportFidsContract(
             departures=combined_departures, arrivals=combined_arrivals
         )
