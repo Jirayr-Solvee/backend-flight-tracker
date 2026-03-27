@@ -73,7 +73,7 @@ class CreateUserResponse(BaseModel):
 
 
 @router.post("/me/", response_model=CreateUserResponse)
-def create_user(
+async def create_user(
     data: CreateUserRequest,
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
@@ -85,7 +85,7 @@ def create_user(
                 detail="Registed users only",
             )
 
-        apple_token_parts = verify_apple_identity_token(data.apple_jwt)
+        apple_token_parts = await verify_apple_identity_token(data.apple_jwt)
         apple_user_id = apple_token_parts.get("sub")
         if not apple_user_id:
             raise HTTPException(
