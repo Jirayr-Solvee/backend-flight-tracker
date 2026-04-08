@@ -156,6 +156,24 @@ class FlightPersistence:
         )
         session.add(airport)
         return airport
+    
+    @staticmethod
+    def get_or_create_airport_via_iata(
+        aerodatabox_airport: AerodataboxAirport, session: Session
+    ) -> Airport:
+        """Get Airport from database or create one"""
+        airport = session.exec(
+            select(Airport).where(Airport.iata == aerodatabox_airport.iata)
+        ).first()
+
+        if airport:
+            return airport
+
+        airport = FlightMapper.aero_airport_to_flight_airport(
+            aerodatabox_airport=aerodatabox_airport
+        )
+        session.add(airport)
+        return airport
 
     @staticmethod
     def create_single_flight_from_aerodatabox_model(

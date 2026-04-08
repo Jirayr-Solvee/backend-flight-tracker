@@ -233,7 +233,7 @@ async def lifespan(app: FastAPI):
     aerodatabox_fetcher_service.balance = (
         await aerodatabox_fetcher_service.get_balance()
     )
-    print(f"aerodatabox balance: {aerodatabox_fetcher_service.balance}")
+    logger.info(f"aerodatabox balance: {aerodatabox_fetcher_service.balance}")
 
     background_fn = [remove_hanging_webhooks(), check_and_create_webhook_for_flight()]
     tasks = [asyncio.create_task(fn) for fn in background_fn]

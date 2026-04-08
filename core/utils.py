@@ -183,3 +183,11 @@ async def verify_apple_identity_token(identity_token: str) -> dict:
 
 def get_time(time_obj, attr: str) -> str | None:
     return getattr(time_obj, attr) if time_obj else None
+
+def normalize_offset(dt: str) -> str:
+    if dt.count(" ") >= 2:
+        first = dt.find(" ")
+        second = dt.find(" ", first + 1)
+        if second != -1:
+            return dt[:second] + "+" + dt[second + 1:]
+    return dt
