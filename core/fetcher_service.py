@@ -188,11 +188,16 @@ class AerodataboxFetcherService:
                 url = f"{self.base_url}/api/v1/aedbx/aerodatabox/subscriptions/balance"
                 response = await self.client.get(url)
 
-                if response.status_code != 200:
+                if response.status_code == 400:
+                    logger.warning(
+                        f"Aerodatabox responded with status code={response.status_code} while checking subscription balance, empty balance"
+                    )
+                    return 0
+                elif response.status_code != 200:
                     logger.warning(
                         f"Aerodatabox responded with status code={response.status_code} while checking subscription balance"
                     )
-                    raise HTTPException(status_code=response.status_code)
+                    return 0
 
                 data = BalanceResponse.model_validate(response.json())
                 return data.creditsRemaining
