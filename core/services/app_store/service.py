@@ -3,11 +3,9 @@ import logging
 from appstoreserverlibrary.models.Environment import Environment
 from appstoreserverlibrary.signed_data_verifier import SignedDataVerifier
 
-from ...config import settings
+from ...config import JWSEnvironment, settings
 
 logger = logging.getLogger(__name__)
-
-from ...config import JWSEnvironment, settings
 
 
 def get_apple_environment() -> Environment:
@@ -20,52 +18,118 @@ def get_apple_environment() -> Environment:
     return mapping[settings.JWS_ENV]
 
 
+def get_apple_environments() -> list[Environment]:
+    primary = get_apple_environment()
+    environments = [primary]
+
+    for fallback in (Environment.PRODUCTION, Environment.SANDBOX):
+        if fallback not in environments:
+            environments.append(fallback)
+
+    return environments
+
+
 class AppStoreService:
+    @staticmethod
+    def _get_root_certs() -> list[bytes]:
+        with open(settings.APPLE_ROOT_CERT_PATH, "rb") as f:
+            return [f.read()]
+
+    @staticmethod
+    def _get_verifier(
+        root_certs: list[bytes],
+        environment: Environment,
+    ) -> SignedDataVerifier:
+        return SignedDataVerifier(
+            root_certificates=root_certs,
+            bundle_id=settings.BUNDLE_ID,
+            app_apple_id=settings.APP_APPLE_ID,
+            environment=environment,
+            enable_online_checks=True,
+        )
+
+    @staticmethod
+    def _environment_name(environment: Environment) -> str:
+        return getattr(environment, "value", str(environment))
 
     @staticmethod
     def process_transaction(signed_jws: str):
-        try:
-            with open(settings.APPLE_ROOT_CERT_PATH, "rb") as f:
-                root_certs = [f.read()]
+        root_certs = AppStoreService._get_root_certs()
+        environments = get_apple_environments()
+        errors: list[Exception] = []
 
-            verifier = SignedDataVerifier(
-                root_certificates=root_certs,
-                bundle_id=settings.BUNDLE_ID,
-                app_apple_id=settings.APP_APPLE_ID,
-                environment=get_apple_environment(),
-                enable_online_checks=True,
-            )
-            payload = verifier.verify_and_decode_signed_transaction(
-                signed_transaction=signed_jws
-            )
+        for environment in environments:
+            try:
+                verifier = AppStoreService._get_verifier(
+                    root_certs=root_certs,
+                    environment=environment,
+                )
+                payload = verifier.verify_and_decode_signed_transaction(
+                    signed_transaction=signed_jws
+                )
 
-            return payload
-        except Exception:
-            logger.exception(
-                f"process_transaction failed to decode following signed_jws={signed_jws}"
-            )
-            return None
+                if environment != environments[0]:
+                    logger.info(
+                        "Accepted App Store transaction using fallback environment=%s",
+                        AppStoreService._environment_name(environment),
+                    )
+
+                return payload
+            except Exception as exc:
+                errors.append(exc)
+
+        attempted = [
+            AppStoreService._environment_name(environment)
+            for environment in environments
+        ]
+        logger.error(
+            "process_transaction failed to decode signed_jws after attempted_environments=%s",
+            attempted,
+            exc_info=(
+                (type(errors[-1]), errors[-1], errors[-1].__traceback__)
+                if errors
+                else None
+            ),
+        )
+        return None
 
     @staticmethod
     def process_notification(signed_payload: str):
-        try:
-            with open(settings.APPLE_ROOT_CERT_PATH, "rb") as f:
-                root_certs = [f.read()]
+        root_certs = AppStoreService._get_root_certs()
+        environments = get_apple_environments()
+        errors: list[Exception] = []
 
-            verifier = SignedDataVerifier(
-                root_certificates=root_certs,
-                bundle_id=settings.BUNDLE_ID,
-                app_apple_id=settings.APP_APPLE_ID,
-                environment=get_apple_environment(),
-                enable_online_checks=True,
-            )
-            result = verifier.verify_and_decode_notification(
-                signed_payload=signed_payload
-            )
+        for environment in environments:
+            try:
+                verifier = AppStoreService._get_verifier(
+                    root_certs=root_certs,
+                    environment=environment,
+                )
+                result = verifier.verify_and_decode_notification(
+                    signed_payload=signed_payload
+                )
 
-            return result
-        except Exception:
-            logger.exception(
-                f"process_notification failed to decode following notification signed payload={signed_payload}"
-            )
-            return None
+                if environment != environments[0]:
+                    logger.info(
+                        "Accepted App Store notification using fallback environment=%s",
+                        AppStoreService._environment_name(environment),
+                    )
+
+                return result
+            except Exception as exc:
+                errors.append(exc)
+
+        attempted = [
+            AppStoreService._environment_name(environment)
+            for environment in environments
+        ]
+        logger.error(
+            "process_notification failed to decode signed payload after attempted_environments=%s",
+            attempted,
+            exc_info=(
+                (type(errors[-1]), errors[-1], errors[-1].__traceback__)
+                if errors
+                else None
+            ),
+        )
+        return None
