@@ -123,9 +123,6 @@ def decode_jwt(token: str) -> Dict[str, Any]:
 
 
 def user_has_active_subscription(user: User) -> bool:
-    if not user.has_searched:
-        return True
-
     if user.premium_valid_until is None:
         return False
 

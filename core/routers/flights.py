@@ -60,6 +60,9 @@ def assign_flight_to_a_user(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
+    if not user_has_active_subscription(user=user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not Allowed")
+
     try:
         flight = session.get(Flight, flight_id)
         if not flight:
@@ -142,8 +145,6 @@ async def search_flights_from_text(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
-    if not user_has_active_subscription(user=user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not Allowed")
     try:
         ai_service = GeminiService()
         result = await ai_service.get_function_call(query=term)
