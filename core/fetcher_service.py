@@ -341,10 +341,17 @@ aerodatabox_fetcher_service = AerodataboxFetcherService()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    aerodatabox_fetcher_service.balance = (
-        await aerodatabox_fetcher_service.get_balance()
-    )
-    logger.info(f"aerodatabox balance: {aerodatabox_fetcher_service.balance}")
+    try:
+        aerodatabox_fetcher_service.balance = await asyncio.wait_for(
+            aerodatabox_fetcher_service.get_balance(),
+            timeout=10,
+        )
+        logger.info(f"aerodatabox balance: {aerodatabox_fetcher_service.balance}")
+    except Exception:
+        aerodatabox_fetcher_service.balance = settings.BALANCE_REFILL_THRESHOLD + 1
+        logger.exception(
+            "Unable to fetch aerodatabox balance during startup; continuing without blocking service readiness"
+        )
 
     background_fn = [remove_hanging_webhooks(), check_and_create_webhook_for_flight()]
     tasks = [asyncio.create_task(fn) for fn in background_fn]
