@@ -1,7 +1,8 @@
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 import httpx
 from aiolimiter import AsyncLimiter
@@ -43,6 +44,22 @@ class AerodataboxFetcherService:
         self.balance: int = 0
         self.latest_webhook_flight_number: str | None = None
         self.latest_webhook_id: str | None = None
+        self.cache: dict[str, tuple[float, Any]] = {}
+
+    async def _cached_json(
+        self,
+        cache_key: str,
+        ttl_seconds: int,
+        fetcher: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        now = time.time()
+        cached = self.cache.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+
+        data = await fetcher()
+        self.cache[cache_key] = (now + ttl_seconds, data)
+        return data
 
     async def fetch_single_flight(self, full_number: str, departure_date: str) -> Any:
         async with self.limiter:
@@ -110,6 +127,95 @@ class AerodataboxFetcherService:
                     f"Error while fetching airport flights, airport_iata={airport_iata}, departure_date={departure_date}, time_window={time_window}, direction={direction}"
                 )
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    async def fetch_flight_delays(self, full_number: str) -> Any:
+        """
+        Get historical delay statistics for a flight number.
+        """
+        full_number = full_number.strip().replace(" ", "").upper()
+        cache_key = f"flight-delays:{full_number}"
+
+        async def fetch():
+            async with self.limiter:
+                url = f"{self.base_url}/api/v1/aedbx/aerodatabox/flights/{full_number}/delays"
+                response = await self.client.get(url)
+
+                if response.status_code == 204:
+                    return {}
+
+                if response.status_code != 200:
+                    logger.warning(
+                        f"Aerodatabox responded with status={response.status_code} for flight delay stats, full_number={full_number}"
+                    )
+                    raise HTTPException(status_code=response.status_code)
+
+                return response.json()
+
+        return await self._cached_json(cache_key, ttl_seconds=60 * 60 * 12, fetcher=fetch)
+
+    async def fetch_airport_delay(
+        self, airport_iata: str, date_local: str | None = None
+    ) -> Any:
+        """
+        Get current or historical delay statistics for one airport.
+        """
+        airport_iata = airport_iata.strip().upper()
+        cache_key = f"airport-delay:{airport_iata}:{date_local or 'current'}"
+
+        async def fetch():
+            async with self.limiter:
+                url = (
+                    f"{self.base_url}/api/v1/aedbx/aerodatabox"
+                    f"/airports/Iata/{airport_iata}/delays"
+                )
+                if date_local:
+                    url = f"{url}/{date_local}"
+
+                response = await self.client.get(url)
+
+                if response.status_code == 204:
+                    return {}
+
+                if response.status_code != 200:
+                    logger.warning(
+                        f"Aerodatabox responded with status={response.status_code} for airport delay stats, airport_iata={airport_iata}, date_local={date_local}"
+                    )
+                    raise HTTPException(status_code=response.status_code)
+
+                return response.json()
+
+        ttl = 60 * 15 if date_local is None else 60 * 60 * 24
+        return await self._cached_json(cache_key, ttl_seconds=ttl, fetcher=fetch)
+
+    async def fetch_route_daily_statistics(
+        self, airport_iata: str, date_local: str
+    ) -> Any:
+        """
+        Get daily route statistics for an airport.
+        """
+        airport_iata = airport_iata.strip().upper()
+        cache_key = f"route-daily-statistics:{airport_iata}:{date_local}"
+
+        async def fetch():
+            async with self.limiter:
+                url = (
+                    f"{self.base_url}/api/v1/aedbx/aerodatabox"
+                    f"/airports/Iata/{airport_iata}/stats/routes/daily/{date_local}"
+                )
+                response = await self.client.get(url)
+
+                if response.status_code == 204:
+                    return {}
+
+                if response.status_code != 200:
+                    logger.warning(
+                        f"Aerodatabox responded with status={response.status_code} for route daily statistics, airport_iata={airport_iata}, date_local={date_local}"
+                    )
+                    raise HTTPException(status_code=response.status_code)
+
+                return response.json()
+
+        return await self._cached_json(cache_key, ttl_seconds=60 * 60 * 24, fetcher=fetch)
 
     async def create_webhook(self, flight_full_number: str) -> Any:
         url = f"{self.base_url}/api/v1/aedbx/aerodatabox/subscriptions/webhook/FlightByNumber/{flight_full_number}?useCredits=true"
@@ -280,6 +386,33 @@ async def get_airport_flights(
         departure_date=departure_date,
         time_window=time_window,
         direction=direction,
+    )
+
+
+@app.get("/flight-delays")
+async def get_flight_delays(full_number: str = Query(...)):
+    return await aerodatabox_fetcher_service.fetch_flight_delays(
+        full_number=full_number
+    )
+
+
+@app.get("/airport-delay")
+async def get_airport_delay(
+    airport_iata: str = Query(...),
+    date_local: str | None = Query(None),
+):
+    return await aerodatabox_fetcher_service.fetch_airport_delay(
+        airport_iata=airport_iata, date_local=date_local
+    )
+
+
+@app.get("/route-daily-statistics")
+async def get_route_daily_statistics(
+    airport_iata: str = Query(...),
+    date_local: str = Query(...),
+):
+    return await aerodatabox_fetcher_service.fetch_route_daily_statistics(
+        airport_iata=airport_iata, date_local=date_local
     )
 
 

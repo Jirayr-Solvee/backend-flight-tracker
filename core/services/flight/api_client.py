@@ -1,4 +1,5 @@
 import asyncio
+from typing import Any
 
 import httpx
 
@@ -61,3 +62,37 @@ class AerodataboxClient:
         return AirportFidsContract(
             departures=combined_departures, arrivals=combined_arrivals
         )
+
+    async def get_flight_delays(self, full_number: str) -> dict[str, Any]:
+        full_number = full_number.strip().replace(" ", "").upper()
+        fetcher_url = (
+            f"{settings.AERODATABOX_SERVICE_URL}"
+            f"flight-delays?full_number={full_number}"
+        )
+        response = await self.client.get(fetcher_url)
+
+        if response.status_code != 200:
+            return {}
+
+        return response.json()
+
+    async def get_airport_delay(
+        self, airport_iata: str | None, date_local: str | None = None
+    ) -> dict[str, Any]:
+        if not airport_iata:
+            return {}
+
+        airport_iata = airport_iata.strip().upper()
+        fetcher_url = (
+            f"{settings.AERODATABOX_SERVICE_URL}"
+            f"airport-delay?airport_iata={airport_iata}"
+        )
+        if date_local:
+            fetcher_url = f"{fetcher_url}&date_local={date_local}"
+
+        response = await self.client.get(fetcher_url)
+
+        if response.status_code != 200:
+            return {}
+
+        return response.json()

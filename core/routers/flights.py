@@ -9,6 +9,7 @@ from ..dependency import get_current_user
 from ..models import get_session
 from ..models.flight import Flight, FlightRead, QuerySearchResponse
 from ..models.user import User, UserFlightLink
+from ..services.flight.delay_risk import DelayRiskResponse, DelayRiskService
 from ..services.flight import FlightPersistence, FlightService
 from ..services.gemini.service import GeminiService
 from ..utils import user_has_active_subscription, normalize_offset
@@ -87,6 +88,44 @@ def assign_flight_to_a_user(
     except Exception:
         session.rollback()
         logger.exception(f"Unable to assign flight id={flight_id}, user id={user.id}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
+
+
+@router.get("/{flight_id}/delay-risk", response_model=DelayRiskResponse)
+async def get_flight_delay_risk(
+    flight_id: int,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    if not user_has_active_subscription(user=user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not Allowed")
+
+    flight = session.get(Flight, flight_id)
+    if not flight:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Flight not found"
+        )
+
+    link = session.exec(
+        select(UserFlightLink).where(
+            UserFlightLink.user_id == user.id,
+            UserFlightLink.flight_id == flight_id,
+        )
+    ).first()
+    if not link:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Flight not found"
+        )
+
+    try:
+        return await DelayRiskService.build_delay_risk(flight=flight)
+    except Exception:
+        logger.exception(
+            f"Unable to build delay risk for flight id={flight_id}, user id={user.id}"
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
