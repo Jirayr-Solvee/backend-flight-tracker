@@ -1,13 +1,19 @@
 import logging
 
-from fastapi import (APIRouter, BackgroundTasks, Depends, HTTPException, Query,
-                     status)
+from fastapi import (APIRouter, BackgroundTasks, Depends, Header, HTTPException,
+                     Query, status)
 from sqlmodel import Session, select
 
 from ..background_tasks import create_webhook_for_flight
 from ..dependency import get_current_user
 from ..models import get_session
-from ..models.flight import Flight, FlightRead, QuerySearchResponse
+from ..models.flight import (
+    CopilotTelemetryRead,
+    Flight,
+    FlightRead,
+    GlobalFlightPositionRead,
+    QuerySearchResponse,
+)
 from ..models.user import User, UserFlightLink
 from ..services.flight.delay_risk import DelayRiskResponse, DelayRiskService
 from ..services.flight import FlightPersistence, FlightService
@@ -17,6 +23,46 @@ from ..utils import user_has_active_subscription, normalize_offset
 router = APIRouter()
 
 logger = logging.getLogger(__name__)
+
+
+@router.get("/live-positions", response_model=list[GlobalFlightPositionRead])
+async def get_global_live_flight_positions(
+    limit: int = Query(5000, ge=1, le=20000),
+    user: User = Depends(get_current_user),
+):
+    return await FlightService.get_global_flight_positions(limit=limit)
+
+
+@router.get("/live-positions/resolve", response_model=FlightRead)
+async def resolve_global_live_flight(
+    callsign: str = Query(..., min_length=3),
+    icao24: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    try:
+        flight = await FlightService.resolve_global_live_flight(
+            session=session,
+            callsign=callsign,
+            icao24=icao24,
+        )
+        if not flight:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Unable to resolve live flight",
+            )
+
+        session.commit()
+        return FlightRead.model_validate(flight, from_attributes=True)
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception:
+        session.rollback()
+        logger.exception(
+            f"Unable to resolve global live flight callsign={callsign}, icao24={icao24}, user id={user.id}"
+        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @router.delete("/{flight_id}/delete", response_model=dict)
@@ -136,18 +182,55 @@ async def get_flight_delay_risk(
 
 
 @router.get(
+    "/{flight_id}/copilot-telemetry",
+    response_model=CopilotTelemetryRead,
+)
+async def get_flight_copilot_telemetry(
+    flight_id: int,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    if not user_has_active_subscription(user=user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not Allowed")
+
+    flight = session.get(Flight, flight_id)
+    if not flight:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Flight not found"
+        )
+
+    link = session.exec(
+        select(UserFlightLink).where(
+            UserFlightLink.user_id == user.id,
+            UserFlightLink.flight_id == flight_id,
+        )
+    ).first()
+    if not link:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Flight not found"
+        )
+
+    return await FlightService.get_copilot_telemetry(flight=flight)
+
+
+@router.get(
     "/search/term",
     summary="Search for flights using nomral text",
     response_model=QuerySearchResponse,
 )
 async def search_flights_from_text(
     term: str = Query(..., min_length=3),
+    language: str | None = Query(default=None),
+    accept_language: str | None = Header(default=None),
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
     try:
         ai_service = GeminiService()
-        result = await ai_service.get_function_call(query=term)
+        result = await ai_service.get_function_call(
+            query=term,
+            language=language or accept_language,
+        )
 
         if not result:
             logger.warning(
@@ -160,6 +243,11 @@ async def search_flights_from_text(
         session.commit()
 
         return flights
+    except HTTPException as exc:
+        session.rollback()
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            return QuerySearchResponse()
+        raise
     except Exception:
         session.rollback()
         logger.exception(f"Error searching for flight using term={term}")

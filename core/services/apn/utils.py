@@ -5,7 +5,8 @@ from sqlmodel import Session, select, update
 
 from ...models.aerodatabox import (
     AerodataboxOriginAndDestinationInformationWebhook,
-    FlightNotificationContractItem)
+    FlightNotificationContractItem,
+    FlightStatusEnum)
 from ...models.device import Device
 from ...models.flight import Arrival, Departure, Flight
 from ...models.notification import DeviceInfo, NotificationBatch
@@ -30,6 +31,14 @@ def extract_all_notifications_for_flight(
     devices_info: list[DeviceInfo],
 ) -> list[NotificationBatch]:
     notification_batches: list[NotificationBatch] = []
+    suppress_departure_timestamps: set[NotificationTimestampTypes] = set()
+    suppress_arrival_timestamps: set[NotificationTimestampTypes] = set()
+
+    if flight.status != webhook_flight.status:
+        if webhook_flight.status == FlightStatusEnum.DEPARTED:
+            suppress_departure_timestamps.add(NotificationTimestampTypes.ACTUAL)
+        elif webhook_flight.status == FlightStatusEnum.ARRIVED:
+            suppress_arrival_timestamps.add(NotificationTimestampTypes.ACTUAL)
 
     basic_notification_batchs = extract_basic_notifications_for_flight(
         flight=flight, webhook_flight=webhook_flight, devices_info=devices_info
@@ -42,6 +51,7 @@ def extract_all_notifications_for_flight(
             db_info=flight.departure,
             webhook_data=webhook_flight.departure,
             devices_info=devices_info,
+            suppressed_time_stamp_types=suppress_departure_timestamps,
         )
         notification_batches.extend(nested_notifications_batches)
 
@@ -51,6 +61,7 @@ def extract_all_notifications_for_flight(
             db_info=flight.arrival,
             webhook_data=webhook_flight.arrival,
             devices_info=devices_info,
+            suppressed_time_stamp_types=suppress_arrival_timestamps,
         )
         notification_batches.extend(nested_notifications_batches)
 
@@ -98,8 +109,10 @@ def extract_nested_notifications_for_flight(
     db_info: Departure | Arrival,
     webhook_data: AerodataboxOriginAndDestinationInformationWebhook,
     devices_info: list[DeviceInfo],
+    suppressed_time_stamp_types: set[NotificationTimestampTypes] | None = None,
 ) -> list[NotificationBatch]:
     notification_batches: list[NotificationBatch] = []
+    suppressed_time_stamp_types = suppressed_time_stamp_types or set()
 
     direction = (
         DirectionType.DEPARTURE.value
@@ -157,6 +170,9 @@ def extract_nested_notifications_for_flight(
         ),
     ]
     for t in time_stamps:
+        if t.type in suppressed_time_stamp_types:
+            continue
+
         if t.new is not None and t.old != t.new:
             batch = ApnService.create_time_stamp_change_notification_batch(
                 location_type=direction,

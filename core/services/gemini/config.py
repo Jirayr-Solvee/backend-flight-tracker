@@ -105,7 +105,7 @@ extract_flight_function = FunctionDeclaration(
 extract_random_flight_function = FunctionDeclaration(
     name="extract_random_flight",
     description=(
-        "When the user requests a random flight, always call this function. "
+        "When the user requests a random flight, sample flight, suggested flight, or surprise flight in any language, always call this function. "
     ),
     parameters=Schema(
         type=Type.OBJECT,
@@ -126,6 +126,7 @@ extract_airport_route_function = FunctionDeclaration(
     description=(
         "Extract exactly three fields from the user query: "
         "`departure_airport_iata`, `arrival_airport_iata`, and `departure_date` (YYYY-MM-DD). "
+        "The query may be in any language. If the user mentions a translated city or airport name, infer the matching city/airport. "
         "If the user mentions a city instead of an airport, use the most relevant/busiest airport in that city. "
         "Always return valid IATA codes. "
         "Return only JSON — do not include extra text. "
@@ -162,7 +163,7 @@ extract_airport_route_single_derection_function = FunctionDeclaration(
     name="extract_flight_info_via_airport_single_derection",
     description=(
         "Use this function when the user asks for flights from or into a single airport "
-        "without specifying a destination. "
+        "without specifying a destination. The query may be in any language. "
         "Infer direction as follows: "
         "- 'from <airport>' → departure "
         "- 'to <airport>' or 'into <airport>' → arrival. "

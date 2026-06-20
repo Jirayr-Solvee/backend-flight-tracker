@@ -36,6 +36,14 @@ class Settings(BaseSettings):
     X_API_MARKET_KEY: str
 
     AERODATABOX_SERVICE_URL: str
+    ADSBEXCHANGE_API_KEY: str | None = None
+    ADSBEXCHANGE_BASE_URL: str = "https://gateway.adsbexchange.com/api/aircraft/v2"
+    ADSBEXCHANGE_AUTH_HEADER: str = "api-auth"
+    ADSBEXCHANGE_GLOBAL_PATHS: str = "all"
+    ADSBEXCHANGE_RAPIDAPI_HOST: str | None = None
+    ADSBEXCHANGE_CACHE_TTL_SECONDS: int = 300
+    GLOBAL_FLIGHT_POSITIONS_RESPONSE_LIMIT: int = 70
+    GLOBAL_FLIGHT_POSITIONS_PER_CONTINENT_LIMIT: int = 10
 
     BALANCE_REFILL_AMMOUNT: int
     BALANCE_REFILL_THRESHOLD: int

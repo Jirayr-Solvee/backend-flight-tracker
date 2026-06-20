@@ -51,6 +51,36 @@ class AerodataboxGreatCircleDistance(BaseModel):
     feet: float
 
 
+class AerodataboxSpeed(BaseModel):
+    kt: float | None = None
+    kmPerHour: float | None = None
+    miPerHour: float | None = None
+    meterPerSecond: float | None = None
+
+
+class AerodataboxAzimuth(BaseModel):
+    deg: float | None = None
+    rad: float | None = None
+
+
+class AerodataboxPressure(BaseModel):
+    hPa: float | None = None
+    inHg: float | None = None
+    mmHg: float | None = None
+
+
+class AerodataboxFlightLocation(BaseModel):
+    pressureAltitude: AerodataboxGreatCircleDistance | None = None
+    altitude: AerodataboxGreatCircleDistance | None = None
+    pressure: AerodataboxPressure | None = None
+    groundSpeed: AerodataboxSpeed | None = None
+    trueTrack: AerodataboxAzimuth | None = None
+    vsiFpm: int | None = None
+    reportedAtUtc: str | None = None
+    lat: float | None = None
+    lon: float | None = None
+
+
 class AerodataboxTimeStamp(BaseModel):
     utc: str
     local: str
@@ -110,6 +140,8 @@ class AerodataboxFlight(BaseModel):
     aircraft: AerodataboxAircraft | None = None
 
     airline: AerodataboxAirline | None = None
+
+    location: AerodataboxFlightLocation | None = None
 
 
 # ---------------- Models for webhook ------------------
@@ -181,6 +213,8 @@ class AerodataboxFlightWebhook(BaseModel):
 
     airline: AerodataboxAirline | None = None
 
+    location: AerodataboxFlightLocation | None = None
+
     @field_validator("status", mode="before")
     def map_status(cls, v):
         # If the webhook sends a number, convert it
@@ -243,6 +277,8 @@ class AerodataboxAirportFlight(BaseModel):
     status: FlightStatusEnum
 
     airline: AerodataboxAirline | None = None
+
+    location: AerodataboxFlightLocation | None = None
 
 
 class AirportFidsContract(BaseModel):

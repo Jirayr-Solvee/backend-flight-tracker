@@ -61,10 +61,19 @@ class AerodataboxFetcherService:
         self.cache[cache_key] = (now + ttl_seconds, data)
         return data
 
-    async def fetch_single_flight(self, full_number: str, departure_date: str) -> Any:
+    async def fetch_single_flight(
+        self, full_number: str, departure_date: str, with_location: bool = False
+    ) -> Any:
         async with self.limiter:
             try:
-                url = f"{self.base_url}/api/v1/aedbx/aerodatabox/flights/Number/{full_number}/{departure_date}?dateLocalRole=Departure&withAircraftImage=false&withLocation=false&withFlightPlan=false"
+                url = (
+                    f"{self.base_url}/api/v1/aedbx/aerodatabox"
+                    f"/flights/Number/{full_number}/{departure_date}"
+                    f"?dateLocalRole=Departure"
+                    f"&withAircraftImage=false"
+                    f"&withLocation={str(with_location).lower()}"
+                    f"&withFlightPlan=false"
+                )
                 response = await self.client.get(url)
 
                 if response.status_code != 200:
@@ -374,10 +383,14 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/flights")
 async def fetch_single_flight(
-    full_number: str = Query(...), departure_date: str = Query(...)
+    full_number: str = Query(...),
+    departure_date: str = Query(...),
+    with_location: bool = Query(False),
 ):
     return await aerodatabox_fetcher_service.fetch_single_flight(
-        full_number=full_number, departure_date=departure_date
+        full_number=full_number,
+        departure_date=departure_date,
+        with_location=with_location,
     )
 
 

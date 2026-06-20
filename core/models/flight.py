@@ -173,6 +173,47 @@ class FlightRead(SQLModel):
     aircraft_model: str | None = None
 
 
+class CopilotTelemetryRead(SQLModel):
+    flight_id: int
+    flight_number: str
+    status: str
+    data_source: str
+    location_available: bool
+    reported_at_utc: str | None = None
+    lat: float | None = None
+    lon: float | None = None
+    altitude_feet: float | None = None
+    altitude_meter: float | None = None
+    pressure_altitude_feet: float | None = None
+    pressure_altitude_meter: float | None = None
+    ground_speed_mph: float | None = None
+    ground_speed_kph: float | None = None
+    ground_speed_kt: float | None = None
+    true_track_deg: float | None = None
+    vertical_speed_fpm: int | None = None
+
+
+class GlobalFlightPositionRead(SQLModel):
+    id: str
+    icao24: str
+    callsign: str | None = None
+    display_code: str
+    origin_country: str | None = None
+    time_position: int | None = None
+    last_contact: int | None = None
+    lat: float
+    lon: float
+    baro_altitude_m: float | None = None
+    geo_altitude_m: float | None = None
+    altitude_feet: float | None = None
+    velocity_mps: float | None = None
+    ground_speed_kt: float | None = None
+    true_track_deg: float | None = None
+    vertical_rate_mps: float | None = None
+    vertical_speed_fpm: int | None = None
+    on_ground: bool
+
+
 # ------- Models for airport search result --------
 class AirportFlightAirportInfoRead(SQLModel):
     iata: str
