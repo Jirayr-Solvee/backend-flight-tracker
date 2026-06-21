@@ -64,8 +64,6 @@ class FlightService:
             "GLO",
             "LA",
             "LAN",
-            "JJ",
-            "TAM",
         },
         "europe": {
             "AF",
