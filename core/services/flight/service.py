@@ -1,6 +1,9 @@
+import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Sequence
 
 from sqlmodel import Session
@@ -30,6 +33,89 @@ logger = logging.getLogger(__name__)
 
 class FlightService:
     _global_positions_cache: tuple[datetime, list[GlobalFlightPositionRead]] | None = None
+    _iata_by_icao_cache: dict[str, str] | None = None
+    _iata_by_icao_overrides = {
+        "DLH": "LH",
+        "GLO": "G3",
+        "SIA": "SQ",
+    }
+    _route_callsign_pattern = re.compile(r"^([A-Z]{2,3})([0-9]{1,4})$")
+    _major_airlines_by_continent: dict[str, set[str]] = {
+        "north_america": {
+            "AA",
+            "AAL",
+            "AC",
+            "ACA",
+            "DL",
+            "DAL",
+            "UA",
+            "UAL",
+            "WN",
+            "SWA",
+        },
+        "south_america": {
+            "AD",
+            "AZU",
+            "AV",
+            "AVA",
+            "CM",
+            "CMP",
+            "G3",
+            "GLO",
+            "LA",
+            "LAN",
+            "JJ",
+            "TAM",
+        },
+        "europe": {
+            "AF",
+            "AFR",
+            "BA",
+            "BAW",
+            "KL",
+            "KLM",
+            "LH",
+            "DLH",
+            "TK",
+            "THY",
+        },
+        "africa": {
+            "EK",
+            "UAE",
+            "KQ",
+            "KQA",
+            "MS",
+            "MSR",
+            "SA",
+            "SAA",
+            "AT",
+            "RAM",
+        },
+        "asia": {
+            "CX",
+            "CPA",
+            "EK",
+            "UAE",
+            "QR",
+            "QTR",
+            "SQ",
+            "SIA",
+            "TK",
+            "THY",
+        },
+        "oceania": {
+            "FJ",
+            "FJI",
+            "JQ",
+            "JST",
+            "NZ",
+            "ANZ",
+            "QF",
+            "QFA",
+            "VA",
+            "VOZ",
+        },
+    }
 
     @staticmethod
     async def get_global_flight_positions(limit: int | None = None) -> list[GlobalFlightPositionRead]:
@@ -84,8 +170,23 @@ class FlightService:
         if not FlightService._looks_like_route_callsign(position):
             return False
 
+        continent = FlightService._continent_key(lat=position.lat, lon=position.lon)
+        if (
+            settings.GLOBAL_FLIGHT_MAJOR_AIRLINES_ONLY
+            and not FlightService._is_preferred_global_airline(
+                position=position,
+                continent=continent,
+            )
+        ):
+            return False
+
+        FlightService._normalize_position_callsign_for_tracking(position)
+
         latest_contact = position.time_position or position.last_contact
-        if latest_contact is not None and now_timestamp - latest_contact > 300:
+        if latest_contact is None:
+            return False
+
+        if now_timestamp - latest_contact > 300:
             return False
 
         altitude_feet = position.altitude_feet or 0
@@ -93,7 +194,7 @@ class FlightService:
             position.velocity_mps * 1.943844 if position.velocity_mps is not None else 0
         )
 
-        return altitude_feet >= 1_000 or ground_speed_kt >= 120
+        return altitude_feet >= 5_000 and ground_speed_kt >= 180
 
     @staticmethod
     def _looks_like_route_callsign(position: GlobalFlightPositionRead) -> bool:
@@ -107,7 +208,103 @@ class FlightService:
         if code.startswith("N") and len(code) > 1 and code[1].isdigit():
             return False
 
-        return any(char.isalpha() for char in code) and any(char.isdigit() for char in code)
+        return FlightService._route_callsign_pattern.match(code) is not None
+
+    @staticmethod
+    def _is_preferred_global_airline(
+        position: GlobalFlightPositionRead,
+        continent: str,
+    ) -> bool:
+        prefix = FlightService._callsign_airline_prefix(position)
+        if not prefix:
+            return False
+
+        preferred_codes = FlightService._preferred_airline_codes_for_continent(continent)
+        if not preferred_codes:
+            return False
+
+        normalized_prefix = FlightService._iata_for_airline_prefix(prefix) or prefix
+        return prefix in preferred_codes or normalized_prefix in preferred_codes
+
+    @staticmethod
+    def _preferred_airline_codes_for_continent(continent: str) -> set[str]:
+        preferred_codes = FlightService._major_airlines_by_continent.get(continent)
+        if preferred_codes:
+            return preferred_codes
+
+        return {
+            code
+            for continent_codes in FlightService._major_airlines_by_continent.values()
+            for code in continent_codes
+        }
+
+    @staticmethod
+    def _callsign_airline_prefix(position: GlobalFlightPositionRead) -> str | None:
+        code = (position.callsign or position.display_code or "").strip().upper()
+        match = FlightService._route_callsign_pattern.match(code)
+        if not match:
+            return None
+
+        return match.group(1)
+
+    @staticmethod
+    def _normalize_position_callsign_for_tracking(position: GlobalFlightPositionRead) -> None:
+        if not settings.GLOBAL_FLIGHT_NORMALIZE_CALLSIGN_TO_IATA:
+            return
+
+        code = (position.callsign or position.display_code or "").strip().upper()
+        normalized = FlightService._normalized_callsign_for_tracking(code)
+        if not normalized:
+            return
+
+        position.callsign = normalized
+        position.display_code = normalized
+
+    @staticmethod
+    def _normalized_callsign_for_tracking(code: str) -> str | None:
+        match = FlightService._route_callsign_pattern.match(code)
+        if not match:
+            return None
+
+        prefix, number = match.groups()
+        iata = FlightService._iata_for_airline_prefix(prefix)
+        if not iata:
+            return code
+
+        return f"{iata}{number}"
+
+    @staticmethod
+    def _iata_for_airline_prefix(prefix: str) -> str | None:
+        prefix = prefix.strip().upper()
+        if len(prefix) != 3:
+            return None
+
+        return FlightService._iata_by_icao().get(prefix)
+
+    @staticmethod
+    def _iata_by_icao() -> dict[str, str]:
+        if FlightService._iata_by_icao_cache is not None:
+            return FlightService._iata_by_icao_cache
+
+        try:
+            airline_map_path = Path(settings.AIRLINE_MAP_JSON)
+            if not airline_map_path.is_absolute():
+                airline_map_path = Path.cwd() / airline_map_path
+
+            with airline_map_path.open("r") as file:
+                iata_to_icao = json.load(file)
+
+            FlightService._iata_by_icao_cache = {
+                str(icao).strip().upper(): str(iata).strip().upper()
+                for iata, icao in iata_to_icao.items()
+                if str(iata).strip() and str(icao).strip()
+            }
+            FlightService._iata_by_icao_cache.update(FlightService._iata_by_icao_overrides)
+        except Exception:
+            logger.exception("Unable to load airline IATA/ICAO map")
+            FlightService._iata_by_icao_cache = FlightService._iata_by_icao_overrides.copy()
+
+        return FlightService._iata_by_icao_cache
 
     @staticmethod
     def _sample_global_positions_by_continent(
