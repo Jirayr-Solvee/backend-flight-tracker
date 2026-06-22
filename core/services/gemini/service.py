@@ -1,8 +1,10 @@
 import asyncio
+import json
 import logging
 import re
 from datetime import timedelta
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from google import genai
@@ -25,6 +27,8 @@ class ResolvedFunctionCall(FunctionCallResult):
 
 
 class GeminiService:
+    _iata_by_icao_cache: dict[str, str] | None = None
+
     def __init__(self):
         api_key = (settings.GEMINI_API_KEY or "").strip()
         if not api_key:
@@ -166,7 +170,9 @@ class GeminiService:
         missing_fields = [
             field
             for field in required_fields
-            if field not in args or args[field] in (None, "")
+            if field not in args
+            or args[field] is None
+            or (isinstance(args[field], str) and args[field].strip() == "")
         ]
 
         if missing_fields:
@@ -187,16 +193,13 @@ class GeminiService:
                 args={"random": True},
             )
 
-        flight_match = re.search(
-            r"(?<![A-Z0-9])([A-Z0-9]{2})\s*([0-9]{1,4}[A-Z]?)(?![A-Z0-9])",
-            normalized.upper(),
-        )
-        if flight_match:
+        flight = self._flight_from_query(normalized)
+        if flight:
             return self._resolved_function_call(
                 function_name="extract_flight_info",
                 args={
-                    "airline_iata": flight_match.group(1),
-                    "flight_number": flight_match.group(2),
+                    "airline_iata": flight[0],
+                    "flight_number": flight[1],
                     "departure_date": self._date_from_query(lowered),
                 },
             )
@@ -222,6 +225,27 @@ class GeminiService:
                 args={
                     "departure_airport_iata": aliased_route[0],
                     "arrival_airport_iata": aliased_route[1],
+                    "departure_date": self._date_from_query(lowered),
+                },
+            )
+
+        single_airport = self._single_airport_from_aliases(lowered)
+        if single_airport:
+            return self._resolved_function_call(
+                function_name="extract_flight_info_via_airport_single_derection",
+                args={
+                    "airport_iata": single_airport[0],
+                    "direction": single_airport[1],
+                    "departure_date": self._date_from_query(lowered),
+                },
+            )
+
+        airline_iata = self._airline_only_query(lowered)
+        if airline_iata:
+            return self._resolved_function_call(
+                function_name="extract_airline_live_flights",
+                args={
+                    "airline_iata": airline_iata,
                     "departure_date": self._date_from_query(lowered),
                 },
             )
@@ -296,13 +320,40 @@ class GeminiService:
         return today.isoformat()
 
     @classmethod
+    def _flight_from_query(cls, query: str) -> tuple[str, str] | None:
+        lowered = query.casefold()
+        for alias, airline_iata in cls._airline_aliases_by_length():
+            match = re.search(
+                rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])"
+                r"(?:\s+flight)?\s+([0-9]{1,4}[a-z]?)\b",
+                lowered,
+            )
+            if match:
+                return airline_iata, match.group(1).upper()
+
+        upper = query.upper()
+        for pattern in (
+            r"(?<![A-Z0-9])([A-Z]{3})\s*([0-9]{1,4}[A-Z]?)(?![A-Z0-9])",
+            r"(?<![A-Z0-9])([A-Z0-9]{2})\s*([0-9]{1,4}[A-Z]?)(?![A-Z0-9])",
+        ):
+            match = re.search(pattern, upper)
+            if not match:
+                continue
+
+            airline_iata = cls._iata_for_airline_token(match.group(1))
+            if airline_iata:
+                return airline_iata, match.group(2)
+
+        return None
+
+    @classmethod
     def _route_from_aliases(cls, lowered_query: str) -> tuple[str, str] | None:
         normalized = cls._normalized_route_text(lowered_query)
-        for departure_name, departure_iata in cls._airport_aliases().items():
+        for departure_name, departure_iata in cls._airport_aliases_by_length():
             if departure_name not in normalized:
                 continue
 
-            for arrival_name, arrival_iata in cls._airport_aliases().items():
+            for arrival_name, arrival_iata in cls._airport_aliases_by_length():
                 if departure_iata == arrival_iata or arrival_name not in normalized:
                     continue
 
@@ -314,6 +365,48 @@ class GeminiService:
                     return departure_iata, arrival_iata
 
         return None
+
+    @classmethod
+    def _single_airport_from_aliases(cls, lowered_query: str) -> tuple[str, str] | None:
+        normalized = cls._normalized_route_text(lowered_query)
+        stripped = normalized.strip()
+
+        for airport_name, airport_iata in cls._airport_aliases_by_length():
+            if len(airport_name) < 3 and stripped != airport_name:
+                continue
+
+            if not re.search(
+                rf"(?<![a-z0-9]){re.escape(airport_name)}(?![a-z0-9])",
+                normalized,
+            ):
+                continue
+
+            return airport_iata, cls._single_airport_direction(normalized)
+
+        return None
+
+    @staticmethod
+    def _single_airport_direction(normalized_query: str) -> str:
+        if re.search(r"\b(to|into|arrivals?|arriving|inbound)\b", normalized_query):
+            return "Arrival"
+
+        return "Departure"
+
+    @classmethod
+    def _airline_only_query(cls, lowered_query: str) -> str | None:
+        normalized = re.sub(r"\s+", " ", lowered_query).strip()
+        normalized = re.sub(
+            r"\b(flights?|airline|airlines|departures?|arrivals?|today|tomorrow|yesterday)\b",
+            "",
+            normalized,
+        )
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+
+        for alias, airline_iata in cls._airline_aliases_by_length():
+            if normalized == alias:
+                return airline_iata
+
+        return cls._iata_for_airline_token(normalized.upper())
 
     @staticmethod
     def _normalized_route_text(value: str) -> str:
@@ -351,7 +444,11 @@ class GeminiService:
             "nyc": "JFK",
             "jfk": "JFK",
             "london": "LHR",
+            "london heathrow": "LHR",
             "lhr": "LHR",
+            "london luton": "LTN",
+            "luton": "LTN",
+            "ltn": "LTN",
             "paris": "CDG",
             "parís": "CDG",
             "cdg": "CDG",
@@ -364,4 +461,121 @@ class GeminiService:
             "gru": "GRU",
             "yerevan": "EVN",
             "evn": "EVN",
+            "prishtina": "PRN",
+            "pristina": "PRN",
+            "prn": "PRN",
+            "honolulu": "HNL",
+            "hawaii": "HNL",
+            "hnl": "HNL",
+            "noida international airport": "DXN",
+            "noida intertional": "DXN",
+            "noida": "DXN",
+            "dxn": "DXN",
+            "ahmedabad": "AMD",
+            "amd": "AMD",
+            "nanded": "NDC",
+            "nandad": "NDC",
+            "ndc": "NDC",
         }
+
+    @classmethod
+    def _airport_aliases_by_length(cls) -> list[tuple[str, str]]:
+        return sorted(
+            cls._airport_aliases().items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _airline_aliases() -> dict[str, str]:
+        return {
+            "aer lingus": "EI",
+            "air canada": "AC",
+            "air france": "AF",
+            "air india": "AI",
+            "alaska": "AS",
+            "alaska airlines": "AS",
+            "american": "AA",
+            "american airlines": "AA",
+            "ana": "NH",
+            "british airways": "BA",
+            "delta": "DL",
+            "delta air lines": "DL",
+            "easyjet": "U2",
+            "emirates": "EK",
+            "etihad": "EY",
+            "flynas": "XY",
+            "flynass": "XY",
+            "frontier": "F9",
+            "indigo": "6E",
+            "jet blue": "B6",
+            "jetblue": "B6",
+            "klm": "KL",
+            "lufthansa": "LH",
+            "qantas": "QF",
+            "qatar": "QR",
+            "qatar airways": "QR",
+            "ryanair": "FR",
+            "southwest": "WN",
+            "spirit": "NK",
+            "swiss": "LX",
+            "turkish": "TK",
+            "turkish airlines": "TK",
+            "united": "UA",
+            "united airlines": "UA",
+            "vueling": "VY",
+            "wizz": "W6",
+            "wizz air": "W6",
+        }
+
+    @classmethod
+    def _airline_aliases_by_length(cls) -> list[tuple[str, str]]:
+        aliases = cls._airline_aliases()
+        aliases.update({iata.casefold(): iata for iata in set(aliases.values())})
+        return sorted(
+            aliases.items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
+
+    @classmethod
+    def _iata_for_airline_token(cls, token: str) -> str | None:
+        normalized = token.strip().upper()
+        if re.fullmatch(r"[A-Z0-9]{2}", normalized):
+            return normalized
+
+        if re.fullmatch(r"[A-Z]{3}", normalized):
+            return cls._iata_by_icao().get(normalized)
+
+        return None
+
+    @classmethod
+    def _iata_by_icao(cls) -> dict[str, str]:
+        if cls._iata_by_icao_cache is not None:
+            return cls._iata_by_icao_cache
+
+        try:
+            airline_map_path = Path(settings.AIRLINE_MAP_JSON)
+            if not airline_map_path.is_absolute():
+                airline_map_path = Path.cwd() / airline_map_path
+
+            with airline_map_path.open("r") as file:
+                iata_to_icao = json.load(file)
+
+            cls._iata_by_icao_cache = {
+                str(icao).strip().upper(): str(iata).strip().upper()
+                for iata, icao in iata_to_icao.items()
+                if str(iata).strip() and str(icao).strip()
+            }
+            cls._iata_by_icao_cache.update(
+                {
+                    "DLH": "LH",
+                    "GLO": "G3",
+                    "SIA": "SQ",
+                }
+            )
+        except Exception:
+            logger.exception("Unable to load airline IATA/ICAO map")
+            cls._iata_by_icao_cache = {}
+
+        return cls._iata_by_icao_cache

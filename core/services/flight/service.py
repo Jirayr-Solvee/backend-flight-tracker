@@ -6,7 +6,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Sequence
 
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from ...config import settings
 from ...models.aerodatabox import (
@@ -16,6 +16,7 @@ from ...models.aerodatabox import (
     FlightStatusEnum,
 )
 from ...models.flight import (
+    Airline,
     AirportFlightOriginAndDestinationInfoRead,
     AirportFlightRead,
     CopilotTelemetryRead,
@@ -39,7 +40,10 @@ class FlightService:
         "GLO": "G3",
         "SIA": "SQ",
     }
-    _route_callsign_pattern = re.compile(r"^([A-Z]{2,3})([0-9]{1,4})$")
+    _route_callsign_patterns = (
+        re.compile(r"^([A-Z]{3})([0-9]{1,4})$"),
+        re.compile(r"^([A-Z0-9]{2})([0-9]{1,4})$"),
+    )
     _major_airlines_by_continent: dict[str, set[str]] = {
         "north_america": {
             "AA",
@@ -118,17 +122,7 @@ class FlightService:
     @staticmethod
     async def get_global_flight_positions(limit: int | None = None) -> list[GlobalFlightPositionRead]:
         now = datetime.now(timezone.utc)
-        cached = FlightService._global_positions_cache
-        ttl_seconds = max(1, settings.ADSBEXCHANGE_CACHE_TTL_SECONDS)
-        if cached and now - cached[0] < timedelta(seconds=ttl_seconds):
-            positions = cached[1]
-        else:
-            try:
-                positions = await ADSBExchangeClient().get_global_positions()
-                FlightService._global_positions_cache = (now, positions)
-            except Exception:
-                logger.exception("Unable to fetch global flight positions")
-                positions = cached[1] if cached else []
+        positions = await FlightService._get_cached_global_positions(now=now)
 
         response_limit = settings.GLOBAL_FLIGHT_POSITIONS_RESPONSE_LIMIT
         if limit is not None:
@@ -141,6 +135,24 @@ class FlightService:
             per_continent_limit=settings.GLOBAL_FLIGHT_POSITIONS_PER_CONTINENT_LIMIT,
             overall_limit=response_limit,
         )
+
+    @staticmethod
+    async def _get_cached_global_positions(
+        now: datetime | None = None,
+    ) -> list[GlobalFlightPositionRead]:
+        now = now or datetime.now(timezone.utc)
+        cached = FlightService._global_positions_cache
+        ttl_seconds = max(1, settings.ADSBEXCHANGE_CACHE_TTL_SECONDS)
+        if cached and now - cached[0] < timedelta(seconds=ttl_seconds):
+            return cached[1]
+
+        try:
+            positions = await ADSBExchangeClient().get_global_positions()
+            FlightService._global_positions_cache = (now, positions)
+            return positions
+        except Exception:
+            logger.exception("Unable to fetch global flight positions")
+            return cached[1] if cached else []
 
     @staticmethod
     def _filter_global_positions_on_route(
@@ -161,6 +173,7 @@ class FlightService:
     def _global_position_is_on_route(
         position: GlobalFlightPositionRead,
         now_timestamp: int,
+        major_airlines_only: bool | None = None,
     ) -> bool:
         if position.on_ground:
             return False
@@ -169,8 +182,11 @@ class FlightService:
             return False
 
         continent = FlightService._continent_key(lat=position.lat, lon=position.lon)
+        if major_airlines_only is None:
+            major_airlines_only = settings.GLOBAL_FLIGHT_MAJOR_AIRLINES_ONLY
+
         if (
-            settings.GLOBAL_FLIGHT_MAJOR_AIRLINES_ONLY
+            major_airlines_only
             and not FlightService._is_preferred_global_airline(
                 position=position,
                 continent=continent,
@@ -195,6 +211,78 @@ class FlightService:
         return altitude_feet >= 5_000 and ground_speed_kt >= 180
 
     @staticmethod
+    async def get_airline_live_flights(
+        session: Session,
+        airline_iata: str,
+        limit: int = 8,
+    ) -> list[Flight]:
+        airline_iata = airline_iata.strip().upper()
+        if not airline_iata or limit <= 0:
+            return []
+
+        now = datetime.now(timezone.utc)
+        now_timestamp = int(now.timestamp())
+        positions = await FlightService._get_cached_global_positions(now=now)
+
+        candidates: list[GlobalFlightPositionRead] = []
+        for position in positions:
+            if not FlightService._global_position_matches_airline(
+                position=position,
+                airline_iata=airline_iata,
+            ):
+                continue
+
+            if FlightService._global_position_is_on_route(
+                position=position,
+                now_timestamp=now_timestamp,
+                major_airlines_only=False,
+            ):
+                candidates.append(position)
+
+        flights: list[Flight] = []
+        seen_flight_numbers: set[str] = set()
+        for position in FlightService._sample_global_positions(candidates, limit * 2):
+            callsign = (position.callsign or position.display_code or "").strip().upper()
+            if not callsign or callsign in seen_flight_numbers:
+                continue
+
+            try:
+                flight = await FlightService.resolve_global_live_flight(
+                    session=session,
+                    callsign=callsign,
+                    icao24=position.icao24,
+                )
+            except Exception:
+                logger.exception(
+                    "Unable to resolve airline live flight airline_iata=%s, callsign=%s",
+                    airline_iata,
+                    callsign,
+                )
+                continue
+
+            if not flight:
+                continue
+
+            seen_flight_numbers.add(callsign)
+            flights.append(flight)
+            if len(flights) >= limit:
+                break
+
+        return flights
+
+    @staticmethod
+    def _global_position_matches_airline(
+        position: GlobalFlightPositionRead,
+        airline_iata: str,
+    ) -> bool:
+        prefix = FlightService._callsign_airline_prefix(position)
+        if not prefix:
+            return False
+
+        normalized_prefix = FlightService._iata_for_airline_prefix(prefix) or prefix
+        return normalized_prefix == airline_iata or prefix == airline_iata
+
+    @staticmethod
     def _looks_like_route_callsign(position: GlobalFlightPositionRead) -> bool:
         code = (position.callsign or position.display_code or "").strip().upper()
         if not code or code == position.icao24.upper():
@@ -206,7 +294,7 @@ class FlightService:
         if code.startswith("N") and len(code) > 1 and code[1].isdigit():
             return False
 
-        return FlightService._route_callsign_pattern.match(code) is not None
+        return FlightService._route_callsign_match(code) is not None
 
     @staticmethod
     def _is_preferred_global_airline(
@@ -239,7 +327,7 @@ class FlightService:
     @staticmethod
     def _callsign_airline_prefix(position: GlobalFlightPositionRead) -> str | None:
         code = (position.callsign or position.display_code or "").strip().upper()
-        match = FlightService._route_callsign_pattern.match(code)
+        match = FlightService._route_callsign_match(code)
         if not match:
             return None
 
@@ -260,7 +348,7 @@ class FlightService:
 
     @staticmethod
     def _normalized_callsign_for_tracking(code: str) -> str | None:
-        match = FlightService._route_callsign_pattern.match(code)
+        match = FlightService._route_callsign_match(code)
         if not match:
             return None
 
@@ -270,6 +358,15 @@ class FlightService:
             return code
 
         return f"{iata}{number}"
+
+    @staticmethod
+    def _route_callsign_match(code: str) -> re.Match[str] | None:
+        for pattern in FlightService._route_callsign_patterns:
+            match = pattern.match(code)
+            if match:
+                return match
+
+        return None
 
     @staticmethod
     def _iata_for_airline_prefix(prefix: str) -> str | None:
@@ -739,6 +836,37 @@ class FlightQueryHandler:
         flight = FlightPersistence.get_random_flight(session=session)
         return QuerySearchResponse(
             flights_result=[FlightRead.model_validate(flight, from_attributes=True)] if flight else []
+        )
+
+    @staticmethod
+    async def extract_airline_live_flights(
+        airline_iata: str,
+        departure_date: str,
+        session: Session,
+        limit: int = 8,
+        **kwargs,
+    ):
+        normalized_airline_iata = airline_iata.strip().upper()
+        flights = await FlightService.get_airline_live_flights(
+            session=session,
+            airline_iata=normalized_airline_iata,
+            limit=limit,
+        )
+
+        if not flights:
+            flights = session.exec(
+                select(Flight)
+                .join(Airline, Flight.airline_id == Airline.id)
+                .where(Airline.iata == normalized_airline_iata)
+                .where(Flight.date >= departure_date)
+                .limit(limit)
+            ).all()
+
+        return QuerySearchResponse(
+            flights_result=[
+                FlightRead.model_validate(flight, from_attributes=True)
+                for flight in flights
+            ]
         )
 
     @staticmethod

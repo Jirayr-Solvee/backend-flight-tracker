@@ -41,6 +41,10 @@ REQUIRED_FIELDS: dict[str, FunctionDefinition] = {
         required_fields=["random"],
         handler=FlightQueryHandler.extract_random_flight,
     ),
+    "extract_airline_live_flights": FunctionDefinition(
+        required_fields=["airline_iata", "departure_date"],
+        handler=FlightQueryHandler.extract_airline_live_flights,
+    ),
 }
 
 # a single config to see where a flight is going into
@@ -117,6 +121,31 @@ extract_random_flight_function = FunctionDeclaration(
             ),
         },
         required=REQUIRED_FIELDS["extract_random_flight"].required_fields,
+    ),
+)
+
+extract_airline_live_flights_function = FunctionDeclaration(
+    name="extract_airline_live_flights",
+    description=(
+        "Use this function when the user searches for an airline by itself, without a flight number or route. "
+        "Return live flights for the airline using its two-character IATA code. "
+        "Examples: JetBlue -> B6, IndiGo -> 6E, Air France -> AF, KLM -> KL."
+    ),
+    parameters=Schema(
+        type=Type.OBJECT,
+        properties={
+            "airline_iata": Schema(
+                type=Type.STRING,
+                description="Two-character airline IATA code, e.g. 'B6', '6E', 'AF'.",
+                nullable=False,
+            ),
+            "departure_date": Schema(
+                type=Type.STRING,
+                description="Date in YYYY-MM-DD format. Use current UTC date if no date is mentioned.",
+                nullable=False,
+            ),
+        },
+        required=REQUIRED_FIELDS["extract_airline_live_flights"].required_fields,
     ),
 )
 
@@ -210,6 +239,7 @@ query_tools = Tool(
         extract_airport_route_function,
         extract_airport_route_single_derection_function,
         extract_random_flight_function,
+        extract_airline_live_flights_function,
     ]
 )
 query_config = GenerateContentConfig(tools=[query_tools])
