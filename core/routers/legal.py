@@ -88,11 +88,11 @@ PRIVACY_POLICY_HTML = """<!doctype html>
 """
 
 
-@router.get("/privacy.html", response_class=HTMLResponse)
+@router.api_route("/privacy.html", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def privacy_html() -> str:
     return PRIVACY_POLICY_HTML
 
 
-@router.get("/privacy", response_class=HTMLResponse)
+@router.api_route("/privacy", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def privacy() -> str:
     return PRIVACY_POLICY_HTML
