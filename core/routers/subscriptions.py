@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlmodel import select
 
-from ..dependency import get_current_user
+from ..dependency import check_lambda_auth_token, get_current_user
 from ..models import Session, get_session
 from ..models.subscription import Subscription
 from ..models.transaction import Transaction
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.get("/")
+@router.get("/", dependencies=[Depends(check_lambda_auth_token)])
 def get_all(session: Session = Depends(get_session)):
     subscriptions = session.exec(select(Subscription)).all()
     formatted = [
