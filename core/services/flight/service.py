@@ -1,6 +1,8 @@
+import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -22,6 +24,7 @@ from ...models.flight import (
     CopilotTelemetryRead,
     Flight,
     FlightRead,
+    GlobalFlightResolveCandidate,
     GlobalFlightPositionRead,
     QuerySearchResponse,
 )
@@ -30,6 +33,20 @@ from .mapper import AirportFlightMapper
 from .persistence import FlightPersistence
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class NormalizedGlobalFlightResolveCandidate:
+    callsign: str
+    icao24: str | None = None
+
+
+@dataclass(frozen=True)
+class GlobalLiveFlightResolveMatch:
+    candidate: NormalizedGlobalFlightResolveCandidate
+    departure_date: str
+    live_flights: list[AerodataboxFlight]
+    live_flight: AerodataboxFlight
 
 
 class FlightService:
@@ -526,10 +543,109 @@ class FlightService:
         callsign: str,
         icao24: str | None = None,
     ) -> Flight | None:
-        full_number = callsign.strip().replace(" ", "").upper()
-        if len(full_number) < 3:
+        candidate = FlightService._normalized_global_resolve_candidate(
+            callsign=callsign,
+            icao24=icao24,
+        )
+        if not candidate:
             return None
 
+        match = await FlightService._fetch_global_live_flight_match_for_candidate(
+            candidate=candidate,
+            require_on_route=False,
+        )
+        if not match:
+            return None
+
+        return FlightService._persist_global_live_flight_match(
+            session=session,
+            match=match,
+        )
+
+    @staticmethod
+    async def resolve_global_live_flight_candidates(
+        session: Session,
+        candidates: Sequence[GlobalFlightResolveCandidate],
+    ) -> Flight | None:
+        normalized_candidates = FlightService._normalized_global_resolve_candidates(
+            candidates=candidates,
+            limit=settings.GLOBAL_FLIGHT_RESOLVE_CANDIDATE_LIMIT,
+        )
+        if not normalized_candidates:
+            return None
+
+        tasks = [
+            asyncio.create_task(
+                FlightService._fetch_global_live_flight_match_for_candidate(
+                    candidate=candidate,
+                    require_on_route=True,
+                )
+            )
+            for candidate in normalized_candidates
+        ]
+
+        try:
+            original_match = await tasks[0]
+            if original_match:
+                original_flight = FlightService._safe_persist_global_live_flight_match(
+                    session=session,
+                    match=original_match,
+                )
+                if original_flight:
+                    await FlightService._cancel_global_resolve_tasks(tasks[1:])
+                    return original_flight
+
+            for task in asyncio.as_completed(tasks[1:]):
+                match = await task
+                if not match:
+                    continue
+
+                backup_flight = FlightService._safe_persist_global_live_flight_match(
+                    session=session,
+                    match=match,
+                )
+                if backup_flight:
+                    await FlightService._cancel_global_resolve_tasks(tasks)
+                    return backup_flight
+
+            return None
+        finally:
+            await FlightService._cancel_global_resolve_tasks(tasks)
+
+    @staticmethod
+    async def _fetch_global_live_flight_match_for_candidate(
+        candidate: NormalizedGlobalFlightResolveCandidate,
+        require_on_route: bool,
+    ) -> GlobalLiveFlightResolveMatch | None:
+        timeout = max(1.0, settings.GLOBAL_FLIGHT_RESOLVE_CANDIDATE_TIMEOUT_SECONDS)
+        try:
+            return await asyncio.wait_for(
+                FlightService._fetch_global_live_flight_match(
+                    candidate=candidate,
+                    require_on_route=require_on_route,
+                ),
+                timeout=timeout,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Timed out resolving global live flight callsign=%s, icao24=%s",
+                candidate.callsign,
+                candidate.icao24,
+            )
+        except Exception:
+            logger.exception(
+                "Unable to resolve global live flight candidate callsign=%s, icao24=%s",
+                candidate.callsign,
+                candidate.icao24,
+            )
+
+        return None
+
+    @staticmethod
+    async def _fetch_global_live_flight_match(
+        candidate: NormalizedGlobalFlightResolveCandidate,
+        require_on_route: bool,
+    ) -> GlobalLiveFlightResolveMatch | None:
         today = datetime.now(timezone.utc).date()
         dates = [
             today.isoformat(),
@@ -540,46 +656,153 @@ class FlightService:
         api_client = AerodataboxClient()
         for departure_date in dates:
             live_flights = await api_client.get_flight(
-                full_number=full_number,
+                full_number=candidate.callsign,
                 departure_date=departure_date,
                 with_location=True,
             )
             if not live_flights:
                 continue
 
+            selectable_live_flights = live_flights
+            if require_on_route:
+                selectable_live_flights = [
+                    live_flight
+                    for live_flight in live_flights
+                    if FlightService._aerodatabox_live_flight_is_on_route(live_flight)
+                ]
+                if not selectable_live_flights:
+                    continue
+
             live_flight = FlightService._select_matching_global_live_flight(
+                live_flights=selectable_live_flights,
+                callsign=candidate.callsign,
+                icao24=candidate.icao24,
+            )
+
+            return GlobalLiveFlightResolveMatch(
+                candidate=candidate,
+                departure_date=departure_date,
                 live_flights=live_flights,
-                callsign=full_number,
-                icao24=icao24,
+                live_flight=live_flight,
             )
-            normalized_number = live_flight.number.strip().replace(" ", "").upper()
-
-            db_flights = FlightPersistence.get_flights(
-                session=session,
-                full_number=normalized_number,
-                departure_date=departure_date,
-            )
-            if db_flights:
-                return FlightService._select_matching_db_flight(
-                    db_flights=db_flights,
-                    live_flight=live_flight,
-                    icao24=icao24,
-                )
-
-            created = FlightPersistence.create_flights_from_aerodatabox_model(
-                flights=live_flights,
-                airline_iata=live_flight.airline.iata if live_flight.airline and live_flight.airline.iata else "",
-                departure_date=departure_date,
-                session=session,
-            )
-            if created:
-                return FlightService._select_matching_db_flight(
-                    db_flights=created,
-                    live_flight=live_flight,
-                    icao24=icao24,
-                )
 
         return None
+
+    @staticmethod
+    def _persist_global_live_flight_match(
+        session: Session,
+        match: GlobalLiveFlightResolveMatch,
+    ) -> Flight | None:
+        normalized_number = match.live_flight.number.strip().replace(" ", "").upper()
+
+        db_flights = FlightPersistence.get_flights(
+            session=session,
+            full_number=normalized_number,
+            departure_date=match.departure_date,
+        )
+        if db_flights:
+            return FlightService._select_matching_db_flight(
+                db_flights=db_flights,
+                live_flight=match.live_flight,
+                icao24=match.candidate.icao24,
+            )
+
+        created = FlightPersistence.create_flights_from_aerodatabox_model(
+            flights=match.live_flights,
+            airline_iata=(
+                match.live_flight.airline.iata
+                if match.live_flight.airline and match.live_flight.airline.iata
+                else ""
+            ),
+            departure_date=match.departure_date,
+            session=session,
+        )
+        if created:
+            return FlightService._select_matching_db_flight(
+                db_flights=created,
+                live_flight=match.live_flight,
+                icao24=match.candidate.icao24,
+            )
+
+        return None
+
+    @staticmethod
+    def _safe_persist_global_live_flight_match(
+        session: Session,
+        match: GlobalLiveFlightResolveMatch,
+    ) -> Flight | None:
+        try:
+            return FlightService._persist_global_live_flight_match(
+                session=session,
+                match=match,
+            )
+        except Exception:
+            session.rollback()
+            logger.exception(
+                "Unable to persist global live flight callsign=%s, icao24=%s",
+                match.candidate.callsign,
+                match.candidate.icao24,
+            )
+            return None
+
+    @staticmethod
+    async def _cancel_global_resolve_tasks(tasks: Sequence[asyncio.Task]) -> None:
+        pending_tasks = [task for task in tasks if not task.done()]
+        for task in pending_tasks:
+            task.cancel()
+
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+    @staticmethod
+    def _normalized_global_resolve_candidates(
+        candidates: Sequence[GlobalFlightResolveCandidate],
+        limit: int,
+    ) -> list[NormalizedGlobalFlightResolveCandidate]:
+        normalized_candidates: list[NormalizedGlobalFlightResolveCandidate] = []
+        seen: set[tuple[str, str | None]] = set()
+        for candidate in candidates:
+            normalized = FlightService._normalized_global_resolve_candidate(
+                callsign=candidate.callsign,
+                icao24=candidate.icao24,
+            )
+            if not normalized:
+                continue
+
+            key = (normalized.callsign, normalized.icao24)
+            if key in seen:
+                continue
+
+            seen.add(key)
+            normalized_candidates.append(normalized)
+            if len(normalized_candidates) >= limit:
+                break
+
+        return normalized_candidates
+
+    @staticmethod
+    def _normalized_global_resolve_candidate(
+        callsign: str,
+        icao24: str | None,
+    ) -> NormalizedGlobalFlightResolveCandidate | None:
+        normalized_callsign = callsign.strip().replace(" ", "").upper()
+        if len(normalized_callsign) < 3:
+            return None
+
+        normalized_icao24 = (icao24 or "").strip().lower() or None
+        return NormalizedGlobalFlightResolveCandidate(
+            callsign=normalized_callsign,
+            icao24=normalized_icao24,
+        )
+
+    @staticmethod
+    def _aerodatabox_live_flight_is_on_route(live_flight: AerodataboxFlight) -> bool:
+        return live_flight.status not in {
+            FlightStatusEnum.ARRIVED,
+            FlightStatusEnum.CANCELED,
+            FlightStatusEnum.CANCELEDUNCERTAIN,
+            FlightStatusEnum.DIVERTED,
+        }
 
     @staticmethod
     def _select_matching_global_live_flight(

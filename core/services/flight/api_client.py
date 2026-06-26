@@ -1,11 +1,15 @@
 import asyncio
+import logging
 from typing import Any
 
 import httpx
+from pydantic import ValidationError
 
 from ...config import settings
 from ...models.aerodatabox import AerodataboxFlight, AirportFidsContract
 from ...models.flight import GlobalFlightPositionRead
+
+logger = logging.getLogger(__name__)
 
 
 class AerodataboxClient:
@@ -34,7 +38,22 @@ class AerodataboxClient:
             return []
 
         data = response.json()
-        return [AerodataboxFlight.model_validate(f) for f in data]
+        if not isinstance(data, list):
+            return []
+
+        flights: list[AerodataboxFlight] = []
+        for item in data:
+            try:
+                flights.append(AerodataboxFlight.model_validate(item))
+            except ValidationError as exc:
+                logger.warning(
+                    "Skipping invalid Aerodatabox flight full_number=%s departure_date=%s error=%s",
+                    full_number,
+                    departure_date,
+                    exc.errors(include_url=False),
+                )
+
+        return flights
 
     async def get_airport_flights(
         self, airport_iata: str, departure_date: str, direction: str = "Both"

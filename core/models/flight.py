@@ -214,6 +214,15 @@ class GlobalFlightPositionRead(SQLModel):
     on_ground: bool
 
 
+class GlobalFlightResolveCandidate(SQLModel):
+    callsign: str
+    icao24: str | None = None
+
+
+class GlobalFlightResolveCandidatesRequest(SQLModel):
+    candidates: list[GlobalFlightResolveCandidate] = Field(default_factory=list)
+
+
 # ------- Models for airport search result --------
 class AirportFlightAirportInfoRead(SQLModel):
     iata: str

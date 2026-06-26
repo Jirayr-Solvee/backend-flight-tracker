@@ -11,6 +11,7 @@ from ..models.flight import (
     CopilotTelemetryRead,
     Flight,
     FlightRead,
+    GlobalFlightResolveCandidatesRequest,
     GlobalFlightPositionRead,
     QuerySearchResponse,
 )
@@ -61,6 +62,36 @@ async def resolve_global_live_flight(
         session.rollback()
         logger.exception(
             f"Unable to resolve global live flight callsign={callsign}, icao24={icao24}, user id={user.id}"
+        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@router.post("/live-positions/resolve-candidates", response_model=FlightRead)
+async def resolve_global_live_flight_candidates(
+    payload: GlobalFlightResolveCandidatesRequest,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    try:
+        flight = await FlightService.resolve_global_live_flight_candidates(
+            session=session,
+            candidates=payload.candidates,
+        )
+        if not flight:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Unable to resolve live flight",
+            )
+
+        session.commit()
+        return FlightRead.model_validate(flight, from_attributes=True)
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception:
+        session.rollback()
+        logger.exception(
+            f"Unable to resolve global live flight candidates user id={user.id}"
         )
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
