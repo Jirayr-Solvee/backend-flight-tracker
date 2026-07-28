@@ -6,7 +6,11 @@ import httpx
 from pydantic import ValidationError
 
 from ...config import settings
-from ...models.aerodatabox import AerodataboxFlight, AirportFidsContract
+from ...models.aerodatabox import (
+    AerodataboxAirportFlight,
+    AerodataboxFlight,
+    AirportFidsContract,
+)
 from ...models.flight import GlobalFlightPositionRead
 
 logger = logging.getLogger(__name__)
@@ -76,15 +80,79 @@ class AerodataboxClient:
         dep_2 = AirportFidsContract()
 
         if r1.status_code == 200:
-            dep_1 = AirportFidsContract.model_validate(r1.json())
+            dep_1 = self._parse_airport_fids_payload(
+                r1.json(),
+                airport_iata=airport_iata,
+                departure_date=departure_date,
+                time_window=timewindows[0],
+            )
         
         if r2.status_code == 200:
-            dep_2 = AirportFidsContract.model_validate(r2.json())
+            dep_2 = self._parse_airport_fids_payload(
+                r2.json(),
+                airport_iata=airport_iata,
+                departure_date=departure_date,
+                time_window=timewindows[1],
+            )
 
         combined_departures = (dep_1.departures or []) + (dep_2.departures or [])
         combined_arrivals = (dep_1.arrivals or []) + (dep_2.arrivals or [])
         return AirportFidsContract(
             departures=combined_departures, arrivals=combined_arrivals
+        )
+
+    @staticmethod
+    def _parse_airport_fids_payload(
+        payload: Any,
+        *,
+        airport_iata: str,
+        departure_date: str,
+        time_window: str,
+    ) -> AirportFidsContract:
+        if not isinstance(payload, dict):
+            logger.warning(
+                "Ignoring invalid airport flights payload airport_iata=%s departure_date=%s time_window=%s",
+                airport_iata,
+                departure_date,
+                time_window,
+            )
+            return AirportFidsContract()
+
+        parsed: dict[str, list[AerodataboxAirportFlight]] = {
+            "departures": [],
+            "arrivals": [],
+        }
+        for collection_name in parsed:
+            items = payload.get(collection_name) or []
+            if not isinstance(items, list):
+                logger.warning(
+                    "Ignoring invalid airport flights collection airport_iata=%s departure_date=%s time_window=%s collection=%s",
+                    airport_iata,
+                    departure_date,
+                    time_window,
+                    collection_name,
+                )
+                continue
+
+            for index, item in enumerate(items):
+                try:
+                    parsed[collection_name].append(
+                        AerodataboxAirportFlight.model_validate(item)
+                    )
+                except ValidationError as exc:
+                    logger.warning(
+                        "Skipping invalid airport flight airport_iata=%s departure_date=%s time_window=%s collection=%s index=%s error=%s",
+                        airport_iata,
+                        departure_date,
+                        time_window,
+                        collection_name,
+                        index,
+                        exc.errors(include_url=False),
+                    )
+
+        return AirportFidsContract(
+            departures=parsed["departures"],
+            arrivals=parsed["arrivals"],
         )
 
     async def get_flight_delays(self, full_number: str) -> dict[str, Any]:
