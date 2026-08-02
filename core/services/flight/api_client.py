@@ -16,6 +16,15 @@ from ...models.flight import GlobalFlightPositionRead
 logger = logging.getLogger(__name__)
 
 
+class AerodataboxUnavailableError(RuntimeError):
+    def __init__(self, failures: list[str]):
+        self.failures = tuple(failures)
+        super().__init__(
+            "Aerodatabox airport flight data is unavailable: "
+            + ", ".join(self.failures)
+        )
+
+
 class AerodataboxClient:
     def __init__(self):
         self.client = httpx.AsyncClient(
@@ -71,32 +80,88 @@ class AerodataboxClient:
 
         fetcher_url = f"{settings.AERODATABOX_SERVICE_URL}airport-flights?airport_iata={airport_iata}&departure_date={departure_date}&direction={direction}"
 
-        r1, r2 = await asyncio.gather(
+        responses = await asyncio.gather(
             self.client.get(fetcher_url + f"&time_window={timewindows[0]}"),
             self.client.get(fetcher_url + f"&time_window={timewindows[1]}"),
+            return_exceptions=True,
         )
 
-        dep_1 = AirportFidsContract()
-        dep_2 = AirportFidsContract()
+        contracts: list[AirportFidsContract] = []
+        failures: list[str] = []
 
-        if r1.status_code == 200:
-            dep_1 = self._parse_airport_fids_payload(
-                r1.json(),
-                airport_iata=airport_iata,
-                departure_date=departure_date,
-                time_window=timewindows[0],
-            )
-        
-        if r2.status_code == 200:
-            dep_2 = self._parse_airport_fids_payload(
-                r2.json(),
-                airport_iata=airport_iata,
-                departure_date=departure_date,
-                time_window=timewindows[1],
+        for time_window, response in zip(timewindows, responses):
+            if isinstance(response, asyncio.CancelledError):
+                raise response
+
+            if isinstance(response, Exception):
+                failures.append(f"{time_window}:transport_error")
+                logger.warning(
+                    "Airport flights request failed airport_iata=%s departure_date=%s time_window=%s error_type=%s",
+                    airport_iata,
+                    departure_date,
+                    time_window,
+                    type(response).__name__,
+                )
+                continue
+
+            if response.status_code in {204, 404}:
+                contracts.append(AirportFidsContract())
+                continue
+
+            if response.status_code != 200:
+                failures.append(f"{time_window}:status_{response.status_code}")
+                logger.warning(
+                    "Airport flights request returned non-success airport_iata=%s departure_date=%s time_window=%s status=%s",
+                    airport_iata,
+                    departure_date,
+                    time_window,
+                    response.status_code,
+                )
+                continue
+
+            try:
+                contracts.append(
+                    self._parse_airport_fids_payload(
+                        response.json(),
+                        airport_iata=airport_iata,
+                        departure_date=departure_date,
+                        time_window=time_window,
+                    )
+                )
+            except Exception as exc:
+                failures.append(f"{time_window}:invalid_response")
+                logger.warning(
+                    "Airport flights response could not be parsed airport_iata=%s departure_date=%s time_window=%s error_type=%s",
+                    airport_iata,
+                    departure_date,
+                    time_window,
+                    type(exc).__name__,
+                )
+
+        combined_departures = [
+            flight for contract in contracts for flight in (contract.departures or [])
+        ]
+        combined_arrivals = [
+            flight for contract in contracts for flight in (contract.arrivals or [])
+        ]
+
+        has_relevant_results = {
+            "Departure": bool(combined_departures),
+            "Arrival": bool(combined_arrivals),
+            "Both": bool(combined_departures or combined_arrivals),
+        }.get(direction, bool(combined_departures or combined_arrivals))
+
+        if failures and not has_relevant_results:
+            raise AerodataboxUnavailableError(failures)
+
+        if failures:
+            logger.warning(
+                "Returning partial airport flight results airport_iata=%s departure_date=%s failures=%s",
+                airport_iata,
+                departure_date,
+                failures,
             )
 
-        combined_departures = (dep_1.departures or []) + (dep_2.departures or [])
-        combined_arrivals = (dep_1.arrivals or []) + (dep_2.arrivals or [])
         return AirportFidsContract(
             departures=combined_departures, arrivals=combined_arrivals
         )

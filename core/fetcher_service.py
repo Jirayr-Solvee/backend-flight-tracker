@@ -123,8 +123,13 @@ class AerodataboxFetcherService:
                 response = await self.client.get(url + params)
 
                 if response.status_code != 200:
-                    logger.exception(
-                        f"Aerodatabox responsded with status={response.status_code}, airport_iata={airport_iata}, departure_date={departure_date}, time_window={time_window}, direction={direction}"
+                    logger.warning(
+                        "Aerodatabox responded with status=%s, airport_iata=%s, departure_date=%s, time_window=%s, direction=%s",
+                        response.status_code,
+                        airport_iata,
+                        departure_date,
+                        time_window,
+                        direction,
                     )
                     raise HTTPException(status_code=response.status_code)
 

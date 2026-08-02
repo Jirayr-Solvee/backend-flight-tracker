@@ -8,6 +8,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Sequence
 
+from fastapi import HTTPException, status
 from sqlmodel import Session, select
 
 from ...config import settings
@@ -28,7 +29,11 @@ from ...models.flight import (
     GlobalFlightPositionRead,
     QuerySearchResponse,
 )
-from .api_client import ADSBExchangeClient, AerodataboxClient
+from .api_client import (
+    ADSBExchangeClient,
+    AerodataboxClient,
+    AerodataboxUnavailableError,
+)
 from .mapper import AirportFlightMapper
 from .persistence import FlightPersistence
 
@@ -891,11 +896,17 @@ class FlightService:
         """
         api_client = AerodataboxClient()
 
-        return await api_client.get_airport_flights(
-            airport_iata=airport_iata,
-            departure_date=departure_date,
-            direction=direction,
-        )
+        try:
+            return await api_client.get_airport_flights(
+                airport_iata=airport_iata,
+                departure_date=departure_date,
+                direction=direction,
+            )
+        except AerodataboxUnavailableError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Flight data provider temporarily unavailable",
+            ) from exc
 
     @staticmethod
     async def get_copilot_telemetry(flight: Flight) -> CopilotTelemetryRead:
