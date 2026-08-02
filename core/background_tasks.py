@@ -76,6 +76,7 @@ async def handle_incoming_email(notification: S3EmailNotification):
                 )
 
                 push_notification = ApnService.create_new_flight_added_notification(
+                    flight_id=flights[0].id,  # type: ignore[arg-type]
                     flight_full_number=flights[0].number
                 )
 

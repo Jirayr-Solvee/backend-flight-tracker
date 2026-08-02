@@ -12,6 +12,7 @@ from ..models.notification import NotificationBatch
 from ..models.subscription import Subscription
 from ..models.transaction import Transaction
 from ..services.apn.service import ApnService
+from ..services.apn.live_activity import LiveActivityService
 from ..services.apn.utils import (extract_all_notifications_for_flight,
                                   increase_notifications_of_users)
 from ..services.app_store.service import AppStoreService
@@ -52,6 +53,7 @@ async def receive_aerodatabox_update(
 
     try:
         flight_full_number: str | None = None
+        updated_flight_ids: set[int] = set()
 
         global_notification_batchs: list[NotificationBatch] = []
 
@@ -88,6 +90,8 @@ async def receive_aerodatabox_update(
             FlightPersistence.update_flight_from_webhook_data(
                 flight=db_flight, webhook_flight=f
             )
+            if db_flight.id is not None:
+                updated_flight_ids.add(db_flight.id)
 
             # NOTE: remove when notifications are linked to device
             linked_user_ids = list({d.user_id for d in devices_info})
@@ -134,6 +138,16 @@ async def receive_aerodatabox_update(
 
         if global_notification_batchs:
             background_tasks.add_task(send_mutiple_batches, global_notification_batchs)
+
+        # ActivityKit updates use a separate per-activity APNs token. Schedule
+        # them after the database commit so the payload always reflects the
+        # persisted status, gate, and revised timestamps, even when no regular
+        # notification was generated for this webhook snapshot.
+        for updated_flight_id in updated_flight_ids:
+            background_tasks.add_task(
+                LiveActivityService.send_updates_for_flight,
+                updated_flight_id,
+            )
 
         background_tasks.add_task(confirm_webhook)
         return {"detail": "ok"}

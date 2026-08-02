@@ -47,6 +47,7 @@ def extract_all_notifications_for_flight(
 
     if flight.departure:
         nested_notifications_batches = extract_nested_notifications_for_flight(
+            flight_id=flight.id,  # type: ignore[arg-type]
             flight_number=flight.number,
             db_info=flight.departure,
             webhook_data=webhook_flight.departure,
@@ -57,6 +58,7 @@ def extract_all_notifications_for_flight(
 
     if flight.arrival:
         nested_notifications_batches = extract_nested_notifications_for_flight(
+            flight_id=flight.id,  # type: ignore[arg-type]
             flight_number=flight.number,
             db_info=flight.arrival,
             webhook_data=webhook_flight.arrival,
@@ -84,6 +86,8 @@ def extract_basic_notifications_for_flight(
 
     if flight.status != webhook_flight.status:
         batch = ApnService.create_status_change_notification_batch(
+            flight_id=flight.id,  # type: ignore[arg-type]
+            previous_status=flight.status,
             status=webhook_flight.status,  # type: ignore
             flight_full_number=flight.number,
             devices_info=devices_info,
@@ -97,7 +101,10 @@ def extract_basic_notifications_for_flight(
         or flight.aircraft_model != new_aircraft.model
     ):
         batch = ApnService.create_aircraft_updated_notification_batch(
-            flight_number=flight.number, devices_info=devices_info, **aircraft_fields
+            flight_id=flight.id,  # type: ignore[arg-type]
+            flight_number=flight.number,
+            devices_info=devices_info,
+            **aircraft_fields,
         )
         notification_batches.append(batch)
 
@@ -105,6 +112,7 @@ def extract_basic_notifications_for_flight(
 
 
 def extract_nested_notifications_for_flight(
+    flight_id: int,
     flight_number: str,
     db_info: Departure | Arrival,
     webhook_data: AerodataboxOriginAndDestinationInformationWebhook,
@@ -133,6 +141,7 @@ def extract_nested_notifications_for_flight(
 
         if old_value != new_value:
             batch = ApnService.create_gate_change_notification_batch(
+                flight_id=flight_id,
                 location_type=direction,
                 gate_type=flight_key.replace("_", " "),
                 old_value=old_value,
@@ -175,6 +184,7 @@ def extract_nested_notifications_for_flight(
 
         if t.new is not None and t.old != t.new:
             batch = ApnService.create_time_stamp_change_notification_batch(
+                flight_id=flight_id,
                 location_type=direction,
                 time_stamp_type=t.type,
                 old_time_stamp=t.old,

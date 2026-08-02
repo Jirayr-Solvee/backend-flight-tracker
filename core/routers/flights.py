@@ -1,4 +1,5 @@
 import logging
+import time
 
 from fastapi import (APIRouter, BackgroundTasks, Depends, Header, HTTPException,
                      Query, status)
@@ -15,6 +16,7 @@ from ..models.flight import (
     GlobalFlightPositionRead,
     QuerySearchResponse,
 )
+from ..models.live_activity import LiveActivityRegistration
 from ..models.user import User, UserFlightLink
 from ..services.flight.delay_risk import DelayRiskResponse, DelayRiskService
 from ..services.flight import FlightPersistence, FlightService
@@ -114,6 +116,19 @@ def delete_flight_for_a_user(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Flight not found",
             )
+
+        device_ids = [device.id for device in user.devices]
+        if device_ids:
+            registrations = session.exec(
+                select(LiveActivityRegistration).where(
+                    LiveActivityRegistration.flight_id == flight_id,
+                    LiveActivityRegistration.device_id.in_(device_ids),  # type: ignore[attr-defined]
+                )
+            ).all()
+            for registration in registrations:
+                registration.active = False
+                registration.updated_at = int(time.time())
+                session.add(registration)
 
         session.commit()
 

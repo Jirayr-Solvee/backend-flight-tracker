@@ -27,23 +27,24 @@ ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 with open(settings.APN_KEY_PATH, "r") as f:
     key_content = f.read()
 
-apns_client: APNs | None = None
+apns_clients: dict[bool, APNs] = {}
 
 
-def get_apns_client() -> APNs:
-    global apns_client
+def get_apns_client(use_sandbox: bool = False) -> APNs:
+    client = apns_clients.get(use_sandbox)
 
-    if apns_client is None:
-        apns_client = APNs(
+    if client is None:
+        client = APNs(
             key=key_content,
             key_id=settings.KEY_ID,
             team_id=settings.TEAM_ID,
             topic=settings.BUNDLE_ID,
-            use_sandbox=False,
+            use_sandbox=use_sandbox,
             ssl_context=ssl_ctx,
         )
+        apns_clients[use_sandbox] = client
 
-    return apns_client
+    return client
 
 class ApnService:
     """
@@ -106,9 +107,10 @@ class ApnService:
                         "body": notification.body,
                     },
                     "badge": badge_count,
-                }
+                },
+                **notification.apns_custom_payload(),
             },
-            notification_id=str(uuid.uuid4()),
+            notification_id=notification.notification_id,
             time_to_live=3600,
             push_type=PushType.ALERT,
         )
@@ -132,9 +134,10 @@ class ApnService:
                             "body": notification_batch.notification.body,
                         },
                         "badge": device.badge,
-                    }
+                    },
+                    **notification_batch.notification.apns_custom_payload(),
                 },
-                notification_id=str(uuid.uuid4()),
+                notification_id=notification_batch.notification.notification_id,
                 time_to_live=3600,
                 push_type=PushType.ALERT,
             )
@@ -176,7 +179,10 @@ class ApnService:
 
     @staticmethod
     def create_status_change_notification(
-        status: FlightStatusEnum, flight_full_number: str
+        flight_id: int,
+        previous_status: str,
+        status: FlightStatusEnum,
+        flight_full_number: str,
     ) -> Notification:
         """
         Return Notification object with proper title and body for status changes
@@ -201,10 +207,19 @@ class ApnService:
 
         body = status_messages.get(status, "Your flight STATUS have been changed")
 
-        return Notification(title=title, body=body)
+        return Notification(
+            title=title,
+            body=body,
+            flight_id=flight_id,
+            update_type="status",
+            previous_value=previous_status,
+            new_value=status.value,
+        )
 
     @staticmethod
     def create_status_change_notification_batch(
+        flight_id: int,
+        previous_status: str,
         status: FlightStatusEnum,
         flight_full_number: str,
         devices_info: list[DeviceInfo],
@@ -213,7 +228,10 @@ class ApnService:
         Return Notification batch object with proper title and body for status changes and a list of fcm tokens
         """
         notification = ApnService.create_status_change_notification(
-            status=status, flight_full_number=flight_full_number
+            flight_id=flight_id,
+            previous_status=previous_status,
+            status=status,
+            flight_full_number=flight_full_number,
         )
 
         batch = NotificationBatch(notification=notification, devices=devices_info)
@@ -224,17 +242,26 @@ class ApnService:
         return batch
 
     @staticmethod
-    def create_new_flight_added_notification(flight_full_number: str) -> Notification:
+    def create_new_flight_added_notification(
+        flight_id: int, flight_full_number: str
+    ) -> Notification:
         """
         Return Notification object with proper title and body for added flight via forwarded email
         """
         title = "New flight added to your account"
         body = f'Flight "{flight_full_number}" has been added to your account automatically from your forwarded email.'
 
-        return Notification(title=title, body=body)
+        return Notification(
+            title=title,
+            body=body,
+            flight_id=flight_id,
+            update_type="flight_added",
+            new_value=flight_full_number,
+        )
 
     @staticmethod
     def create_time_stamp_change_notification(
+        flight_id: int,
         location_type: str,
         time_stamp_type: NotificationTimestampTypes,
         old_time_stamp: str | None,
@@ -250,7 +277,16 @@ class ApnService:
                 f"A new {time_stamp_type.value.lower()} {location_type.lower()} time is now available "
                 f"for flight {flight_number}."
             )
-            return (Notification(title=title, body=body), False)
+            return (
+                Notification(
+                    title=title,
+                    body=body,
+                    flight_id=flight_id,
+                    update_type="time",
+                    new_value=new_time_stamp,
+                ),
+                False,
+            )
 
         from .utils import calculate_difference_in_minutes
 
@@ -261,7 +297,17 @@ class ApnService:
                 f"A new {time_stamp_type.value.lower()} {location_type.lower()} time is now available "
                 f"for flight {flight_number}."
             )
-            return (Notification(title=title, body=body), False)
+            return (
+                Notification(
+                    title=title,
+                    body=body,
+                    flight_id=flight_id,
+                    update_type="time",
+                    previous_value=old_time_stamp,
+                    new_value=new_time_stamp,
+                ),
+                False,
+            )
 
         # delay
         if difference_in_minutes > 0:
@@ -270,16 +316,36 @@ class ApnService:
                 f"Your flight {flight_number} {location_type.lower()} is delayed by "
                 f"{difference_in_minutes} min ({time_stamp_type.value.lower()})."
             )
-            return (Notification(title=title, body=body), True)
+            return (
+                Notification(
+                    title=title,
+                    body=body,
+                    flight_id=flight_id,
+                    update_type="delay",
+                    previous_value=old_time_stamp,
+                    new_value=new_time_stamp,
+                ),
+                True,
+            )
 
         # early
         elif difference_in_minutes < 0:
             title = f"Flight {flight_number} {location_type.lower()} moved earlier"
             body = (
                 f"Your flight {flight_number} {location_type.lower()} is now "
-                f"{difference_in_minutes} min earlier ({time_stamp_type.value.lower()})."
+                f"{abs(difference_in_minutes)} min earlier ({time_stamp_type.value.lower()})."
             )
-            return (Notification(title=title, body=body), False)
+            return (
+                Notification(
+                    title=title,
+                    body=body,
+                    flight_id=flight_id,
+                    update_type="time",
+                    previous_value=old_time_stamp,
+                    new_value=new_time_stamp,
+                ),
+                False,
+            )
 
         # on time
         else:
@@ -288,11 +354,22 @@ class ApnService:
                 f"Your flight {flight_number} {location_type.lower()} is on time "
                 f"({time_stamp_type.value.lower()})."
             )
-            return (Notification(title=title, body=body), False)
+            return (
+                Notification(
+                    title=title,
+                    body=body,
+                    flight_id=flight_id,
+                    update_type="time",
+                    previous_value=old_time_stamp,
+                    new_value=new_time_stamp,
+                ),
+                False,
+            )
         
 
     @staticmethod
     def create_time_stamp_change_notification_batch(
+        flight_id: int,
         location_type: str,
         time_stamp_type: NotificationTimestampTypes,
         old_time_stamp: str | None,
@@ -304,6 +381,7 @@ class ApnService:
         Return Batch of Notifications of a new time stamp availability or change
         """
         notification, invoke_review = ApnService.create_time_stamp_change_notification(
+            flight_id=flight_id,
             location_type=location_type,
             time_stamp_type=time_stamp_type,
             old_time_stamp=old_time_stamp,
@@ -317,6 +395,7 @@ class ApnService:
 
     @staticmethod
     def create_gate_change_notification(
+        flight_id: int,
         location_type: str,
         gate_type: str,
         old_value: str | None,
@@ -330,10 +409,25 @@ class ApnService:
             title = f"{location_type} {gate_type} changed"
             body = f"The {gate_type.lower()} has changed from {old_value} to {new_value} for flight {flight_number}."
 
-        return Notification(title=title, body=body)
+        update_type_by_field = {
+            "gate": "gate",
+            "terminal": "terminal",
+            "baggage belt": "baggage",
+            "checkin desk": "check_in",
+        }
+
+        return Notification(
+            title=title,
+            body=body,
+            flight_id=flight_id,
+            update_type=update_type_by_field.get(gate_type, "flight_details"),
+            previous_value=old_value or "",
+            new_value=new_value or "",
+        )
 
     @staticmethod
     def create_gate_change_notification_batch(
+        flight_id: int,
         location_type: str,
         gate_type: str,
         old_value: str | None,
@@ -342,6 +436,7 @@ class ApnService:
         devices_info: list[DeviceInfo],
     ) -> NotificationBatch:
         notification = ApnService.create_gate_change_notification(
+            flight_id=flight_id,
             location_type=location_type,
             gate_type=gate_type,
             old_value=old_value,
@@ -353,6 +448,7 @@ class ApnService:
 
     @staticmethod
     def create_aircraft_updated_notification(
+        flight_id: int,
         flight_number: str,
         old_reg: str | None,
         new_reg: str | None,
@@ -370,10 +466,21 @@ class ApnService:
         else:
             body = f"Aircraft information has been updated for flight {flight_number}."
 
-        return Notification(title=title, body=body)
+        previous_value = old_reg or old_model or ""
+        new_value = new_reg or new_model or ""
+
+        return Notification(
+            title=title,
+            body=body,
+            flight_id=flight_id,
+            update_type="aircraft",
+            previous_value=previous_value,
+            new_value=new_value,
+        )
 
     @staticmethod
     def create_aircraft_updated_notification_batch(
+        flight_id: int,
         flight_number: str,
         old_reg: str | None,
         new_reg: str | None,
@@ -382,6 +489,7 @@ class ApnService:
         devices_info: list[DeviceInfo],
     ):
         notification = ApnService.create_aircraft_updated_notification(
+            flight_id=flight_id,
             flight_number=flight_number,
             old_reg=old_reg,
             new_reg=new_reg,

@@ -2,6 +2,7 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from .device import Device
 from .flight import Airline, Airport, Arrival, Departure, Flight
+from .live_activity import LiveActivityRegistration
 from .subscription import Subscription
 from .transaction import Transaction
 
