@@ -241,6 +241,20 @@ class AirportFlightRead(SQLModel):
     arrival: AirportFlightOriginAndDestinationInfoRead | None
 
 
+class SearchSuggestionRead(SQLModel):
+    label: str
+    query: str
+    kind: str
+
+
+class SearchRecoveryRead(SQLModel):
+    reason: str
+    detected_query_type: str
+    normalized_query: str | None = None
+    suggestions: list[SearchSuggestionRead] = Field(default_factory=list)
+
+
 class QuerySearchResponse(SQLModel):
-    flights_result: list[FlightRead] = []
-    airport_flights_result: list[AirportFlightRead] = []
+    flights_result: list[FlightRead] = Field(default_factory=list)
+    airport_flights_result: list[AirportFlightRead] = Field(default_factory=list)
+    recovery: SearchRecoveryRead | None = None

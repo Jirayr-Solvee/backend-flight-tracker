@@ -273,18 +273,35 @@ async def search_flights_from_text(
 ):
     try:
         ai_service = GeminiService()
+        normalized_term = ai_service.normalize_query(term)
+        preflight_recovery = ai_service.preflight_recovery(
+            normalized_term,
+            language=language or accept_language,
+        )
+        if preflight_recovery:
+            return QuerySearchResponse(recovery=preflight_recovery)
+
         result = await ai_service.get_function_call(
-            query=term,
+            query=normalized_term,
             language=language or accept_language,
         )
 
         if not result:
-            logger.warning(
-                f"Gemini unable to retrive a function call from user query={term}"
+            logger.warning("Gemini unable to retrieve a search function call")
+            return QuerySearchResponse(
+                recovery=ai_service.recovery_for_empty_result(
+                    query=normalized_term,
+                    resolved_call=None,
+                )
             )
-            return QuerySearchResponse()
 
         flights = await result.handler(**result.args, session=session)
+
+        if not flights.flights_result and not flights.airport_flights_result:
+            flights.recovery = ai_service.recovery_for_empty_result(
+                query=normalized_term,
+                resolved_call=result,
+            )
 
         session.commit()
 

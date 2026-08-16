@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import unicodedata
 from datetime import timedelta
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ from google.genai.types import GenerateContentConfig, GenerateContentResponse
 from pydantic import BaseModel
 
 from ...config import settings
+from ...models.flight import SearchRecoveryRead, SearchSuggestionRead
 from .config import REQUIRED_FIELDS, email_config, query_config
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,33 @@ class ResolvedFunctionCall(FunctionCallResult):
 
 class GeminiService:
     _iata_by_icao_cache: dict[str, str] | None = None
+
+    _flight_code_corrections = {
+        # Confusions observed in real Sofly searches. Suggestions are shown to
+        # the user and never silently substituted.
+        "EL": "EK",
+        "FL": "FI",
+    }
+
+    _country_airports = {
+        "mexico": ("MEX", "CUN", "GDL"),
+        "turkey": ("IST", "SAW", "AYT"),
+        "germany": ("FRA", "MUC", "BER", "DUS"),
+    }
+
+    _country_aliases = {
+        "mexico": {
+            "mexico", "méxico", "مكسيكو", "المكسيك",
+        },
+        "turkey": {
+            "turkey", "turkiye", "türkiye", "turquía", "turquia",
+            "turquie", "turchia", "türkei", "تركيا",
+        },
+        "germany": {
+            "germany", "deutschland", "alemania", "allemagne", "germania",
+            "alemanha", "ألمانيا", "المانيا",
+        },
+    }
 
     def __init__(self):
         api_key = (settings.GEMINI_API_KEY or "").strip()
@@ -85,6 +114,7 @@ class GeminiService:
     async def get_function_call(
         self, query: str, email: bool = False, language: str | None = None
     ) -> ResolvedFunctionCall | None:
+        query = self.normalize_query(query)
         if not email:
             fallback = self._deterministic_function_call(query)
             if fallback:
@@ -154,6 +184,176 @@ class GeminiService:
             f"Gemini unable to extract a function call for query={query}, email={email}, after all attempts"
         )
         return None
+
+    @staticmethod
+    def normalize_query(query: str) -> str:
+        normalized = unicodedata.normalize("NFKC", query)
+        normalized = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", normalized)
+        normalized = normalized.replace("–", "-").replace("—", "-")
+        return re.sub(r"\s+", " ", normalized).strip()
+
+    @classmethod
+    def preflight_recovery(
+        cls,
+        query: str,
+        language: str | None = None,
+    ) -> SearchRecoveryRead | None:
+        normalized = cls.normalize_query(query)
+        compact = re.sub(r"[\s-]", "", normalized).upper()
+
+        if re.fullmatch(r"N[0-9]{1,5}[A-Z]{0,2}", compact):
+            return SearchRecoveryRead(
+                reason="aircraft_registration",
+                detected_query_type="aircraft_registration",
+                normalized_query=compact,
+                suggestions=[
+                    SearchSuggestionRead(
+                        label="Search by flight number",
+                        query="",
+                        kind="search_help",
+                    ),
+                ],
+            )
+
+        countries = cls._countries_in_query(normalized)
+        if len(countries) >= 2:
+            departure, arrival = countries[0], countries[1]
+            suggestions = cls._route_suggestions(departure, arrival)
+            return SearchRecoveryRead(
+                reason="choose_airport_route",
+                detected_query_type="country_route",
+                normalized_query=normalized,
+                suggestions=suggestions,
+            )
+
+        if len(countries) == 1 and cls._is_broad_location_query(normalized, countries[0]):
+            country = countries[0]
+            suggestions = [
+                SearchSuggestionRead(
+                    label=f"{iata} departures",
+                    query=f"Departures from {iata} Today",
+                    kind="airport",
+                )
+                for iata in cls._country_airports[country]
+            ]
+            return SearchRecoveryRead(
+                reason="choose_airport",
+                detected_query_type="broad_location",
+                normalized_query=normalized,
+                suggestions=suggestions,
+            )
+
+        if "rockport" in normalized.casefold():
+            return SearchRecoveryRead(
+                reason="nearby_commercial_airport",
+                detected_query_type="city",
+                normalized_query=normalized,
+                suggestions=[
+                    SearchSuggestionRead(
+                        label="CRP departures",
+                        query="Departures from CRP Today",
+                        kind="airport",
+                    ),
+                    SearchSuggestionRead(
+                        label="CRP arrivals",
+                        query="Arrivals at CRP Today",
+                        kind="airport",
+                    ),
+                ],
+            )
+
+        return None
+
+    @classmethod
+    def recovery_for_empty_result(
+        cls,
+        query: str,
+        resolved_call: ResolvedFunctionCall | None,
+    ) -> SearchRecoveryRead:
+        normalized = cls.normalize_query(query)
+        if resolved_call and resolved_call.function_name == "extract_flight_info":
+            airline = str(resolved_call.args.get("airline_iata", "")).upper()
+            number = str(resolved_call.args.get("flight_number", "")).upper()
+            corrected_airline = cls._flight_code_corrections.get(airline)
+            if corrected_airline:
+                corrected_query = f"{corrected_airline}{number}"
+                return SearchRecoveryRead(
+                    reason="possible_flight_number_typo",
+                    detected_query_type="flight_number",
+                    normalized_query=f"{airline}{number}",
+                    suggestions=[
+                        SearchSuggestionRead(
+                            label=f"{corrected_airline} {number}",
+                            query=corrected_query,
+                            kind="corrected_flight_number",
+                        )
+                    ],
+                )
+
+            canonical_query = f"{airline}{number}" if airline and number else normalized
+            return SearchRecoveryRead(
+                reason="flight_not_found",
+                detected_query_type="flight_number",
+                normalized_query=canonical_query,
+                suggestions=[
+                    SearchSuggestionRead(
+                        label=f"{canonical_query} tomorrow",
+                        query=f"{canonical_query} Tomorrow",
+                        kind="next_day",
+                    )
+                ] if canonical_query else [],
+            )
+
+        return SearchRecoveryRead(
+            reason="no_results",
+            detected_query_type="natural_language",
+            normalized_query=normalized,
+            suggestions=[],
+        )
+
+    @classmethod
+    def _countries_in_query(cls, query: str) -> list[str]:
+        lowered = query.casefold()
+        matches: list[tuple[int, str]] = []
+        for country, aliases in cls._country_aliases.items():
+            indexes = [lowered.find(alias.casefold()) for alias in aliases]
+            valid_indexes = [index for index in indexes if index >= 0]
+            if valid_indexes:
+                matches.append((min(valid_indexes), country))
+        return [country for _, country in sorted(matches)]
+
+    @classmethod
+    def _route_suggestions(
+        cls,
+        departure_country: str,
+        arrival_country: str,
+    ) -> list[SearchSuggestionRead]:
+        departure_airports = cls._country_airports[departure_country]
+        arrival_airports = cls._country_airports[arrival_country]
+        pairs = [
+            (departure_airports[0], arrival_airports[0]),
+            (departure_airports[1], arrival_airports[0]),
+            (departure_airports[0], arrival_airports[1]),
+        ]
+        return [
+            SearchSuggestionRead(
+                label=f"{departure} → {arrival}",
+                query=f"{departure} to {arrival} Today",
+                kind="airport_route",
+            )
+            for departure, arrival in pairs
+        ]
+
+    @classmethod
+    def _is_broad_location_query(cls, query: str, country: str) -> bool:
+        lowered = query.casefold().strip()
+        aliases = cls._country_aliases[country]
+        stripped = re.sub(
+            r"\b(to|from|in|flights?|departures?|arrivals?|today|tomorrow)\b",
+            "",
+            lowered,
+        ).strip()
+        return any(stripped == alias.casefold() for alias in aliases)
 
     def _validate_function_args(
         self,
@@ -333,8 +533,8 @@ class GeminiService:
 
         upper = query.upper()
         for pattern in (
-            r"(?<![A-Z0-9])([A-Z]{3})\s*([0-9]{1,4}[A-Z]?)(?![A-Z0-9])",
-            r"(?<![A-Z0-9])([A-Z0-9]{2})\s*([0-9]{1,4}[A-Z]?)(?![A-Z0-9])",
+            r"(?<![A-Z0-9])([A-Z]{3})[\s-]*([0-9]{1,4}[A-Z]?)(?![A-Z0-9])",
+            r"(?<![A-Z0-9])([A-Z0-9]{2})[\s-]*([0-9]{1,4}[A-Z]?)(?![A-Z0-9])",
         ):
             match = re.search(pattern, upper)
             if not match:
