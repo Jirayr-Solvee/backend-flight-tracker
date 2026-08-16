@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from pydantic import ValidationError
@@ -24,6 +25,14 @@ class AerodataboxUnavailableError(RuntimeError):
             + ", ".join(self.failures)
         )
 
+    @property
+    def rate_limited(self) -> bool:
+        return any("status_429" in failure for failure in self.failures)
+
+
+class ADSBExchangeRateLimitedError(RuntimeError):
+    pass
+
 
 class AerodataboxClient:
     def __init__(self):
@@ -45,10 +54,17 @@ class AerodataboxClient:
             f"flights?full_number={full_number}&departure_date={departure_date}"
             f"&with_location={str(with_location).lower()}"
         )
-        response = await self.client.get(fetcher_url)
+        try:
+            response = await self.client.get(fetcher_url)
+        except Exception as exc:
+            raise AerodataboxUnavailableError(["flight:transport_error"]) from exc
 
-        if response.status_code != 200:
+        if response.status_code in {204, 404}:
             return []
+        if response.status_code != 200:
+            raise AerodataboxUnavailableError(
+                [f"flight:status_{response.status_code}"]
+            )
 
         data = response.json()
         if not isinstance(data, list):
@@ -342,6 +358,46 @@ class ADSBExchangeClient:
         )
         if response.status_code != 200:
             return []
+
+        return self._positions_from_payload(response.json())
+
+    async def get_positions_for_registration(
+        self,
+        registration: str,
+    ) -> list[GlobalFlightPositionRead] | None:
+        """Return live positions, or None when the provider could not be queried."""
+        api_key = (settings.ADSBEXCHANGE_API_KEY or "").strip()
+        if not api_key:
+            logger.warning("Aircraft registration lookup unavailable: missing ADS-B Exchange key")
+            return None
+
+        normalized = registration.strip().upper()
+        if not normalized:
+            return []
+
+        base_url = settings.ADSBEXCHANGE_BASE_URL.rstrip("/")
+        try:
+            response = await self.client.get(
+                f"{base_url}/registration/{quote(normalized, safe='')}",
+                headers={
+                    **self._headers(api_key),
+                    "Accept-Encoding": "gzip",
+                },
+            )
+        except Exception:
+            logger.exception("Aircraft registration lookup failed")
+            return None
+
+        if response.status_code != 200:
+            logger.warning(
+                "Aircraft registration provider returned status=%s",
+                response.status_code,
+            )
+            if response.status_code == 429:
+                raise ADSBExchangeRateLimitedError(
+                    "ADS-B Exchange rate limited aircraft registration lookup"
+                )
+            return None
 
         return self._positions_from_payload(response.json())
 

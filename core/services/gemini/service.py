@@ -58,6 +58,33 @@ class GeminiService:
         },
     }
 
+    _explicit_date_words = {
+        "today", "tomorrow", "yesterday",
+        "hoy", "mañana", "ayer",
+        "aujourd'hui", "demain", "hier",
+        "heute", "morgen", "gestern",
+        "oggi", "domani", "ieri",
+        "hoje", "amanhã", "ontem",
+        "اليوم", "غد", "غدًا", "أمس",
+        "january", "jan", "enero", "ene", "janvier", "janv", "januar",
+        "gennaio", "janeiro", "يناير",
+        "february", "feb", "febrero", "février", "févr", "fevrier", "fevr",
+        "februar", "febbraio", "fevereiro", "fev", "فبراير",
+        "march", "mar", "marzo", "mars", "märz", "marz", "março", "marco",
+        "مارس", "april", "apr", "abril", "abr", "avril", "avr", "aprile",
+        "أبريل", "ابريل", "may", "mayo", "mai", "maggio", "maio", "mag",
+        "مايو", "june", "jun", "junio", "juin", "juni", "giugno", "giu",
+        "junho", "يونيو", "july", "jul", "julio", "juillet", "juli", "juil",
+        "luglio", "lug", "julho", "يوليو", "august", "aug", "agosto", "août",
+        "aout", "ago", "أغسطس", "اغسطس", "september", "sep", "septiembre",
+        "septembre", "sept", "settembre", "setembro", "set", "سبتمبر",
+        "october", "oct", "octubre", "octobre", "oktober", "okt", "ottobre",
+        "ott", "outubro", "out", "أكتوبر", "اكتوبر", "november", "nov",
+        "noviembre", "novembre", "نوفمبر", "december", "dec", "diciembre",
+        "décembre", "déc", "decembre", "dezember", "dez", "dicembre", "dic",
+        "dezembro", "ديسمبر",
+    }
+
     def __init__(self):
         api_key = (settings.GEMINI_API_KEY or "").strip()
         if not api_key:
@@ -199,13 +226,13 @@ class GeminiService:
         language: str | None = None,
     ) -> SearchRecoveryRead | None:
         normalized = cls.normalize_query(query)
-        compact = re.sub(r"[\s-]", "", normalized).upper()
+        registration = cls.aircraft_registration_from_query(normalized)
 
-        if re.fullmatch(r"N[0-9]{1,5}[A-Z]{0,2}", compact):
+        if registration:
             return SearchRecoveryRead(
                 reason="aircraft_registration",
                 detected_query_type="aircraft_registration",
-                normalized_query=compact,
+                normalized_query=registration,
                 suggestions=[
                     SearchSuggestionRead(
                         label="Search by flight number",
@@ -265,6 +292,53 @@ class GeminiService:
         return None
 
     @classmethod
+    def aircraft_registration_from_query(cls, query: str) -> str | None:
+        normalized = cls.normalize_query(query).upper().strip()
+        normalized = re.sub(
+            r"^(?:AIRCRAFT\s+)?(?:REGISTRATION|TAIL(?:\s+NUMBER)?)\s*[:#-]?\s*",
+            "",
+            normalized,
+        ).strip()
+        compact = re.sub(r"\s+", "", normalized)
+
+        if re.fullmatch(r"N[0-9]{1,5}[A-Z]{0,2}", compact):
+            return compact
+
+        # Common non-US forms retain a country prefix and hyphen, for example
+        # G-STBA, D-ABCD, C-FABC, or VH-ABC.
+        if re.fullmatch(r"[A-Z]{1,2}-[A-Z0-9]{3,5}", compact):
+            return compact
+
+        return None
+
+    @staticmethod
+    def registration_recovery(
+        registration: str,
+        failure_reason: str,
+    ) -> SearchRecoveryRead:
+        reason_by_failure = {
+            "registration_not_live": "aircraft_registration_not_live",
+            "registration_live_unresolved": "aircraft_registration_live_unresolved",
+            "provider_unavailable": "aircraft_registration_provider_unavailable",
+            "provider_rate_limited": "aircraft_registration_provider_rate_limited",
+        }
+        return SearchRecoveryRead(
+            reason=reason_by_failure.get(
+                failure_reason,
+                "aircraft_registration",
+            ),
+            detected_query_type="aircraft_registration",
+            normalized_query=registration,
+            suggestions=[
+                SearchSuggestionRead(
+                    label="Search by flight number",
+                    query="",
+                    kind="search_help",
+                ),
+            ],
+        )
+
+    @classmethod
     def recovery_for_empty_result(
         cls,
         query: str,
@@ -277,6 +351,11 @@ class GeminiService:
             corrected_airline = cls._flight_code_corrections.get(airline)
             if corrected_airline:
                 corrected_query = f"{corrected_airline}{number}"
+                resolved_date = str(
+                    resolved_call.args.get("departure_date", "")
+                ).strip()
+                if resolved_date and cls.query_has_explicit_date(normalized):
+                    corrected_query = f"{corrected_query} {resolved_date}"
                 return SearchRecoveryRead(
                     reason="possible_flight_number_typo",
                     detected_query_type="flight_number",
@@ -286,6 +365,20 @@ class GeminiService:
                             label=f"{corrected_airline} {number}",
                             query=corrected_query,
                             kind="corrected_flight_number",
+                        )
+                    ],
+                )
+
+            if not cls.query_has_explicit_date(normalized):
+                return SearchRecoveryRead(
+                    reason="missing_date",
+                    detected_query_type="flight_number",
+                    normalized_query=f"{airline}{number}",
+                    suggestions=[
+                        SearchSuggestionRead(
+                            label="Add a date",
+                            query="",
+                            kind="add_date",
                         )
                     ],
                 )
@@ -301,12 +394,65 @@ class GeminiService:
                 suggestions=[],
             )
 
+        if re.fullmatch(
+            r"[A-Z]{2,3}[\s-]*[0-9]{1,4}[A-Z]?",
+            normalized.upper(),
+        ):
+            return SearchRecoveryRead(
+                reason="unrecognized_flight_number",
+                detected_query_type="flight_number",
+                normalized_query=normalized.upper().replace(" ", ""),
+                suggestions=[],
+            )
+
         return SearchRecoveryRead(
             reason="no_results",
             detected_query_type="natural_language",
             normalized_query=normalized,
             suggestions=[],
         )
+
+    @classmethod
+    def query_has_explicit_date(cls, query: str) -> bool:
+        normalized = cls.normalize_query(query).casefold()
+        for word in cls._explicit_date_words:
+            if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", normalized):
+                return True
+
+        return bool(
+            re.search(
+                r"(?<!\d)(?:(?:19|20)\d{2}[\s./-]+\d{1,2}[\s./-]+\d{1,2}|"
+                r"\d{1,2}[\s./-]+\d{1,2}(?:[\s,./-]+(?:19|20)?\d{2})?)(?!\d)",
+                normalized,
+            )
+        )
+
+    @staticmethod
+    def query_type_for_call(resolved_call: ResolvedFunctionCall | None) -> str:
+        if not resolved_call:
+            return "unknown"
+        return {
+            "extract_flight_info": "flight_number",
+            "extract_flight_info_via_airport": "airport_route",
+            "extract_flight_info_via_airport_single_derection": "airport",
+            "extract_airline_live_flights": "airline",
+            "extract_random_flight": "random",
+        }.get(resolved_call.function_name, "natural_language")
+
+    @staticmethod
+    def failure_reason_for_recovery(recovery: SearchRecoveryRead) -> str:
+        return {
+            "possible_flight_number_typo": "unrecognized_flight_number",
+            "unrecognized_flight_number": "unrecognized_flight_number",
+            "missing_date": "missing_date",
+            "choose_airport_route": "ambiguous_location",
+            "choose_airport": "ambiguous_location",
+            "nearby_commercial_airport": "unsupported_location",
+            "aircraft_registration_not_live": "registration_not_live",
+            "aircraft_registration_live_unresolved": "registration_live_unresolved",
+            "aircraft_registration_provider_unavailable": "provider_unavailable",
+            "aircraft_registration_provider_rate_limited": "provider_rate_limited",
+        }.get(recovery.reason, "provider_no_match")
 
     @classmethod
     def _countries_in_query(cls, query: str) -> list[str]:

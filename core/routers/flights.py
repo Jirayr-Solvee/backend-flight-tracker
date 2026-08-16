@@ -15,17 +15,42 @@ from ..models.flight import (
     GlobalFlightResolveCandidatesRequest,
     GlobalFlightPositionRead,
     QuerySearchResponse,
+    SearchDiagnosticsRead,
+    SearchRecoveryRead,
 )
 from ..models.live_activity import LiveActivityRegistration
 from ..models.user import User, UserFlightLink
 from ..services.flight.delay_risk import DelayRiskResponse, DelayRiskService
 from ..services.flight import FlightPersistence, FlightService
+from ..services.flight.api_client import AerodataboxUnavailableError
 from ..services.gemini.service import GeminiService
 from ..utils import user_has_active_subscription, normalize_offset
 
 router = APIRouter()
 
 logger = logging.getLogger(__name__)
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, int((time.perf_counter() - started_at) * 1000))
+
+
+def _log_search_provider(
+    *,
+    query_type: str,
+    outcome: str,
+    latency_ms: int,
+    result_count: int,
+) -> None:
+    # Keep search text out of logs. These bounded dimensions are sufficient for
+    # provider latency, outage, and rate-limit monitoring.
+    logger.info(
+        "flight_search_provider query_type=%s outcome=%s latency_ms=%s result_count=%s",
+        query_type,
+        outcome,
+        latency_ms,
+        result_count,
+    )
 
 
 @router.get("/live-positions", response_model=list[GlobalFlightPositionRead])
@@ -271,37 +296,165 @@ async def search_flights_from_text(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
+    ai_service = GeminiService()
+    normalized_term = ai_service.normalize_query(term)
+    normalization_applied = normalized_term != term.strip()
+    resolved_call = None
+
     try:
-        ai_service = GeminiService()
-        normalized_term = ai_service.normalize_query(term)
+        registration = ai_service.aircraft_registration_from_query(normalized_term)
+        if registration:
+            provider_started_at = time.perf_counter()
+            registration_result = await FlightService.resolve_live_aircraft_registration(
+                session=session,
+                registration=registration,
+            )
+            provider_latency_ms = _elapsed_ms(provider_started_at)
+            provider_outcome = registration_result.failure_reason or "results"
+            _log_search_provider(
+                query_type="aircraft_registration",
+                outcome=provider_outcome,
+                latency_ms=provider_latency_ms,
+                result_count=registration_result.provider_result_count,
+            )
+            diagnostics = SearchDiagnosticsRead(
+                query_type="aircraft_registration",
+                failure_reason=registration_result.failure_reason,
+                normalization_applied=(
+                    normalization_applied
+                    or registration != normalized_term.upper()
+                ),
+                provider_result_count=registration_result.provider_result_count,
+                provider_outcome=provider_outcome,
+                provider_latency_ms=provider_latency_ms,
+            )
+            if registration_result.flight:
+                session.commit()
+                return QuerySearchResponse(
+                    flights_result=[
+                        FlightRead.model_validate(
+                            registration_result.flight,
+                            from_attributes=True,
+                        )
+                    ],
+                    diagnostics=diagnostics,
+                )
+
+            return QuerySearchResponse(
+                recovery=ai_service.registration_recovery(
+                    registration=registration,
+                    failure_reason=(
+                        registration_result.failure_reason
+                        or "registration_live_unresolved"
+                    ),
+                ),
+                diagnostics=diagnostics,
+            )
+
         preflight_recovery = ai_service.preflight_recovery(
             normalized_term,
             language=language or accept_language,
         )
         if preflight_recovery:
-            return QuerySearchResponse(recovery=preflight_recovery)
+            return QuerySearchResponse(
+                recovery=preflight_recovery,
+                diagnostics=SearchDiagnosticsRead(
+                    query_type=preflight_recovery.detected_query_type,
+                    failure_reason=ai_service.failure_reason_for_recovery(
+                        preflight_recovery
+                    ),
+                    normalization_applied=normalization_applied,
+                    provider_result_count=0,
+                    provider_outcome="not_called",
+                ),
+            )
 
-        result = await ai_service.get_function_call(
+        resolved_call = await ai_service.get_function_call(
             query=normalized_term,
             language=language or accept_language,
         )
 
-        if not result:
+        if not resolved_call:
             logger.warning("Gemini unable to retrieve a search function call")
+            recovery = ai_service.recovery_for_empty_result(
+                query=normalized_term,
+                resolved_call=None,
+            )
             return QuerySearchResponse(
-                recovery=ai_service.recovery_for_empty_result(
-                    query=normalized_term,
-                    resolved_call=None,
-                )
+                recovery=recovery,
+                diagnostics=SearchDiagnosticsRead(
+                    query_type=recovery.detected_query_type,
+                    failure_reason=ai_service.failure_reason_for_recovery(recovery),
+                    normalization_applied=normalization_applied,
+                    provider_result_count=0,
+                    provider_outcome="not_called",
+                ),
             )
 
-        flights = await result.handler(**result.args, session=session)
+        query_type = ai_service.query_type_for_call(resolved_call)
+        provider_started_at = time.perf_counter()
+        try:
+            flights = await resolved_call.handler(
+                **resolved_call.args,
+                session=session,
+            )
+        except AerodataboxUnavailableError as exc:
+            provider_latency_ms = _elapsed_ms(provider_started_at)
+            failure_reason = (
+                "provider_rate_limited" if exc.rate_limited else "provider_unavailable"
+            )
+            _log_search_provider(
+                query_type=query_type,
+                outcome=failure_reason,
+                latency_ms=provider_latency_ms,
+                result_count=0,
+            )
+            return QuerySearchResponse(
+                recovery=SearchRecoveryRead(
+                    reason=failure_reason,
+                    detected_query_type=query_type,
+                    suggestions=[],
+                ),
+                diagnostics=SearchDiagnosticsRead(
+                    query_type=query_type,
+                    failure_reason=failure_reason,
+                    normalization_applied=normalization_applied,
+                    provider_result_count=0,
+                    provider_outcome=failure_reason,
+                    provider_latency_ms=provider_latency_ms,
+                ),
+            )
 
-        if not flights.flights_result and not flights.airport_flights_result:
+        provider_latency_ms = _elapsed_ms(provider_started_at)
+        provider_result_count = (
+            len(flights.flights_result) + len(flights.airport_flights_result)
+        )
+        provider_outcome = "results" if provider_result_count > 0 else "no_match"
+        _log_search_provider(
+            query_type=query_type,
+            outcome=provider_outcome,
+            latency_ms=provider_latency_ms,
+            result_count=provider_result_count,
+        )
+
+        if provider_result_count == 0:
             flights.recovery = ai_service.recovery_for_empty_result(
                 query=normalized_term,
-                resolved_call=result,
+                resolved_call=resolved_call,
             )
+
+        flights.diagnostics = SearchDiagnosticsRead(
+            query_type=query_type,
+            failure_reason=(
+                ai_service.failure_reason_for_recovery(flights.recovery)
+                if flights.recovery
+                else None
+            ),
+            normalization_applied=normalization_applied,
+            provider_result_count=provider_result_count,
+            provider_outcome=provider_outcome,
+            provider_latency_ms=provider_latency_ms,
+        )
 
         session.commit()
 
@@ -309,11 +462,28 @@ async def search_flights_from_text(
     except HTTPException as exc:
         session.rollback()
         if exc.status_code == status.HTTP_404_NOT_FOUND:
-            return QuerySearchResponse()
+            recovery = ai_service.recovery_for_empty_result(
+                query=normalized_term,
+                resolved_call=resolved_call,
+            )
+            return QuerySearchResponse(
+                recovery=recovery,
+                diagnostics=SearchDiagnosticsRead(
+                    query_type=ai_service.query_type_for_call(resolved_call),
+                    failure_reason=ai_service.failure_reason_for_recovery(recovery),
+                    normalization_applied=normalization_applied,
+                    provider_result_count=0,
+                    provider_outcome="not_found",
+                ),
+            )
         raise
     except Exception:
         session.rollback()
-        logger.exception(f"Error searching for flight using term={term}")
+        logger.exception(
+            "Error searching for flight query_type=%s user_id=%s",
+            ai_service.query_type_for_call(resolved_call),
+            user.id,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",

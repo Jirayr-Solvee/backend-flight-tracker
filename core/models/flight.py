@@ -254,7 +254,20 @@ class SearchRecoveryRead(SQLModel):
     suggestions: list[SearchSuggestionRead] = Field(default_factory=list)
 
 
+class SearchDiagnosticsRead(SQLModel):
+    # Deliberately contains classifications and counts only. The raw query can
+    # contain a pasted itinerary or other personal data and must not be copied
+    # into product analytics.
+    query_type: str = "unknown"
+    failure_reason: str | None = None
+    normalization_applied: bool = False
+    provider_result_count: int = 0
+    provider_outcome: str = "not_called"
+    provider_latency_ms: int | None = None
+
+
 class QuerySearchResponse(SQLModel):
     flights_result: list[FlightRead] = Field(default_factory=list)
     airport_flights_result: list[AirportFlightRead] = Field(default_factory=list)
     recovery: SearchRecoveryRead | None = None
+    diagnostics: SearchDiagnosticsRead | None = None

@@ -30,6 +30,7 @@ from ...models.flight import (
     QuerySearchResponse,
 )
 from .api_client import (
+    ADSBExchangeRateLimitedError,
     ADSBExchangeClient,
     AerodataboxClient,
     AerodataboxUnavailableError,
@@ -52,6 +53,13 @@ class GlobalLiveFlightResolveMatch:
     departure_date: str
     live_flights: list[AerodataboxFlight]
     live_flight: AerodataboxFlight
+
+
+@dataclass(frozen=True)
+class LiveRegistrationSearchResult:
+    flight: Flight | None
+    failure_reason: str | None
+    provider_result_count: int
 
 
 class FlightService:
@@ -568,6 +576,57 @@ class FlightService:
         )
 
     @staticmethod
+    async def resolve_live_aircraft_registration(
+        session: Session,
+        registration: str,
+    ) -> LiveRegistrationSearchResult:
+        try:
+            positions = await ADSBExchangeClient().get_positions_for_registration(
+                registration=registration,
+            )
+        except ADSBExchangeRateLimitedError:
+            return LiveRegistrationSearchResult(
+                flight=None,
+                failure_reason="provider_rate_limited",
+                provider_result_count=0,
+            )
+        if positions is None:
+            return LiveRegistrationSearchResult(
+                flight=None,
+                failure_reason="provider_unavailable",
+                provider_result_count=0,
+            )
+        if not positions:
+            return LiveRegistrationSearchResult(
+                flight=None,
+                failure_reason="registration_not_live",
+                provider_result_count=0,
+            )
+
+        for position in positions:
+            callsign = (position.callsign or "").strip()
+            if len(callsign) < 3:
+                continue
+
+            flight = await FlightService.resolve_global_live_flight(
+                session=session,
+                callsign=callsign,
+                icao24=position.icao24,
+            )
+            if flight:
+                return LiveRegistrationSearchResult(
+                    flight=flight,
+                    failure_reason=None,
+                    provider_result_count=len(positions),
+                )
+
+        return LiveRegistrationSearchResult(
+            flight=None,
+            failure_reason="registration_live_unresolved",
+            provider_result_count=len(positions),
+        )
+
+    @staticmethod
     async def resolve_global_live_flight_candidates(
         session: Session,
         candidates: Sequence[GlobalFlightResolveCandidate],
@@ -1061,6 +1120,21 @@ class FlightQueryHandler:
         FlightStatusEnum.APPROACHING.value: 90,
         FlightStatusEnum.ARRIVED.value: 100,
     }
+    SEARCH_STATUS_PRIORITY = {
+        FlightStatusEnum.ENROUTE.value: 0,
+        FlightStatusEnum.DEPARTED.value: 1,
+        FlightStatusEnum.APPROACHING.value: 2,
+        FlightStatusEnum.DIVERTED.value: 3,
+        FlightStatusEnum.BOARDING.value: 4,
+        FlightStatusEnum.GATECLOSED.value: 5,
+        FlightStatusEnum.CHECKIN.value: 6,
+        FlightStatusEnum.DELAYED.value: 7,
+        FlightStatusEnum.EXPECTED.value: 8,
+        FlightStatusEnum.UNKNOWN.value: 20,
+        FlightStatusEnum.CANCELEDUNCERTAIN.value: 30,
+        FlightStatusEnum.CANCELED.value: 31,
+        FlightStatusEnum.ARRIVED.value: 40,
+    }
 
     @staticmethod
     async def extract_random_flight(
@@ -1096,11 +1170,15 @@ class FlightQueryHandler:
                 .limit(limit)
             ).all()
 
+        flight_reads = [
+            FlightRead.model_validate(flight, from_attributes=True)
+            for flight in flights
+        ]
         return QuerySearchResponse(
-            flights_result=[
-                FlightRead.model_validate(flight, from_attributes=True)
-                for flight in flights
-            ]
+            flights_result=FlightQueryHandler._rank_exact_flights(
+                flight_reads,
+                requested_number="",
+            )
         )
 
     @staticmethod
@@ -1129,11 +1207,15 @@ class FlightQueryHandler:
                     f"Unable to resolve live fallback for airline_iata={airline_iata}, flight_number={flight_number}"
                 )
 
+        flight_reads = [
+            FlightRead.model_validate(flight, from_attributes=True)
+            for flight in flights
+        ]
         return QuerySearchResponse(
-            flights_result=[
-                FlightRead.model_validate(flight, from_attributes=True)
-                for flight in flights
-            ]
+            flights_result=FlightQueryHandler._rank_exact_flights(
+                flight_reads,
+                requested_number=f"{airline_iata}{flight_number}",
+            )
         )
 
     @staticmethod
@@ -1273,18 +1355,35 @@ class FlightQueryHandler:
             ):
                 best_by_key[key] = flight
 
-        return list(best_by_key.values())
+        return sorted(
+            best_by_key.values(),
+            key=FlightQueryHandler._airport_search_sort_key,
+        )
 
     @staticmethod
     def _airport_flight_key(
         flight: AirportFlightRead,
     ) -> tuple[str, str, str, str, str]:
+        departure_time = (
+            flight.departure.scheduled_time_utc if flight.departure else ""
+        ) or ""
+        arrival_time = (
+            flight.arrival.scheduled_time_utc if flight.arrival else ""
+        ) or ""
+        # Identical route and scheduled timestamps are the stable signal shared
+        # by marketing/operating codeshares. When timing is incomplete, retain
+        # the number so unrelated flights are never collapsed.
+        incomplete_discriminator = (
+            flight.number.strip().replace(" ", "").upper()
+            if not departure_time or not arrival_time
+            else ""
+        )
         return (
-            flight.number.strip().replace(" ", "").upper(),
-            flight.departure.scheduled_time_utc if flight.departure else "",
-            flight.arrival.scheduled_time_utc if flight.arrival else "",
             (flight.departure.airport.iata if flight.departure else "") or "",
             (flight.arrival.airport.iata if flight.arrival else "") or "",
+            departure_time,
+            arrival_time,
+            incomplete_discriminator,
         )
 
     @staticmethod
@@ -1293,7 +1392,8 @@ class FlightQueryHandler:
             flight.status.value if isinstance(flight.status, FlightStatusEnum)
             else str(flight.status)
         )
-        score = FlightQueryHandler.STATUS_SCORE.get(status_value, 0)
+        priority = FlightQueryHandler.SEARCH_STATUS_PRIORITY.get(status_value, 20)
+        score = 1000 - (priority * 20)
 
         for segment in (flight.departure, flight.arrival):
             if not segment:
@@ -1307,6 +1407,123 @@ class FlightQueryHandler:
                 score += 10
 
         return score
+
+    @staticmethod
+    def _airport_search_sort_key(
+        flight: AirportFlightRead,
+    ) -> tuple[int, str, str]:
+        status_value = (
+            flight.status.value if isinstance(flight.status, FlightStatusEnum)
+            else str(flight.status)
+        )
+        scheduled = (
+            flight.departure.scheduled_time_utc if flight.departure else ""
+        ) or "9999"
+        return (
+            FlightQueryHandler.SEARCH_STATUS_PRIORITY.get(status_value, 20),
+            scheduled,
+            flight.number,
+        )
+
+    @staticmethod
+    def _rank_exact_flights(
+        flights: list[FlightRead],
+        requested_number: str,
+    ) -> list[FlightRead]:
+        requested = requested_number.strip().replace(" ", "").upper()
+        best_by_physical_flight: dict[
+            tuple[str, str, str, str, str],
+            FlightRead,
+        ] = {}
+
+        for flight in flights:
+            key = FlightQueryHandler._direct_physical_flight_key(flight)
+            current = best_by_physical_flight.get(key)
+            if current is None or FlightQueryHandler._direct_flight_score(
+                flight,
+                requested,
+            ) > FlightQueryHandler._direct_flight_score(current, requested):
+                best_by_physical_flight[key] = flight
+
+        return sorted(
+            best_by_physical_flight.values(),
+            key=lambda flight: FlightQueryHandler._direct_flight_sort_key(
+                flight,
+                requested,
+            ),
+        )
+
+    @staticmethod
+    def _direct_physical_flight_key(
+        flight: FlightRead,
+    ) -> tuple[str, str, str, str, str]:
+        departure_iata = (
+            flight.departure.airport.iata if flight.departure else ""
+        ) or ""
+        arrival_iata = (
+            flight.arrival.airport.iata if flight.arrival else ""
+        ) or ""
+        departure_time = (
+            flight.departure.scheduled_time_utc if flight.departure else ""
+        ) or ""
+        arrival_time = (
+            flight.arrival.scheduled_time_utc if flight.arrival else ""
+        ) or ""
+        discriminator = (
+            ""
+            if departure_iata and arrival_iata and departure_time and arrival_time
+            else flight.number.strip().replace(" ", "").upper()
+        )
+        return (
+            departure_iata,
+            arrival_iata,
+            departure_time,
+            arrival_time,
+            discriminator,
+        )
+
+    @staticmethod
+    def _direct_flight_score(flight: FlightRead, requested: str) -> int:
+        number = flight.number.strip().replace(" ", "").upper()
+        status_value = (
+            flight.status.value if isinstance(flight.status, FlightStatusEnum)
+            else str(flight.status)
+        )
+        priority = FlightQueryHandler.SEARCH_STATUS_PRIORITY.get(status_value, 20)
+        score = 10000 if number == requested else 0
+        score += 1000 - (priority * 20)
+
+        for segment in (flight.departure, flight.arrival):
+            if not segment:
+                continue
+            if segment.runway_time_utc:
+                score += 30
+            if segment.predicted_time_utc:
+                score += 20
+            if segment.revised_time_utc:
+                score += 10
+
+        return score
+
+    @staticmethod
+    def _direct_flight_sort_key(
+        flight: FlightRead,
+        requested: str,
+    ) -> tuple[int, int, str, str]:
+        number = flight.number.strip().replace(" ", "").upper()
+        status_value = (
+            flight.status.value if isinstance(flight.status, FlightStatusEnum)
+            else str(flight.status)
+        )
+        scheduled = (
+            flight.departure.scheduled_time_utc if flight.departure else ""
+        ) or "9999"
+        return (
+            0 if number == requested else 1,
+            FlightQueryHandler.SEARCH_STATUS_PRIORITY.get(status_value, 20),
+            scheduled,
+            number,
+        )
 
     @staticmethod
     def _sanitize_airport_flight(flight: AirportFlightRead) -> None:
