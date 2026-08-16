@@ -33,9 +33,9 @@ class GeminiService:
 
     _flight_code_corrections = {
         # Confusions observed in real Sofly searches. Suggestions are shown to
-        # the user and never silently substituted.
+        # the user and never silently substituted. Only keep corrections that
+        # were confirmed by a successful follow-up search.
         "EL": "EK",
-        "FL": "FI",
     }
 
     _country_airports = {
@@ -295,13 +295,10 @@ class GeminiService:
                 reason="flight_not_found",
                 detected_query_type="flight_number",
                 normalized_query=canonical_query,
-                suggestions=[
-                    SearchSuggestionRead(
-                        label=f"{canonical_query} tomorrow",
-                        query=f"{canonical_query} Tomorrow",
-                        kind="next_day",
-                    )
-                ] if canonical_query else [],
+                # Do not offer another search unless it is a confirmed
+                # correction. An unverified date/code chip creates a dead end
+                # when the provider has no matching upcoming service.
+                suggestions=[],
             )
 
         return SearchRecoveryRead(

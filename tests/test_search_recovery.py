@@ -87,7 +87,7 @@ class SearchRecoveryTests(unittest.TestCase):
             ("V7", "2115"),
         )
 
-    def test_empty_result_suggests_confusable_airline_code(self):
+    def test_empty_result_does_not_guess_an_unconfirmed_airline_code(self):
         resolved = ResolvedFunctionCall(
             function_name="extract_flight_info",
             args={
@@ -100,9 +100,24 @@ class SearchRecoveryTests(unittest.TestCase):
 
         recovery = GeminiService.recovery_for_empty_result("FL528", resolved)
 
+        self.assertEqual(recovery.reason, "flight_not_found")
+        self.assertEqual(recovery.suggestions, [])
+
+    def test_confirmed_code_confusion_still_gets_a_correction(self):
+        resolved = ResolvedFunctionCall(
+            function_name="extract_flight_info",
+            args={
+                "airline_iata": "EL",
+                "flight_number": "822",
+                "departure_date": "2026-08-16",
+            },
+            handler=lambda **_: None,
+        )
+
+        recovery = GeminiService.recovery_for_empty_result("EL822", resolved)
+
         self.assertEqual(recovery.reason, "possible_flight_number_typo")
-        self.assertEqual(recovery.suggestions[0].query, "FI528")
-        self.assertEqual(recovery.suggestions[0].label, "FI 528")
+        self.assertEqual(recovery.suggestions[0].query, "EK822")
 
 
 if __name__ == "__main__":
