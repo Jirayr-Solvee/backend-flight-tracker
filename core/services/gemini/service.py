@@ -485,39 +485,54 @@ class GeminiService:
 
     @staticmethod
     def _date_from_query(lowered_query: str) -> str:
+        lowered_query = lowered_query.casefold()
         today = datetime.now(timezone.utc).date()
         month_aliases = {
-            "january": 1, "jan": 1, "enero": 1, "janvier": 1,
+            "january": 1, "jan": 1, "enero": 1, "ene": 1,
+            "janvier": 1, "janv": 1,
             "januar": 1, "gennaio": 1, "janeiro": 1, "يناير": 1,
             "february": 2, "feb": 2, "febrero": 2, "février": 2,
-            "fevrier": 2, "februar": 2, "febbraio": 2, "fevereiro": 2,
+            "févr": 2, "fevrier": 2, "fevr": 2, "februar": 2,
+            "febbraio": 2, "fevereiro": 2, "fev": 2,
             "فبراير": 2,
             "march": 3, "mar": 3, "marzo": 3, "mars": 3, "märz": 3,
             "marz": 3, "março": 3, "marco": 3, "مارس": 3,
-            "april": 4, "apr": 4, "abril": 4, "avril": 4, "aprile": 4,
+            "april": 4, "apr": 4, "abril": 4, "abr": 4,
+            "avril": 4, "avr": 4, "aprile": 4,
             "أبريل": 4, "ابريل": 4,
             "may": 5, "mayo": 5, "mai": 5, "maggio": 5, "maio": 5,
+            "mag": 5,
             "مايو": 5,
             "june": 6, "jun": 6, "junio": 6, "juin": 6, "juni": 6,
-            "giugno": 6, "junho": 6, "يونيو": 6,
+            "giugno": 6, "giu": 6, "junho": 6, "يونيو": 6,
             "july": 7, "jul": 7, "julio": 7, "juillet": 7, "juli": 7,
-            "luglio": 7, "julho": 7, "يوليو": 7,
+            "juil": 7, "luglio": 7, "lug": 7, "julho": 7, "يوليو": 7,
             "august": 8, "aug": 8, "agosto": 8, "août": 8, "aout": 8,
+            "ago": 8,
             "أغسطس": 8, "اغسطس": 8,
             "september": 9, "sep": 9, "septiembre": 9,
-            "septembre": 9, "settembre": 9, "setembro": 9, "سبتمبر": 9,
+            "septembre": 9, "sept": 9, "settembre": 9, "setembro": 9,
+            "set": 9, "سبتمبر": 9,
             "october": 10, "oct": 10, "octubre": 10, "octobre": 10,
-            "oktober": 10, "ottobre": 10, "outubro": 10,
+            "oktober": 10, "okt": 10, "ottobre": 10, "ott": 10,
+            "outubro": 10, "out": 10,
             "أكتوبر": 10, "اكتوبر": 10,
             "november": 11, "nov": 11, "noviembre": 11,
             "novembre": 11, "نوفمبر": 11,
             "december": 12, "dec": 12, "diciembre": 12,
-            "décembre": 12, "decembre": 12, "dezember": 12,
-            "dicembre": 12, "dezembro": 12, "ديسمبر": 12,
+            "décembre": 12, "déc": 12, "decembre": 12,
+            "dezember": 12, "dez": 12, "dicembre": 12, "dic": 12,
+            "dezembro": 12, "ديسمبر": 12,
         }
 
+        def resolved_year(raw_year: str | None) -> int:
+            if not raw_year:
+                return today.year
+            value = int(raw_year)
+            return 2000 + value if value < 100 else value
+
         iso_match = re.search(
-            r"(?<!\d)(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)",
+            r"(?<!\d)((?:19|20)\d{2})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)",
             lowered_query,
         )
         if iso_match:
@@ -538,18 +553,17 @@ class GeminiService:
         named_date_patterns = (
             rf"(?<!\w)(?P<month>{month_pattern})\s+"
             r"(?P<day>\d{1,2})(?:st|nd|rd|th)?"
-            r"(?:,?\s+(?P<year>20\d{2}))?(?!\w)",
-            r"(?<!\w)(?P<day>\d{1,2})\s+"
+            r"(?:,?\s+(?P<year>\d{4}|\d{2}))?(?!\w)",
+            r"(?<!\w)(?P<day>\d{1,2})(?:st|nd|rd|th)?\s+"
             rf"(?P<month>{month_pattern})"
-            r"(?:\s+(?P<year>20\d{2}))?(?!\w)",
+            r"(?:\s+(?P<year>\d{4}|\d{2}))?(?!\w)",
         )
         for pattern in named_date_patterns:
             match = re.search(pattern, lowered_query)
             if not match:
                 continue
 
-            year_was_explicit = match.group("year") is not None
-            year = int(match.group("year") or today.year)
+            year = resolved_year(match.group("year"))
             month = month_aliases[match.group("month")]
             day = int(match.group("day"))
             try:
@@ -562,12 +576,34 @@ class GeminiService:
             except ValueError:
                 continue
 
-            if not year_was_explicit and parsed_date < today:
-                try:
-                    parsed_date = parsed_date.replace(year=year + 1)
-                except ValueError:
-                    pass
             return parsed_date.isoformat()
+
+        numeric_date = re.search(
+            r"(?<!\d)(?P<first>\d{1,2})[\s./-]+(?P<second>\d{1,2})"
+            r"(?:[\s,./-]+(?P<year>\d{4}|\d{2}))?(?!\d)",
+            lowered_query,
+        )
+        if numeric_date:
+            first = int(numeric_date.group("first"))
+            second = int(numeric_date.group("second"))
+
+            # Prefer day-first for ambiguous forms because that is the common
+            # format across Sofly's supported locales. Still accept an
+            # unambiguous US month-first form such as 08/17.
+            if second > 12 and first <= 12:
+                month, day = first, second
+            else:
+                day, month = first, second
+
+            try:
+                return datetime(
+                    resolved_year(numeric_date.group("year")),
+                    month,
+                    day,
+                    tzinfo=timezone.utc,
+                ).date().isoformat()
+            except ValueError:
+                pass
 
         tomorrow_tokens = {
             "tomorrow",

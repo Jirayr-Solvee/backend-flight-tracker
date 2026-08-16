@@ -1,5 +1,6 @@
 import os
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -104,6 +105,46 @@ class SearchRecoveryTests(unittest.TestCase):
             GeminiService._date_from_query("fi528 2026-08-17"),
             "2026-08-17",
         )
+
+    def test_named_dates_without_a_year_use_current_year(self):
+        expected = f"{datetime.now(timezone.utc).year}-08-17"
+        for query in (
+            "fi528 August 17",
+            "fi528 Aug 17",
+            "fi528 17 August",
+            "fi528 17 Aug",
+            "fi528 Aug 17th",
+            "fi528 17th Aug",
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(GeminiService._date_from_query(query), expected)
+
+        self.assertEqual(
+            GeminiService._date_from_query("fi528 January 1"),
+            f"{datetime.now(timezone.utc).year}-01-01",
+        )
+
+    def test_numeric_day_first_dates_are_supported(self):
+        expected = f"{datetime.now(timezone.utc).year}-08-17"
+        for query in (
+            "fi528 17 08",
+            "fi528 17/08",
+            "fi528 17-08",
+            "fi528 17.08",
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(GeminiService._date_from_query(query), expected)
+
+    def test_numeric_dates_accept_year_and_unambiguous_month_first(self):
+        expected = {
+            "fi528 17 08 2026": "2026-08-17",
+            "fi528 17/08/26": "2026-08-17",
+            "fi528 08/17/2026": "2026-08-17",
+            "fi528 2026/08/17": "2026-08-17",
+        }
+        for query, date in expected.items():
+            with self.subTest(query=query):
+                self.assertEqual(GeminiService._date_from_query(query), date)
 
     def test_empty_result_does_not_guess_an_unconfirmed_airline_code(self):
         resolved = ResolvedFunctionCall(
