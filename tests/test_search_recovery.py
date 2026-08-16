@@ -87,6 +87,24 @@ class SearchRecoveryTests(unittest.TestCase):
             ("V7", "2115"),
         )
 
+    def test_explicit_english_date_is_not_replaced_with_today(self):
+        self.assertEqual(
+            GeminiService._date_from_query("fi528 august 17, 2026"),
+            "2026-08-17",
+        )
+
+    def test_day_first_date_is_supported(self):
+        self.assertEqual(
+            GeminiService._date_from_query("fi528 17 august 2026"),
+            "2026-08-17",
+        )
+
+    def test_iso_date_is_supported(self):
+        self.assertEqual(
+            GeminiService._date_from_query("fi528 2026-08-17"),
+            "2026-08-17",
+        )
+
     def test_empty_result_does_not_guess_an_unconfirmed_airline_code(self):
         resolved = ResolvedFunctionCall(
             function_name="extract_flight_info",

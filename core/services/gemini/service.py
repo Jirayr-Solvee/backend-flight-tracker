@@ -486,6 +486,89 @@ class GeminiService:
     @staticmethod
     def _date_from_query(lowered_query: str) -> str:
         today = datetime.now(timezone.utc).date()
+        month_aliases = {
+            "january": 1, "jan": 1, "enero": 1, "janvier": 1,
+            "januar": 1, "gennaio": 1, "janeiro": 1, "يناير": 1,
+            "february": 2, "feb": 2, "febrero": 2, "février": 2,
+            "fevrier": 2, "februar": 2, "febbraio": 2, "fevereiro": 2,
+            "فبراير": 2,
+            "march": 3, "mar": 3, "marzo": 3, "mars": 3, "märz": 3,
+            "marz": 3, "março": 3, "marco": 3, "مارس": 3,
+            "april": 4, "apr": 4, "abril": 4, "avril": 4, "aprile": 4,
+            "أبريل": 4, "ابريل": 4,
+            "may": 5, "mayo": 5, "mai": 5, "maggio": 5, "maio": 5,
+            "مايو": 5,
+            "june": 6, "jun": 6, "junio": 6, "juin": 6, "juni": 6,
+            "giugno": 6, "junho": 6, "يونيو": 6,
+            "july": 7, "jul": 7, "julio": 7, "juillet": 7, "juli": 7,
+            "luglio": 7, "julho": 7, "يوليو": 7,
+            "august": 8, "aug": 8, "agosto": 8, "août": 8, "aout": 8,
+            "أغسطس": 8, "اغسطس": 8,
+            "september": 9, "sep": 9, "septiembre": 9,
+            "septembre": 9, "settembre": 9, "setembro": 9, "سبتمبر": 9,
+            "october": 10, "oct": 10, "octubre": 10, "octobre": 10,
+            "oktober": 10, "ottobre": 10, "outubro": 10,
+            "أكتوبر": 10, "اكتوبر": 10,
+            "november": 11, "nov": 11, "noviembre": 11,
+            "novembre": 11, "نوفمبر": 11,
+            "december": 12, "dec": 12, "diciembre": 12,
+            "décembre": 12, "decembre": 12, "dezember": 12,
+            "dicembre": 12, "dezembro": 12, "ديسمبر": 12,
+        }
+
+        iso_match = re.search(
+            r"(?<!\d)(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)",
+            lowered_query,
+        )
+        if iso_match:
+            try:
+                return datetime(
+                    int(iso_match.group(1)),
+                    int(iso_match.group(2)),
+                    int(iso_match.group(3)),
+                    tzinfo=timezone.utc,
+                ).date().isoformat()
+            except ValueError:
+                pass
+
+        month_pattern = "|".join(
+            re.escape(alias)
+            for alias in sorted(month_aliases, key=len, reverse=True)
+        )
+        named_date_patterns = (
+            rf"(?<!\w)(?P<month>{month_pattern})\s+"
+            r"(?P<day>\d{1,2})(?:st|nd|rd|th)?"
+            r"(?:,?\s+(?P<year>20\d{2}))?(?!\w)",
+            r"(?<!\w)(?P<day>\d{1,2})\s+"
+            rf"(?P<month>{month_pattern})"
+            r"(?:\s+(?P<year>20\d{2}))?(?!\w)",
+        )
+        for pattern in named_date_patterns:
+            match = re.search(pattern, lowered_query)
+            if not match:
+                continue
+
+            year_was_explicit = match.group("year") is not None
+            year = int(match.group("year") or today.year)
+            month = month_aliases[match.group("month")]
+            day = int(match.group("day"))
+            try:
+                parsed_date = datetime(
+                    year,
+                    month,
+                    day,
+                    tzinfo=timezone.utc,
+                ).date()
+            except ValueError:
+                continue
+
+            if not year_was_explicit and parsed_date < today:
+                try:
+                    parsed_date = parsed_date.replace(year=year + 1)
+                except ValueError:
+                    pass
+            return parsed_date.isoformat()
+
         tomorrow_tokens = {
             "tomorrow",
             "mañana",
