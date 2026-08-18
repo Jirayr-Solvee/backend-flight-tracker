@@ -61,6 +61,6 @@ D0/D7/D30 ROAS with maturity counts.
 For a daily server job, run:
 
 ```bash
-/home/ubuntu/backend-flight-tracker/venv/bin/python \
-  /home/ubuntu/backend-flight-tracker/scripts/sync_apple_ads.py
+cd /home/ubuntu/backend-flight-tracker
+/home/ubuntu/backend-flight-tracker/venv/bin/python3 -m scripts.sync_apple_ads
 ```
