@@ -4,6 +4,7 @@ from .device import Device
 from .experiment import ExperimentConversion, ExperimentExposure
 from .flight import Airline, Airport, Arrival, Departure, Flight
 from .live_activity import LiveActivityRegistration
+from .search_failure import SearchFailureSample
 from .subscription import Subscription
 from .transaction import Transaction
 

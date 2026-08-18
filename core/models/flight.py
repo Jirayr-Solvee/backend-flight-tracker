@@ -264,6 +264,33 @@ class SearchDiagnosticsRead(SQLModel):
     provider_result_count: int = 0
     provider_outcome: str = "not_called"
     provider_latency_ms: int | None = None
+    failure_sample_id: str | None = None
+
+
+class SearchQueryRequest(SQLModel):
+    term: str = Field(min_length=2, max_length=2_000)
+    language: str | None = Field(default=None, max_length=80)
+    app_version: str | None = Field(default=None, max_length=40)
+    build_number: str | None = Field(default=None, max_length=40)
+    analytics_environment: str = Field(default="unknown", max_length=20)
+
+
+class SearchFailureReportRequest(SQLModel):
+    query: str = Field(min_length=1, max_length=2_000)
+    failure_sample_id: str | None = Field(default=None, max_length=80)
+    source: str = Field(min_length=1, max_length=80)
+    query_type: str = Field(default="unknown", max_length=80)
+    failure_reason: str = Field(min_length=1, max_length=100)
+    provider_outcome: str = Field(default="unknown", max_length=100)
+    normalization_applied: bool = False
+    provider_result_count: int = Field(default=0, ge=0, le=100_000)
+    filtered_result_count: int = Field(default=0, ge=0, le=100_000)
+    provider_latency_ms: int | None = Field(default=None, ge=0, le=600_000)
+    search_journey_id: str | None = Field(default=None, max_length=80)
+    search_attempt_number: int | None = Field(default=None, ge=1, le=100)
+    app_version: str | None = Field(default=None, max_length=40)
+    build_number: str | None = Field(default=None, max_length=40)
+    analytics_environment: str = Field(default="unknown", max_length=20)
 
 
 class QuerySearchResponse(SQLModel):

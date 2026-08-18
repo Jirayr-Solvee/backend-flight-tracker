@@ -126,16 +126,14 @@ class GeminiService:
                     fc = part.function_call
 
                     if not fc.name or not fc.args:
-                        logger.warning(
-                            f"function name or function args not found for function call: {fc}"
-                        )
+                        logger.warning("Gemini function call is missing a name or arguments")
                         continue
 
                     return FunctionCallResult(
                         function_name=fc.name,
                         args=dict(fc.args),
                     )
-        logger.warning(f"Unable to extract function call from response: {response}")
+        logger.warning("Unable to extract a function call from Gemini response")
         return None
 
     async def get_function_call(
@@ -172,7 +170,9 @@ class GeminiService:
                 )
                 if not response:
                     logger.warning(
-                        f"Gemini produced invalid response={response}, for query={query}, email={email}, attempt={attempt}"
+                        "Gemini produced an invalid response email_mode=%s attempt=%s",
+                        email,
+                        attempt,
                     )
                     continue
 
@@ -187,7 +187,10 @@ class GeminiService:
                 )
                 if not valid_function_call:
                     logger.warning(
-                        f"Gemini produced invalid function_call={extracted_function_call}, for query={query}, email={email}, attempt={attempt}"
+                        "Gemini produced an invalid function call function=%s email_mode=%s attempt=%s",
+                        extracted_function_call.function_name,
+                        email,
+                        attempt,
                     )
                     continue
 
@@ -204,11 +207,15 @@ class GeminiService:
                 )
             except Exception:
                 logger.exception(
-                    f"Error while retriving a function call for query={query}, email={email}, attempt={attempt}"
+                    "Error retrieving Gemini function call email_mode=%s attempt=%s",
+                    email,
+                    attempt,
                 )
 
         logger.warning(
-            f"Gemini unable to extract a function call for query={query}, email={email}, after all attempts"
+            "Gemini unable to extract a function call email_mode=%s attempts=%s",
+            email,
+            attempts,
         )
         return None
 

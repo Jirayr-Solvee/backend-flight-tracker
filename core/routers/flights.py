@@ -6,7 +6,7 @@ from fastapi import (APIRouter, BackgroundTasks, Depends, Header, HTTPException,
 from sqlmodel import Session, select
 
 from ..background_tasks import create_webhook_for_flight
-from ..dependency import get_current_user
+from ..dependency import check_lambda_auth_token, get_current_user
 from ..models import get_session
 from ..models.flight import (
     CopilotTelemetryRead,
@@ -16,6 +16,8 @@ from ..models.flight import (
     GlobalFlightPositionRead,
     QuerySearchResponse,
     SearchDiagnosticsRead,
+    SearchFailureReportRequest,
+    SearchQueryRequest,
     SearchRecoveryRead,
 )
 from ..models.live_activity import LiveActivityRegistration
@@ -24,6 +26,7 @@ from ..services.flight.delay_risk import DelayRiskResponse, DelayRiskService
 from ..services.flight import FlightPersistence, FlightService
 from ..services.flight.api_client import AerodataboxUnavailableError
 from ..services.gemini.service import GeminiService
+from ..services.search_failure import RETENTION_DAYS, SearchFailureService
 from ..utils import user_has_active_subscription, normalize_offset
 
 router = APIRouter()
@@ -51,6 +54,39 @@ def _log_search_provider(
         latency_ms,
         result_count,
     )
+
+
+def _record_backend_search_failure(
+    *,
+    session: Session,
+    user: User,
+    query: str,
+    diagnostics: SearchDiagnosticsRead,
+    structured_args: dict | None = None,
+    app_version: str | None = None,
+    build_number: str | None = None,
+    analytics_environment: str = "unknown",
+) -> None:
+    if not diagnostics.failure_reason:
+        return
+
+    sample = SearchFailureService.record(
+        session=session,
+        user_id=user.id,
+        query=query,
+        source="backend",
+        query_type=diagnostics.query_type,
+        failure_reason=diagnostics.failure_reason,
+        provider_outcome=diagnostics.provider_outcome,
+        normalization_applied=diagnostics.normalization_applied,
+        provider_result_count=diagnostics.provider_result_count,
+        provider_latency_ms=diagnostics.provider_latency_ms,
+        structured_args=structured_args,
+        app_version=app_version,
+        build_number=build_number,
+        analytics_environment=analytics_environment,
+    )
+    diagnostics.failure_sample_id = sample.id
 
 
 @router.get("/live-positions", response_model=list[GlobalFlightPositionRead])
@@ -290,8 +326,11 @@ async def get_flight_copilot_telemetry(
     response_model=QuerySearchResponse,
 )
 async def search_flights_from_text(
-    term: str = Query(..., min_length=3),
+    term: str = Query(..., min_length=2),
     language: str | None = Query(default=None),
+    app_version: str | None = Query(default=None, max_length=40),
+    build_number: str | None = Query(default=None, max_length=40),
+    analytics_environment: str = Query(default="unknown", max_length=20),
     accept_language: str | None = Header(default=None),
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
@@ -340,7 +379,7 @@ async def search_flights_from_text(
                     diagnostics=diagnostics,
                 )
 
-            return QuerySearchResponse(
+            response = QuerySearchResponse(
                 recovery=ai_service.registration_recovery(
                     registration=registration,
                     failure_reason=(
@@ -350,24 +389,47 @@ async def search_flights_from_text(
                 ),
                 diagnostics=diagnostics,
             )
+            _record_backend_search_failure(
+                session=session,
+                user=user,
+                query=normalized_term,
+                diagnostics=diagnostics,
+                app_version=app_version,
+                build_number=build_number,
+                analytics_environment=analytics_environment,
+            )
+            session.commit()
+            return response
 
         preflight_recovery = ai_service.preflight_recovery(
             normalized_term,
             language=language or accept_language,
         )
         if preflight_recovery:
-            return QuerySearchResponse(
-                recovery=preflight_recovery,
-                diagnostics=SearchDiagnosticsRead(
-                    query_type=preflight_recovery.detected_query_type,
-                    failure_reason=ai_service.failure_reason_for_recovery(
-                        preflight_recovery
-                    ),
-                    normalization_applied=normalization_applied,
-                    provider_result_count=0,
-                    provider_outcome="not_called",
+            diagnostics = SearchDiagnosticsRead(
+                query_type=preflight_recovery.detected_query_type,
+                failure_reason=ai_service.failure_reason_for_recovery(
+                    preflight_recovery
                 ),
+                normalization_applied=normalization_applied,
+                provider_result_count=0,
+                provider_outcome="not_called",
             )
+            response = QuerySearchResponse(
+                recovery=preflight_recovery,
+                diagnostics=diagnostics,
+            )
+            _record_backend_search_failure(
+                session=session,
+                user=user,
+                query=normalized_term,
+                diagnostics=diagnostics,
+                app_version=app_version,
+                build_number=build_number,
+                analytics_environment=analytics_environment,
+            )
+            session.commit()
+            return response
 
         resolved_call = await ai_service.get_function_call(
             query=normalized_term,
@@ -380,16 +442,28 @@ async def search_flights_from_text(
                 query=normalized_term,
                 resolved_call=None,
             )
-            return QuerySearchResponse(
-                recovery=recovery,
-                diagnostics=SearchDiagnosticsRead(
-                    query_type=recovery.detected_query_type,
-                    failure_reason=ai_service.failure_reason_for_recovery(recovery),
-                    normalization_applied=normalization_applied,
-                    provider_result_count=0,
-                    provider_outcome="not_called",
-                ),
+            diagnostics = SearchDiagnosticsRead(
+                query_type=recovery.detected_query_type,
+                failure_reason=ai_service.failure_reason_for_recovery(recovery),
+                normalization_applied=normalization_applied,
+                provider_result_count=0,
+                provider_outcome="not_called",
             )
+            response = QuerySearchResponse(
+                recovery=recovery,
+                diagnostics=diagnostics,
+            )
+            _record_backend_search_failure(
+                session=session,
+                user=user,
+                query=normalized_term,
+                diagnostics=diagnostics,
+                app_version=app_version,
+                build_number=build_number,
+                analytics_environment=analytics_environment,
+            )
+            session.commit()
+            return response
 
         query_type = ai_service.query_type_for_call(resolved_call)
         provider_started_at = time.perf_counter()
@@ -409,21 +483,34 @@ async def search_flights_from_text(
                 latency_ms=provider_latency_ms,
                 result_count=0,
             )
-            return QuerySearchResponse(
+            diagnostics = SearchDiagnosticsRead(
+                query_type=query_type,
+                failure_reason=failure_reason,
+                normalization_applied=normalization_applied,
+                provider_result_count=0,
+                provider_outcome=failure_reason,
+                provider_latency_ms=provider_latency_ms,
+            )
+            response = QuerySearchResponse(
                 recovery=SearchRecoveryRead(
                     reason=failure_reason,
                     detected_query_type=query_type,
                     suggestions=[],
                 ),
-                diagnostics=SearchDiagnosticsRead(
-                    query_type=query_type,
-                    failure_reason=failure_reason,
-                    normalization_applied=normalization_applied,
-                    provider_result_count=0,
-                    provider_outcome=failure_reason,
-                    provider_latency_ms=provider_latency_ms,
-                ),
+                diagnostics=diagnostics,
             )
+            _record_backend_search_failure(
+                session=session,
+                user=user,
+                query=normalized_term,
+                diagnostics=diagnostics,
+                structured_args=resolved_call.args,
+                app_version=app_version,
+                build_number=build_number,
+                analytics_environment=analytics_environment,
+            )
+            session.commit()
+            return response
 
         provider_latency_ms = _elapsed_ms(provider_started_at)
         provider_result_count = (
@@ -456,6 +543,18 @@ async def search_flights_from_text(
             provider_latency_ms=provider_latency_ms,
         )
 
+        if provider_result_count == 0:
+            _record_backend_search_failure(
+                session=session,
+                user=user,
+                query=normalized_term,
+                diagnostics=flights.diagnostics,
+                structured_args=resolved_call.args,
+                app_version=app_version,
+                build_number=build_number,
+                analytics_environment=analytics_environment,
+            )
+
         session.commit()
 
         return flights
@@ -466,16 +565,29 @@ async def search_flights_from_text(
                 query=normalized_term,
                 resolved_call=resolved_call,
             )
-            return QuerySearchResponse(
-                recovery=recovery,
-                diagnostics=SearchDiagnosticsRead(
-                    query_type=ai_service.query_type_for_call(resolved_call),
-                    failure_reason=ai_service.failure_reason_for_recovery(recovery),
-                    normalization_applied=normalization_applied,
-                    provider_result_count=0,
-                    provider_outcome="not_found",
-                ),
+            diagnostics = SearchDiagnosticsRead(
+                query_type=ai_service.query_type_for_call(resolved_call),
+                failure_reason=ai_service.failure_reason_for_recovery(recovery),
+                normalization_applied=normalization_applied,
+                provider_result_count=0,
+                provider_outcome="not_found",
             )
+            response = QuerySearchResponse(
+                recovery=recovery,
+                diagnostics=diagnostics,
+            )
+            _record_backend_search_failure(
+                session=session,
+                user=user,
+                query=normalized_term,
+                diagnostics=diagnostics,
+                structured_args=(resolved_call.args if resolved_call else None),
+                app_version=app_version,
+                build_number=build_number,
+                analytics_environment=analytics_environment,
+            )
+            session.commit()
+            return response
         raise
     except Exception:
         session.rollback()
@@ -484,10 +596,203 @@ async def search_flights_from_text(
             ai_service.query_type_for_call(resolved_call),
             user.id,
         )
+        try:
+            diagnostics = SearchDiagnosticsRead(
+                query_type=ai_service.query_type_for_call(resolved_call),
+                failure_reason="internal_error",
+                normalization_applied=normalization_applied,
+                provider_result_count=0,
+                provider_outcome="internal_error",
+            )
+            _record_backend_search_failure(
+                session=session,
+                user=user,
+                query=normalized_term,
+                diagnostics=diagnostics,
+                structured_args=(resolved_call.args if resolved_call else None),
+                app_version=app_version,
+                build_number=build_number,
+                analytics_environment=analytics_environment,
+            )
+            session.commit()
+        except Exception:
+            session.rollback()
+            logger.exception("Unable to persist failed-search diagnostic")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
         )
+
+
+@router.post(
+    "/search/term",
+    summary="Search for flights without placing private query text in access logs",
+    response_model=QuerySearchResponse,
+)
+async def search_flights_from_text_post(
+    payload: SearchQueryRequest,
+    accept_language: str | None = Header(default=None),
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    return await search_flights_from_text(
+        term=payload.term,
+        language=payload.language,
+        app_version=payload.app_version,
+        build_number=payload.build_number,
+        analytics_environment=payload.analytics_environment,
+        accept_language=accept_language,
+        session=session,
+        user=user,
+    )
+
+
+@router.post("/search/failures", response_model=dict)
+def report_app_search_failure(
+    payload: SearchFailureReportRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    try:
+        sample = SearchFailureService.record(
+            session=session,
+            user_id=user.id,
+            query=payload.query,
+            source=payload.source,
+            query_type=payload.query_type,
+            failure_reason=payload.failure_reason,
+            provider_outcome=payload.provider_outcome,
+            normalization_applied=payload.normalization_applied,
+            provider_result_count=payload.provider_result_count,
+            filtered_result_count=payload.filtered_result_count,
+            provider_latency_ms=payload.provider_latency_ms,
+            search_journey_id=payload.search_journey_id,
+            search_attempt_number=payload.search_attempt_number,
+            app_version=payload.app_version,
+            build_number=payload.build_number,
+            analytics_environment=payload.analytics_environment,
+            sample_id=payload.failure_sample_id,
+        )
+        session.commit()
+        return {
+            "detail": "success",
+            "failure_sample_id": sample.id,
+            "retention_days": RETENTION_DAYS,
+        }
+    except Exception:
+        session.rollback()
+        logger.exception(
+            "Unable to persist app failed-search diagnostic user_id=%s",
+            user.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
+
+
+@router.get(
+    "/search/failures/report",
+    dependencies=[Depends(check_lambda_auth_token)],
+)
+def get_search_failure_report(
+    days: int = Query(default=7, ge=1, le=RETENTION_DAYS),
+    limit: int = Query(default=100, ge=1, le=500),
+    include_samples: bool = Query(default=False),
+    analytics_environment: str | None = Query(default=None, max_length=20),
+    session: Session = Depends(get_session),
+):
+    now_ms = int(time.time() * 1_000)
+    SearchFailureService.purge_expired(session, now_ms=now_ms)
+    all_samples = SearchFailureService.recent(
+        session,
+        since_ms=now_ms - days * 24 * 60 * 60 * 1_000,
+        limit=5_000,
+    )
+    session.commit()
+
+    if analytics_environment:
+        all_samples = [
+            sample
+            for sample in all_samples
+            if sample.analytics_environment == analytics_environment
+        ]
+
+    grouped: dict[tuple[str, str, str, str], dict] = {}
+    recurring_queries: dict[str, int] = {}
+    for sample in all_samples:
+        key = (
+            sample.failure_reason,
+            sample.query_type,
+            sample.source,
+            sample.analytics_environment,
+        )
+        group = grouped.setdefault(
+            key,
+            {
+                "failure_reason": sample.failure_reason,
+                "query_type": sample.query_type,
+                "source": sample.source,
+                "analytics_environment": sample.analytics_environment,
+                "count": 0,
+                "provider_result_count": 0,
+                "filtered_result_count": 0,
+            },
+        )
+        group["count"] += 1
+        group["provider_result_count"] += sample.provider_result_count
+        group["filtered_result_count"] += sample.filtered_result_count
+        recurring_queries[sample.query_digest] = (
+            recurring_queries.get(sample.query_digest, 0) + 1
+        )
+
+    recent_samples = []
+    for sample in all_samples[:limit]:
+        item = {
+            "id": sample.id,
+            "created_at_ms": sample.created_at_ms,
+            "expires_at_ms": sample.expires_at_ms,
+            "source": sample.source,
+            "query_type": sample.query_type,
+            "failure_reason": sample.failure_reason,
+            "provider_outcome": sample.provider_outcome,
+            "normalization_applied": sample.normalization_applied,
+            "provider_result_count": sample.provider_result_count,
+            "filtered_result_count": sample.filtered_result_count,
+            "provider_latency_ms": sample.provider_latency_ms,
+            "search_journey_id": sample.search_journey_id,
+            "search_attempt_number": sample.search_attempt_number,
+            "app_version": sample.app_version,
+            "build_number": sample.build_number,
+            "analytics_environment": sample.analytics_environment,
+            "repeat_count": recurring_queries[sample.query_digest],
+            "structured_query": {
+                "airline_iata": sample.airline_iata,
+                "flight_number": sample.flight_number,
+                "departure_airport_iata": sample.departure_airport_iata,
+                "arrival_airport_iata": sample.arrival_airport_iata,
+                "airport_iata": sample.airport_iata,
+                "departure_date": sample.departure_date,
+                "direction": sample.direction,
+            },
+        }
+        if include_samples:
+            item["redacted_query"] = SearchFailureService.decrypt_query(
+                sample.query_ciphertext
+            )
+        recent_samples.append(item)
+
+    return {
+        "retention_days": RETENTION_DAYS,
+        "window_days": days,
+        "analytics_environment": analytics_environment,
+        "sample_count": len(all_samples),
+        "groups": sorted(
+            grouped.values(),
+            key=lambda item: (-item["count"], item["failure_reason"]),
+        ),
+        "recent_samples": recent_samples,
+    }
 
 
 @router.get(
