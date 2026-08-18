@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import unittest
 from datetime import date, datetime, timezone
@@ -60,7 +61,7 @@ from core.routers.apple_ads import (
     backfill_revenue,
     record_attribution,
 )
-from core.services.apple_ads import parse_report_rows
+from core.services.apple_ads import AppleAdsClient, parse_report_rows
 from core.services.apple_ads_reporting import build_measurement_report
 from core.services.exchange_rates import fetch_latest_ecb_rates
 
@@ -133,6 +134,43 @@ class AppleAdsMeasurementTests(unittest.TestCase):
         self.assertEqual(rows[0].spend_microunits, 12_345_678)
         self.assertEqual(rows[0].keyword_id, 40)
         self.assertEqual(rows[0].tap_installs, 7)
+
+    def test_reporting_requests_include_required_dimension_ordering(self):
+        requests = []
+
+        async def handler(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={"data": {"reportingDataResponse": {"row": []}}},
+                request=request,
+            )
+
+        async def fetch():
+            transport = httpx.MockTransport(handler)
+            async with httpx.AsyncClient(transport=transport) as http_client:
+                client = AppleAdsClient(http_client)
+                client._api_headers = AsyncMock(
+                    return_value={"Authorization": "Bearer test"}
+                )
+                for dimension_level in ("ad_group", "keyword"):
+                    await client._report_pages(
+                        campaign_id=20,
+                        dimension_level=dimension_level,
+                        start_date=date(2026, 8, 1),
+                        end_date=date(2026, 8, 2),
+                    )
+
+        asyncio.run(fetch())
+
+        self.assertEqual(
+            requests[0]["selector"]["orderBy"],
+            [{"field": "adGroupId", "sortOrder": "ASCENDING"}],
+        )
+        self.assertEqual(
+            requests[1]["selector"]["orderBy"],
+            [{"field": "keywordId", "sortOrder": "ASCENDING"}],
+        )
 
     def test_adservices_result_is_idempotent_and_token_is_not_persisted(self):
         request = AttributionRequest(

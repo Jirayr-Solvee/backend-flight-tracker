@@ -303,6 +303,9 @@ class AppleAdsClient:
         end_date: date,
     ) -> list[AppleAdsSpendDaily]:
         endpoint = "adgroups" if dimension_level == "ad_group" else "keywords"
+        order_by_field = (
+            "adGroupId" if dimension_level == "ad_group" else "keywordId"
+        )
         headers = await self._api_headers()
         rows: list[AppleAdsSpendDaily] = []
         offset = 0
@@ -318,6 +321,12 @@ class AppleAdsClient:
                 "returnRowTotals": False,
                 "returnGrandTotals": False,
                 "selector": {
+                    "orderBy": [
+                        {
+                            "field": order_by_field,
+                            "sortOrder": "ASCENDING",
+                        }
+                    ],
                     "pagination": {"offset": offset, "limit": limit},
                 },
             }
