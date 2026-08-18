@@ -1,6 +1,7 @@
 from sqlmodel import Session, SQLModel, create_engine
 
 from .device import Device
+from .experiment import ExperimentConversion, ExperimentExposure
 from .flight import Airline, Airport, Arrival, Departure, Flight
 from .live_activity import LiveActivityRegistration
 from .subscription import Subscription
