@@ -1,5 +1,6 @@
 from sqlmodel import Session, SQLModel, create_engine
 
+from .apple_ads import AppleAdsAttribution, AppleAdsSpendDaily, AppStoreRevenueEvent
 from .device import Device
 from .experiment import ExperimentConversion, ExperimentExposure
 from .flight import Airline, Airport, Arrival, Departure, Flight

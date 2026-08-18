@@ -67,5 +67,15 @@ class Settings(BaseSettings):
 
     AIRLINE_MAP_JSON: str
 
+    # Apple Ads measurement. The OAuth fields are optional so attribution and
+    # App Store revenue collection can ship before API-read credentials exist.
+    APPLE_ADS_CLIENT_ID: str | None = None
+    APPLE_ADS_TEAM_ID: str | None = None
+    APPLE_ADS_KEY_ID: str | None = None
+    APPLE_ADS_PRIVATE_KEY_PATH: str | None = None
+    APPLE_ADS_ORG_ID: int | None = None
+    APPLE_ADS_API_BASE_URL: str = "https://api.searchads.apple.com/api/v5"
+    APPLE_ADS_ATTRIBUTION_URL: str = "https://api-adservices.apple.com/api/v1/"
+
 
 settings = Settings()  # type: ignore

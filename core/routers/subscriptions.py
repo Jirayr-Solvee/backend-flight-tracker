@@ -14,6 +14,7 @@ from ..models.subscription import Subscription
 from ..models.transaction import Transaction
 from ..models.user import User
 from ..services.app_store.service import AppStoreService
+from ..services.revenue_measurement import upsert_verified_revenue_event
 from ..utils import calculate_premium_valid_until
 
 logger = logging.getLogger(__name__)
@@ -333,6 +334,11 @@ def create_or_update_transaction(
         db_transaction.is_upgraded = decoded_jws.isUpgraded
         db_transaction.environment = decoded_jws.environment
         db_transaction.revoked_date = decoded_jws.revocationDate
+        db_transaction.app_account_token = (
+            str(decoded_jws.appAccountToken)
+            if getattr(decoded_jws, "appAccountToken", None)
+            else user.id
+        )
 
         # now we need to link it to the actual user it self
         if db_subscription not in user.subscriptions:
@@ -344,6 +350,12 @@ def create_or_update_transaction(
 
         session.add(db_transaction)
         session.flush()
+
+        upsert_verified_revenue_event(
+            session=session,
+            decoded_jws=decoded_jws,
+            user_id=user.id,
+        )
 
         if data.experiment:
             _upsert_experiment_exposure(

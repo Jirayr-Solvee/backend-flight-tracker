@@ -11,11 +11,13 @@ from ..models.flight import Departure, Flight
 from ..models.notification import NotificationBatch
 from ..models.subscription import Subscription
 from ..models.transaction import Transaction
+from ..models.user import User
 from ..services.apn.service import ApnService
 from ..services.apn.live_activity import LiveActivityService
 from ..services.apn.utils import (extract_all_notifications_for_flight,
                                   increase_notifications_of_users)
 from ..services.app_store.service import AppStoreService
+from ..services.revenue_measurement import upsert_verified_revenue_event
 from ..utils import calculate_premium_valid_until
 
 router = APIRouter()
@@ -232,6 +234,26 @@ def create_or_update_transaction(
         db_transaction.is_upgraded = decoded_jws.isUpgraded
         db_transaction.environment = decoded_jws.environment
         db_transaction.revoked_date = decoded_jws.revocationDate
+        db_transaction.app_account_token = str(decoded_jws.appAccountToken)
+
+        transaction_user = session.get(User, str(decoded_jws.appAccountToken))
+        if transaction_user and db_subscription not in transaction_user.subscriptions:
+            transaction_user.subscriptions.append(db_subscription)
+
+        measurement_user_id = (
+            transaction_user.id
+            if transaction_user
+            else (
+                db_subscription.users[0].id
+                if db_subscription.users
+                else str(decoded_jws.appAccountToken)
+            )
+        )
+        upsert_verified_revenue_event(
+            session=session,
+            decoded_jws=decoded_jws,
+            user_id=measurement_user_id,
+        )
 
         premium_until = calculate_premium_valid_until(decoded_jws.expiresDate)
 
