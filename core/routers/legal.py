@@ -88,6 +88,74 @@ PRIVACY_POLICY_HTML = """<!doctype html>
 """
 
 
+SUPPORT_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sofly Support</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.6;
+      margin: 0;
+      color: #13202f;
+      background: #f7fbff;
+    }
+    main {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 48px 20px 64px;
+      background: #ffffff;
+    }
+    h1, h2 {
+      line-height: 1.25;
+      color: #0b1726;
+    }
+    h1 {
+      margin-top: 0;
+    }
+    a {
+      color: #0a67c8;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Sofly Support</h1>
+    <p>
+      Need help with Sofly: Flight Tracker &amp; Radar? Contact us at
+      <a href="mailto:track@sofly.to">track@sofly.to</a>. Please include your
+      flight number and departure date when asking about a flight search or
+      tracking issue.
+    </p>
+
+    <h2>Flight search and tracking</h2>
+    <p>
+      Search using an airline flight number and departure date, or enter the
+      departure and arrival airports. Gate, terminal, baggage, status, and delay
+      details appear when they are available from the flight-data provider.
+    </p>
+
+    <h2>Subscriptions</h2>
+    <p>
+      You can manage or cancel your subscription in iOS Settings under your
+      Apple Account and Subscriptions. Use Restore Purchases in Sofly if an
+      active subscription is not recognized.
+    </p>
+
+    <h2>Privacy</h2>
+    <p>
+      Read the <a href="/privacy.html">Sofly Privacy Policy</a> or contact us at
+      <a href="mailto:info@sofly.to">info@sofly.to</a> for privacy questions and
+      account-deletion requests.
+    </p>
+  </main>
+</body>
+</html>
+"""
+
+
 @router.api_route("/privacy.html", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def privacy_html() -> str:
     return PRIVACY_POLICY_HTML
@@ -96,3 +164,15 @@ def privacy_html() -> str:
 @router.api_route("/privacy", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def privacy() -> str:
     return PRIVACY_POLICY_HTML
+
+
+@router.api_route("/support", methods=["GET", "HEAD"], response_class=HTMLResponse)
+def support() -> str:
+    return SUPPORT_HTML
+
+
+@router.api_route(
+    "/support.html", methods=["GET", "HEAD"], response_class=HTMLResponse
+)
+def support_html() -> str:
+    return SUPPORT_HTML
