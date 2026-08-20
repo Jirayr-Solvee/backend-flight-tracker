@@ -51,7 +51,9 @@ from core.models.flight import (
     DepartureRead,
     FlightRead,
     GlobalFlightPositionRead,
+    QuerySearchResponse,
 )
+from core.routers.flights import _execute_search_with_date_fallback
 from core.services.flight.api_client import (
     ADSBExchangeRateLimitedError,
     AerodataboxClient,
@@ -104,6 +106,131 @@ class SearchRecoveryTests(unittest.TestCase):
         self.assertIsNotNone(recovery)
         self.assertEqual(recovery.reason, "nearby_commercial_airport")
         self.assertEqual(recovery.suggestions[0].label, "CRP departures")
+
+    def test_numeric_only_queries_require_an_airline(self):
+        for query in ("23", "4320", "4320 Jetzt"):
+            with self.subTest(query=query):
+                recovery = GeminiService.preflight_recovery(query)
+                self.assertIsNotNone(recovery)
+                self.assertEqual(recovery.reason, "missing_airline")
+                self.assertEqual(
+                    GeminiService.failure_reason_for_recovery(recovery),
+                    "incomplete_query",
+                )
+
+        self.assertIsNone(GeminiService._iata_for_airline_token("43"))
+        self.assertEqual(GeminiService._iata_for_airline_token("LX"), "LX")
+
+    def test_observed_localized_single_cities_resolve_without_ai(self):
+        service = GeminiService()
+        expected = {
+            "Libonne": "LIS",
+            "Lisbonne": "LIS",
+            "Lisbone": "LIS",
+            "Abu Dhabi": "AUH",
+            "Kuwait": "KWI",
+        }
+        for query, airport_iata in expected.items():
+            with self.subTest(query=query):
+                resolved = service._deterministic_function_call(query)
+                self.assertIsNotNone(resolved)
+                self.assertEqual(
+                    resolved.function_name,
+                    "extract_flight_info_via_airport_single_derection",
+                )
+                self.assertEqual(resolved.args["airport_iata"], airport_iata)
+
+    def test_observed_city_routes_resolve_without_ai(self):
+        service = GeminiService()
+        expected = {
+            "Von Bukarest nach Memmingen": ("OTP", "FMM"),
+            "Lyon Dubrovnik": ("LYS", "DBV"),
+            "Marbella Oran Aujourdhui": ("AGP", "ORN"),
+        }
+        for query, route in expected.items():
+            with self.subTest(query=query):
+                resolved = service._deterministic_function_call(query)
+                self.assertIsNotNone(resolved)
+                self.assertEqual(
+                    (
+                        resolved.args["departure_airport_iata"],
+                        resolved.args["arrival_airport_iata"],
+                    ),
+                    route,
+                )
+
+    def test_observed_broad_locations_return_airport_choices(self):
+        georgia = GeminiService.preflight_recovery("جورجيا")
+        indonesia = GeminiService.preflight_recovery("Indonesia to Riyadh")
+        switzerland = GeminiService.preflight_recovery(
+            "من سويسرا الى جورجيا"
+        )
+
+        self.assertEqual(georgia.reason, "choose_airport")
+        self.assertEqual(georgia.suggestions[0].query, "Departures from TBS Today")
+        self.assertEqual(indonesia.reason, "choose_airport_route")
+        self.assertEqual(indonesia.suggestions[0].query, "CGK to RUH Today")
+        self.assertEqual(switzerland.reason, "choose_airport_route")
+        self.assertEqual(switzerland.suggestions[0].query, "ZRH to TBS Today")
+
+    def test_aircraft_type_is_not_misclassified_as_a_flight(self):
+        recovery = GeminiService.preflight_recovery("FA7X")
+
+        self.assertEqual(recovery.reason, "unsupported_aircraft_type")
+        self.assertEqual(recovery.detected_query_type, "aircraft_type")
+
+    def test_unparsed_query_is_not_labelled_as_provider_no_match(self):
+        recovery = GeminiService.recovery_for_empty_result("Rev", None)
+
+        self.assertEqual(recovery.reason, "no_results")
+        self.assertEqual(
+            GeminiService.failure_reason_for_recovery(recovery),
+            "unsupported_or_incomplete_query",
+        )
+
+    def test_empty_route_after_provider_call_is_still_provider_no_match(self):
+        resolved = ResolvedFunctionCall(
+            function_name="extract_flight_info_via_airport",
+            args={
+                "departure_airport_iata": "OTP",
+                "arrival_airport_iata": "FMM",
+                "departure_date": "2026-08-20",
+            },
+            handler=lambda **_: None,
+        )
+
+        recovery = GeminiService.recovery_for_empty_result(
+            "OTP to FMM Today",
+            resolved,
+        )
+
+        self.assertEqual(recovery.reason, "route_not_found")
+        self.assertEqual(
+            GeminiService.failure_reason_for_recovery(recovery),
+            "provider_no_match",
+        )
+
+    def test_observed_spanish_date_with_de_is_parsed(self):
+        self.assertEqual(
+            GeminiService._date_from_query("KR0152 18 De Agosto"),
+            f"{datetime.now(timezone.utc).year}-08-18",
+        )
+
+    def test_upcoming_date_window_is_bounded_by_query_precision(self):
+        self.assertEqual(GeminiService.upcoming_search_days("LX546"), 3)
+        self.assertEqual(GeminiService.upcoming_search_days("LX546 Jetzt"), 1)
+        self.assertEqual(
+            GeminiService.upcoming_search_days("LX546 20 August 2026"),
+            0,
+        )
+
+    def test_embedded_airport_codes_are_offered_as_route_recovery(self):
+        service = GeminiService()
+        resolved = service._deterministic_function_call("J9 530 ktmkwi")
+
+        recovery = service.recovery_for_empty_result("J9 530 ktmkwi", resolved)
+
+        self.assertEqual(recovery.suggestions[-1].query, "KTM to KWI Today")
 
     def test_pasted_itinerary_extracts_hyphenated_flight_number(self):
         self.assertEqual(
@@ -514,6 +641,87 @@ class ProviderAndRankingTests(unittest.IsolatedAsyncioTestCase):
             await client.client.aclose()
 
         self.assertTrue(context.exception.rate_limited)
+
+    async def test_missing_date_searches_upcoming_days_until_a_result(self):
+        requested_dates = []
+
+        async def handler(*, departure_date: str, session, **kwargs):
+            requested_dates.append(departure_date)
+            if departure_date != "2026-08-22":
+                return QuerySearchResponse()
+            return QuerySearchResponse(
+                flights_result=[
+                    self._flight(
+                        identifier=9,
+                        number="LX546",
+                        status=FlightStatusEnum.EXPECTED,
+                        departure_time="2026-08-22 12:00Z",
+                    )
+                ]
+            )
+
+        resolved = ResolvedFunctionCall(
+            function_name="extract_flight_info",
+            args={
+                "airline_iata": "LX",
+                "flight_number": "546",
+                "departure_date": "2026-08-20",
+            },
+            handler=handler,
+        )
+
+        response = await _execute_search_with_date_fallback(
+            resolved_call=resolved,
+            query="LX546",
+            session=MagicMock(),
+        )
+
+        self.assertEqual(
+            requested_dates,
+            ["2026-08-20", "2026-08-21", "2026-08-22"],
+        )
+        self.assertEqual(response.flights_result[0].number, "LX546")
+        self.assertEqual(resolved.args["departure_date"], "2026-08-22")
+
+    async def test_date_ambiguous_search_skips_landed_day_for_upcoming_flight(self):
+        requested_dates = []
+
+        async def handler(*, departure_date: str, session, **kwargs):
+            requested_dates.append(departure_date)
+            status = (
+                FlightStatusEnum.ARRIVED
+                if departure_date == "2026-08-20"
+                else FlightStatusEnum.EXPECTED
+            )
+            return QuerySearchResponse(
+                flights_result=[
+                    self._flight(
+                        identifier=len(requested_dates),
+                        number="LX546",
+                        status=status,
+                        departure_time=f"{departure_date} 12:00Z",
+                    )
+                ]
+            )
+
+        resolved = ResolvedFunctionCall(
+            function_name="extract_flight_info",
+            args={
+                "airline_iata": "LX",
+                "flight_number": "546",
+                "departure_date": "2026-08-20",
+            },
+            handler=handler,
+        )
+
+        response = await _execute_search_with_date_fallback(
+            resolved_call=resolved,
+            query="LX546",
+            session=MagicMock(),
+        )
+
+        self.assertEqual(requested_dates, ["2026-08-20", "2026-08-21"])
+        self.assertEqual(response.flights_result[0].status, FlightStatusEnum.EXPECTED)
 
 
 if __name__ == "__main__":

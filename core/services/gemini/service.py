@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import json
 import logging
 import re
@@ -30,6 +31,7 @@ class ResolvedFunctionCall(FunctionCallResult):
 
 class GeminiService:
     _iata_by_icao_cache: dict[str, str] | None = None
+    _known_iata_airlines_cache: set[str] | None = None
 
     _flight_code_corrections = {
         # Confusions observed in real Sofly searches. Suggestions are shown to
@@ -42,6 +44,10 @@ class GeminiService:
         "mexico": ("MEX", "CUN", "GDL"),
         "turkey": ("IST", "SAW", "AYT"),
         "germany": ("FRA", "MUC", "BER", "DUS"),
+        "georgia": ("TBS", "BUS", "KUT"),
+        "indonesia": ("CGK", "DPS", "SUB"),
+        "saudi_arabia": ("RUH", "JED", "DMM"),
+        "switzerland": ("ZRH", "GVA", "BSL"),
     }
 
     _country_aliases = {
@@ -56,16 +62,53 @@ class GeminiService:
             "germany", "deutschland", "alemania", "allemagne", "germania",
             "alemanha", "ألمانيا", "المانيا",
         },
+        "georgia": {
+            "georgia", "géorgie", "georgien", "georgia country",
+            "جورجيا", "საქართველო",
+        },
+        "indonesia": {
+            "indonesia", "indonésie", "indonesie", "indonesien",
+            "indonésia", "إندونيسيا", "اندونيسيا",
+        },
+        "saudi_arabia": {
+            "saudi arabia", "saudi", "arabie saoudite", "saudi-arabien",
+            "arabia saudita", "arábia saudita", "السعودية",
+            "المملكة العربية السعودية",
+        },
+        "switzerland": {
+            "switzerland", "suisse", "schweiz", "svizzera", "suiza",
+            "suíça", "سويسرا",
+        },
+    }
+
+    _today_words = {
+        "today", "now", "hoy", "ahora", "aujourd'hui", "aujourd’hui",
+        "aujourdhui",
+        "maintenant", "heute", "jetzt", "oggi", "adesso", "ora", "hoje",
+        "agora", "bugün", "şimdi", "اليوم", "الآن", "الان",
+    }
+    _tomorrow_words = {
+        "tomorrow", "mañana", "demain", "morgen", "domani", "amanhã",
+        "yarın", "غد", "غدًا",
+    }
+    _yesterday_words = {
+        "yesterday", "ayer", "hier", "gestern", "ieri", "ontem", "dün",
+        "أمس",
+    }
+
+    _aircraft_type_aliases = {
+        "fa7x", "falcon 7x", "dassault falcon 7x",
     }
 
     _explicit_date_words = {
-        "today", "tomorrow", "yesterday",
+        "today", "now", "tomorrow", "yesterday",
         "hoy", "mañana", "ayer",
-        "aujourd'hui", "demain", "hier",
-        "heute", "morgen", "gestern",
-        "oggi", "domani", "ieri",
-        "hoje", "amanhã", "ontem",
-        "اليوم", "غد", "غدًا", "أمس",
+        "ahora", "aujourd'hui", "aujourd’hui", "aujourdhui", "maintenant", "demain", "hier",
+        "heute", "jetzt", "morgen", "gestern",
+        "oggi", "adesso", "ora", "domani", "ieri",
+        "hoje", "agora", "amanhã", "ontem",
+        "bugün", "şimdi", "yarın", "dün",
+        "اليوم", "الآن", "الان", "غد", "غدًا", "أمس",
         "january", "jan", "enero", "ene", "janvier", "janv", "januar",
         "gennaio", "janeiro", "يناير",
         "february", "feb", "febrero", "février", "févr", "fevrier", "fevr",
@@ -233,6 +276,36 @@ class GeminiService:
         language: str | None = None,
     ) -> SearchRecoveryRead | None:
         normalized = cls.normalize_query(query)
+
+        if cls.aircraft_type_from_query(normalized):
+            return SearchRecoveryRead(
+                reason="unsupported_aircraft_type",
+                detected_query_type="aircraft_type",
+                normalized_query=normalized.upper(),
+                suggestions=[
+                    SearchSuggestionRead(
+                        label="Search by flight number",
+                        query="",
+                        kind="search_help",
+                    ),
+                ],
+            )
+
+        number_without_airline = cls.flight_number_without_airline(normalized)
+        if number_without_airline:
+            return SearchRecoveryRead(
+                reason="missing_airline",
+                detected_query_type="flight_number",
+                normalized_query=number_without_airline,
+                suggestions=[
+                    SearchSuggestionRead(
+                        label="Search by flight number",
+                        query="",
+                        kind="search_help",
+                    ),
+                ],
+            )
+
         registration = cls.aircraft_registration_from_query(normalized)
 
         if registration:
@@ -259,6 +332,25 @@ class GeminiService:
                 normalized_query=normalized,
                 suggestions=suggestions,
             )
+
+        if len(countries) == 1:
+            country_airport_route = cls._country_and_airport_route(
+                normalized,
+                countries[0],
+            )
+            if country_airport_route:
+                country, airport_iata, country_first = country_airport_route
+                suggestions = cls._country_airport_route_suggestions(
+                    country,
+                    airport_iata,
+                    country_first=country_first,
+                )
+                return SearchRecoveryRead(
+                    reason="choose_airport_route",
+                    detected_query_type="country_route",
+                    normalized_query=normalized,
+                    suggestions=suggestions,
+                )
 
         if len(countries) == 1 and cls._is_broad_location_query(normalized, countries[0]):
             country = countries[0]
@@ -297,6 +389,23 @@ class GeminiService:
             )
 
         return None
+
+    @classmethod
+    def aircraft_type_from_query(cls, query: str) -> str | None:
+        normalized = cls._fold_text(cls.normalize_query(query)).strip()
+        return normalized if normalized in cls._aircraft_type_aliases else None
+
+    @classmethod
+    def flight_number_without_airline(cls, query: str) -> str | None:
+        normalized = cls.normalize_query(query)
+        match = re.fullmatch(r"(?P<number>[0-9]{1,4})(?:\s+(?P<rest>.+))?", normalized)
+        if not match:
+            return None
+
+        rest = (match.group("rest") or "").strip()
+        if rest and not cls.query_has_explicit_date(rest):
+            return None
+        return match.group("number")
 
     @classmethod
     def aircraft_registration_from_query(cls, query: str) -> str | None:
@@ -376,18 +485,22 @@ class GeminiService:
                     ],
                 )
 
+            route_suggestion = cls._embedded_airport_route_suggestion(normalized)
             if not cls.query_has_explicit_date(normalized):
+                suggestions = [
+                    SearchSuggestionRead(
+                        label="Add a date",
+                        query="",
+                        kind="add_date",
+                    )
+                ]
+                if route_suggestion:
+                    suggestions.append(route_suggestion)
                 return SearchRecoveryRead(
                     reason="missing_date",
                     detected_query_type="flight_number",
                     normalized_query=f"{airline}{number}",
-                    suggestions=[
-                        SearchSuggestionRead(
-                            label="Add a date",
-                            query="",
-                            kind="add_date",
-                        )
-                    ],
+                    suggestions=suggestions,
                 )
 
             canonical_query = f"{airline}{number}" if airline and number else normalized
@@ -395,10 +508,7 @@ class GeminiService:
                 reason="flight_not_found",
                 detected_query_type="flight_number",
                 normalized_query=canonical_query,
-                # Do not offer another search unless it is a confirmed
-                # correction. An unverified date/code chip creates a dead end
-                # when the provider has no matching upcoming service.
-                suggestions=[],
+                suggestions=[route_suggestion] if route_suggestion else [],
             )
 
         if re.fullmatch(
@@ -412,12 +522,46 @@ class GeminiService:
                 suggestions=[],
             )
 
+        if resolved_call:
+            reason_by_function = {
+                "extract_flight_info_via_airport": "route_not_found",
+                "extract_flight_info_via_airport_single_derection": "airport_no_flights",
+                "extract_airline_live_flights": "airline_no_flights",
+                "extract_random_flight": "random_flight_unavailable",
+            }
+            return SearchRecoveryRead(
+                reason=reason_by_function.get(
+                    resolved_call.function_name,
+                    "provider_no_match",
+                ),
+                detected_query_type=cls.query_type_for_call(resolved_call),
+                normalized_query=normalized,
+                suggestions=[],
+            )
+
         return SearchRecoveryRead(
             reason="no_results",
             detected_query_type="natural_language",
             normalized_query=normalized,
             suggestions=[],
         )
+
+    @classmethod
+    def _embedded_airport_route_suggestion(
+        cls,
+        query: str,
+    ) -> SearchSuggestionRead | None:
+        known_airports = set(cls._airport_aliases().values())
+        for compact_pair in re.findall(r"(?<![A-Z])([A-Z]{6})(?![A-Z])", query.upper()):
+            departure, arrival = compact_pair[:3], compact_pair[3:]
+            if departure not in known_airports or arrival not in known_airports:
+                continue
+            return SearchSuggestionRead(
+                label=f"{departure} → {arrival}",
+                query=f"{departure} to {arrival} Today",
+                kind="airport_route",
+            )
+        return None
 
     @classmethod
     def query_has_explicit_date(cls, query: str) -> bool:
@@ -432,6 +576,30 @@ class GeminiService:
                 r"\d{1,2}[\s./-]+\d{1,2}(?:[\s,./-]+(?:19|20)?\d{2})?)(?!\d)",
                 normalized,
             )
+        )
+
+    @classmethod
+    def upcoming_search_days(cls, query: str) -> int:
+        """Return a small bounded fallback window for date-ambiguous searches."""
+        normalized = cls.normalize_query(query).casefold()
+        if cls._contains_date_word(normalized, cls._yesterday_words):
+            return 0
+        if cls._contains_date_word(
+            normalized,
+            cls._today_words | cls._tomorrow_words,
+        ):
+            # This one-day fallback bridges users whose local calendar date is
+            # already ahead of UTC without guessing their timezone.
+            return 1
+        if cls.query_has_explicit_date(normalized):
+            return 0
+        return 3
+
+    @staticmethod
+    def _contains_date_word(query: str, words: set[str]) -> bool:
+        return any(
+            re.search(rf"(?<!\w){re.escape(word)}(?!\w)", query)
+            for word in words
         )
 
     @staticmethod
@@ -452,14 +620,25 @@ class GeminiService:
             "possible_flight_number_typo": "unrecognized_flight_number",
             "unrecognized_flight_number": "unrecognized_flight_number",
             "missing_date": "missing_date",
+            "missing_airline": "incomplete_query",
             "choose_airport_route": "ambiguous_location",
             "choose_airport": "ambiguous_location",
             "nearby_commercial_airport": "unsupported_location",
+            "unsupported_aircraft_type": "unsupported_aircraft_type",
+            "no_results": "unsupported_or_incomplete_query",
+            "flight_not_found": "provider_no_match",
+            "route_not_found": "provider_no_match",
+            "airport_no_flights": "provider_no_match",
+            "airline_no_flights": "provider_no_match",
+            "random_flight_unavailable": "provider_no_match",
+            "provider_no_match": "provider_no_match",
+            "provider_unavailable": "provider_unavailable",
+            "provider_rate_limited": "provider_rate_limited",
             "aircraft_registration_not_live": "registration_not_live",
             "aircraft_registration_live_unresolved": "registration_live_unresolved",
             "aircraft_registration_provider_unavailable": "provider_unavailable",
             "aircraft_registration_provider_rate_limited": "provider_rate_limited",
-        }.get(recovery.reason, "provider_no_match")
+        }.get(recovery.reason, "unsupported_or_incomplete_query")
 
     @classmethod
     def _countries_in_query(cls, query: str) -> list[str]:
@@ -493,6 +672,54 @@ class GeminiService:
             )
             for departure, arrival in pairs
         ]
+
+    @classmethod
+    def _country_and_airport_route(
+        cls,
+        query: str,
+        country: str,
+    ) -> tuple[str, str, bool] | None:
+        normalized = cls._normalized_route_text(query.casefold())
+        country_aliases = cls._country_aliases[country]
+        country_positions = [
+            normalized.find(cls._fold_text(alias))
+            for alias in country_aliases
+            if normalized.find(cls._fold_text(alias)) >= 0
+        ]
+        if not country_positions:
+            return None
+        country_index = min(country_positions)
+
+        for airport_alias, airport_iata in cls._airport_aliases_by_length():
+            airport_index = normalized.find(cls._fold_text(airport_alias))
+            if airport_index < 0:
+                continue
+            return country, airport_iata, country_index < airport_index
+        return None
+
+    @classmethod
+    def _country_airport_route_suggestions(
+        cls,
+        country: str,
+        airport_iata: str,
+        *,
+        country_first: bool,
+    ) -> list[SearchSuggestionRead]:
+        suggestions: list[SearchSuggestionRead] = []
+        for country_airport in cls._country_airports[country][:3]:
+            departure, arrival = (
+                (country_airport, airport_iata)
+                if country_first
+                else (airport_iata, country_airport)
+            )
+            suggestions.append(
+                SearchSuggestionRead(
+                    label=f"{departure} → {arrival}",
+                    query=f"{departure} to {arrival} Today",
+                    kind="airport_route",
+                )
+            )
+        return suggestions
 
     @classmethod
     def _is_broad_location_query(cls, query: str, country: str) -> bool:
@@ -636,8 +863,8 @@ class GeminiService:
         }
         return any(token in lowered_query for token in random_tokens)
 
-    @staticmethod
-    def _date_from_query(lowered_query: str) -> str:
+    @classmethod
+    def _date_from_query(cls, lowered_query: str) -> str:
         lowered_query = lowered_query.casefold()
         today = datetime.now(timezone.utc).date()
         month_aliases = {
@@ -707,7 +934,7 @@ class GeminiService:
             rf"(?<!\w)(?P<month>{month_pattern})\s+"
             r"(?P<day>\d{1,2})(?:st|nd|rd|th)?"
             r"(?:,?\s+(?P<year>\d{4}|\d{2}))?(?!\w)",
-            r"(?<!\w)(?P<day>\d{1,2})(?:st|nd|rd|th)?\s+"
+            r"(?<!\w)(?P<day>\d{1,2})(?:st|nd|rd|th)?\s+(?:de\s+)?"
             rf"(?P<month>{month_pattern})"
             r"(?:\s+(?P<year>\d{4}|\d{2}))?(?!\w)",
         )
@@ -758,33 +985,14 @@ class GeminiService:
             except ValueError:
                 pass
 
-        tomorrow_tokens = {
-            "tomorrow",
-            "mañana",
-            "demain",
-            "morgen",
-            "domani",
-            "amanhã",
-            "yarın",
-            "غد",
-            "غدًا",
-        }
-        yesterday_tokens = {
-            "yesterday",
-            "ayer",
-            "hier",
-            "gestern",
-            "ieri",
-            "ontem",
-            "dün",
-            "أمس",
-        }
-
-        if any(token in lowered_query for token in tomorrow_tokens):
+        if cls._contains_date_word(lowered_query, cls._tomorrow_words):
             return (today + timedelta(days=1)).isoformat()
 
-        if any(token in lowered_query for token in yesterday_tokens):
+        if cls._contains_date_word(lowered_query, cls._yesterday_words):
             return (today - timedelta(days=1)).isoformat()
+
+        if cls._contains_date_word(lowered_query, cls._today_words):
+            return today.isoformat()
 
         return today.isoformat()
 
@@ -852,7 +1060,46 @@ class GeminiService:
 
             return airport_iata, cls._single_airport_direction(normalized)
 
+        candidate = cls._single_location_candidate(normalized)
+        if len(candidate) >= 5:
+            aliases = [
+                alias
+                for alias, _ in cls._airport_aliases_by_length()
+                if len(alias) >= 5 and not re.fullmatch(r"[a-z]{3}", alias)
+            ]
+            close_matches = difflib.get_close_matches(
+                candidate,
+                aliases,
+                n=1,
+                cutoff=0.84,
+            )
+            if close_matches:
+                return (
+                    cls._airport_aliases()[close_matches[0]],
+                    cls._single_airport_direction(normalized),
+                )
+
         return None
+
+    @classmethod
+    def _single_location_candidate(cls, normalized_query: str) -> str:
+        candidate = normalized_query.strip()
+        removable_words = (
+            cls._today_words
+            | cls._tomorrow_words
+            | cls._yesterday_words
+            | {
+                "to", "from", "in", "into", "flights", "flight",
+                "departures", "departure", "arrivals", "arrival",
+            }
+        )
+        for word in sorted(removable_words, key=len, reverse=True):
+            candidate = re.sub(
+                rf"(?<!\w){re.escape(cls._fold_text(word))}(?!\w)",
+                " ",
+                candidate,
+            )
+        return re.sub(r"\s+", " ", candidate).strip()
 
     @staticmethod
     def _single_airport_direction(normalized_query: str) -> str:
@@ -877,14 +1124,23 @@ class GeminiService:
 
         return cls._iata_for_airline_token(normalized.upper())
 
-    @staticmethod
-    def _normalized_route_text(value: str) -> str:
+    @classmethod
+    def _normalized_route_text(cls, value: str) -> str:
         normalized = re.sub(
             r"\s+",
             " ",
-            value.replace("→", " to ").replace("-", " to "),
+            cls._fold_text(value).replace("→", " to ").replace("-", " to "),
         ).strip()
         return f" {normalized} "
+
+    @staticmethod
+    def _fold_text(value: str) -> str:
+        decomposed = unicodedata.normalize("NFKD", value.casefold())
+        return "".join(
+            character
+            for character in decomposed
+            if not unicodedata.combining(character)
+        )
 
     @staticmethod
     def _ordered_route_match(
@@ -901,7 +1157,7 @@ class GeminiService:
             departure_index + len(departure_name):arrival_index
         ]
         route_words = (" to ", " from ", " a ", " à ", " para ", " nach ", " vers ")
-        return any(word in between for word in route_words)
+        return not between.strip() or any(word in between for word in route_words)
 
     @staticmethod
     def _airport_aliases() -> dict[str, str]:
@@ -945,6 +1201,43 @@ class GeminiService:
             "nanded": "NDC",
             "nandad": "NDC",
             "ndc": "NDC",
+            "lisbon": "LIS",
+            "lisbonne": "LIS",
+            "lisboa": "LIS",
+            "lisbona": "LIS",
+            "libonne": "LIS",
+            "lis": "LIS",
+            "abu dhabi": "AUH",
+            "abou dabi": "AUH",
+            "auh": "AUH",
+            "kuwait city": "KWI",
+            "kuwait": "KWI",
+            "koweit": "KWI",
+            "kwi": "KWI",
+            "riyadh": "RUH",
+            "riyad": "RUH",
+            "الرياض": "RUH",
+            "ruh": "RUH",
+            "bucharest": "OTP",
+            "bukarest": "OTP",
+            "bucarest": "OTP",
+            "bucuresti": "OTP",
+            "bucurești": "OTP",
+            "otp": "OTP",
+            "memmingen": "FMM",
+            "fmm": "FMM",
+            "lyon": "LYS",
+            "lys": "LYS",
+            "dubrovnik": "DBV",
+            "dbv": "DBV",
+            "marbella": "AGP",
+            "malaga": "AGP",
+            "málaga": "AGP",
+            "agp": "AGP",
+            "oran": "ORN",
+            "orn": "ORN",
+            "kathmandu": "KTM",
+            "ktm": "KTM",
         }
 
     @classmethod
@@ -1010,13 +1303,27 @@ class GeminiService:
     @classmethod
     def _iata_for_airline_token(cls, token: str) -> str | None:
         normalized = token.strip().upper()
-        if re.fullmatch(r"[A-Z0-9]{2}", normalized):
+        if (
+            re.fullmatch(r"[A-Z0-9]{2}", normalized)
+            and normalized in cls._known_iata_airlines()
+        ):
             return normalized
 
         if re.fullmatch(r"[A-Z]{3}", normalized):
             return cls._iata_by_icao().get(normalized)
 
         return None
+
+    @classmethod
+    def _known_iata_airlines(cls) -> set[str]:
+        if cls._known_iata_airlines_cache is None:
+            cls._known_iata_airlines_cache = {
+                iata.upper()
+                for iata in cls._iata_by_icao().values()
+                if iata
+            }
+            cls._known_iata_airlines_cache.update(cls._airline_aliases().values())
+        return cls._known_iata_airlines_cache
 
     @classmethod
     def _iata_by_icao(cls) -> dict[str, str]:

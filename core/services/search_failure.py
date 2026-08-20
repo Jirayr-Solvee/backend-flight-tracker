@@ -138,7 +138,15 @@ class SearchFailureService:
                 "backend_and_app" if existing.source != source else existing.source
             )
             existing.query_type = query_type or existing.query_type
-            existing.failure_reason = failure_reason or existing.failure_reason
+            if not (
+                failure_reason == "provider_no_match"
+                and existing.failure_reason not in {"provider_no_match", "unknown"}
+            ):
+                # Older clients collapse unfamiliar recovery reasons into the
+                # generic provider_no_match value. Keep a more precise backend
+                # classification, while still allowing client-only outcomes
+                # such as landed_only to replace a generic backend reason.
+                existing.failure_reason = failure_reason or existing.failure_reason
             existing.provider_outcome = provider_outcome or existing.provider_outcome
             existing.normalization_applied = (
                 existing.normalization_applied or normalization_applied

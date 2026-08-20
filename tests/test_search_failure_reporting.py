@@ -2,6 +2,7 @@ import asyncio
 import os
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from sqlalchemy.pool import StaticPool
 
@@ -145,6 +146,41 @@ class SearchFailureReportingTests(unittest.TestCase):
         self.assertEqual(rows[0].filtered_result_count, 2)
         self.assertEqual(rows[0].app_version, "3.4")
 
+    def test_generic_app_reason_does_not_replace_precise_backend_reason(self):
+        sample = SearchFailureService.record(
+            session=self.session,
+            user_id=self.user.id,
+            query="Rev",
+            source="backend",
+            query_type="natural_language",
+            failure_reason="unsupported_or_incomplete_query",
+            provider_outcome="not_called",
+            normalization_applied=False,
+            provider_result_count=0,
+        )
+        self.session.commit()
+
+        report_app_search_failure(
+            SearchFailureReportRequest(
+                query="Rev",
+                failure_sample_id=sample.id,
+                source="regular_search",
+                query_type="natural_language",
+                failure_reason="provider_no_match",
+                provider_outcome="not_called",
+                app_version="3.4",
+                build_number="108",
+            ),
+            self.session,
+            self.user,
+        )
+
+        enriched = self.session.get(SearchFailureSample, sample.id)
+        self.assertEqual(
+            enriched.failure_reason,
+            "unsupported_or_incomplete_query",
+        )
+
     def test_backend_preflight_failure_returns_correlatable_sample_id(self):
         response = asyncio.run(
             search_flights_from_text_post(
@@ -171,6 +207,37 @@ class SearchFailureReportingTests(unittest.TestCase):
         self.assertEqual(sample.app_version, "3.4")
         self.assertEqual(sample.build_number, "108")
         self.assertEqual(sample.analytics_environment, "production")
+
+    @patch(
+        "core.routers.flights.GeminiService.get_function_call",
+        new_callable=AsyncMock,
+    )
+    def test_unparsed_query_is_recorded_as_not_called_not_provider_no_match(
+        self,
+        get_function_call: AsyncMock,
+    ):
+        get_function_call.return_value = None
+
+        response = asyncio.run(
+            search_flights_from_text_post(
+                payload=SearchQueryRequest(
+                    term="Rev",
+                    language="en",
+                    app_version="3.4",
+                    build_number="108",
+                    analytics_environment="production",
+                ),
+                accept_language="en",
+                session=self.session,
+                user=self.user,
+            )
+        )
+
+        self.assertEqual(
+            response.diagnostics.failure_reason,
+            "unsupported_or_incomplete_query",
+        )
+        self.assertEqual(response.diagnostics.provider_outcome, "not_called")
 
     def test_report_hides_query_by_default_and_can_return_redacted_sample(self):
         SearchFailureService.record(
