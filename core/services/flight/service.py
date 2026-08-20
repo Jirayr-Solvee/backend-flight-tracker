@@ -1187,6 +1187,7 @@ class FlightQueryHandler:
         flight_number: str,
         airline_iata: str,
         session: Session,
+        allow_live_fallback: bool = True,
     ):
         flights = await FlightService.get_flights(
             session=session,
@@ -1194,7 +1195,7 @@ class FlightQueryHandler:
             flight_number=flight_number,
             airline_iata=airline_iata,
         )
-        if not flights:
+        if not flights and allow_live_fallback:
             try:
                 resolved_flight = await FlightService.resolve_global_live_flight(
                     session=session,

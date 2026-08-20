@@ -644,9 +644,11 @@ class ProviderAndRankingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_date_searches_upcoming_days_until_a_result(self):
         requested_dates = []
+        live_fallback_values = []
 
         async def handler(*, departure_date: str, session, **kwargs):
             requested_dates.append(departure_date)
+            live_fallback_values.append(kwargs.get("allow_live_fallback"))
             if departure_date != "2026-08-22":
                 return QuerySearchResponse()
             return QuerySearchResponse(
@@ -682,6 +684,7 @@ class ProviderAndRankingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.flights_result[0].number, "LX546")
         self.assertEqual(resolved.args["departure_date"], "2026-08-22")
+        self.assertEqual(live_fallback_values, [None, False, False])
 
     async def test_date_ambiguous_search_skips_landed_day_for_upcoming_flight(self):
         requested_dates = []

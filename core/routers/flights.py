@@ -148,6 +148,10 @@ async def _execute_search_with_date_fallback(
             **initial_args,
             "departure_date": (initial_date + timedelta(days=offset)).isoformat(),
         }
+        if resolved_call.function_name == "extract_flight_info":
+            # The live-flight fallback already checked the current callsign on
+            # the initial attempt. Future schedule retries must not repeat it.
+            candidate_args["allow_live_fallback"] = False
         candidate_response = await resolved_call.handler(
             **candidate_args,
             session=session,
