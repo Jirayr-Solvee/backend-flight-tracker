@@ -2,6 +2,7 @@ import unittest
 
 from core.routers.legal import (
     LUMA_PRIVACY_POLICY_HTML,
+    LUMA_SUPPORT_HTML,
     PRIVACY_POLICY_HTML,
     SUPPORT_HTML,
     router,
@@ -26,6 +27,12 @@ class LegalPageTests(unittest.TestCase):
         self.assertIn("request deletion", LUMA_PRIVACY_POLICY_HTML)
         self.assertIn("mailto:jirayr.melikyan.jm@gmail.com", LUMA_PRIVACY_POLICY_HTML)
 
+    def test_luma_support_has_purchase_privacy_and_contact_information(self):
+        self.assertIn("Luma Tales Support", LUMA_SUPPORT_HTML)
+        self.assertIn("one-time consumable video packs", LUMA_SUPPORT_HTML)
+        self.assertIn('href="/luma/privacy"', LUMA_SUPPORT_HTML)
+        self.assertIn("mailto:jirayr.melikyan.jm@gmail.com", LUMA_SUPPORT_HTML)
+
     def test_public_legal_routes_support_get_and_head(self):
         routes = {
             route.path: route.methods
@@ -37,6 +44,8 @@ class LegalPageTests(unittest.TestCase):
             "/privacy.html",
             "/luma/privacy",
             "/luma/privacy.html",
+            "/luma/support",
+            "/luma/support.html",
             "/support",
             "/support.html",
         ):
