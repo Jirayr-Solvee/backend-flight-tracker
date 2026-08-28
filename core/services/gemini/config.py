@@ -192,10 +192,12 @@ extract_airport_route_single_derection_function = FunctionDeclaration(
     name="extract_flight_info_via_airport_single_derection",
     description=(
         "Use this function when the user asks for flights from or into a single airport "
-        "without specifying a destination. The query may be in any language. "
+        "without specifying a destination, or enters only one airport/city name or IATA code. "
+        "The query may be in any language. Resolve translated names and common misspellings. "
         "Infer direction as follows: "
         "- 'from <airport>' → departure "
         "- 'to <airport>' or 'into <airport>' → arrival. "
+        "- a bare airport, city, or IATA code → departure. "
         "If no date is mentioned, use the current UTC date. "
         "Return only JSON."
     ),

@@ -1,6 +1,6 @@
 import os
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -129,6 +129,14 @@ class SearchRecoveryTests(unittest.TestCase):
             "Lisbone": "LIS",
             "Abu Dhabi": "AUH",
             "Kuwait": "KWI",
+            "Amritsar": "ATQ",
+            "kannur": "CNN",
+            "Düsseldorfer": "DUS",
+            "Toronto": "YYZ",
+            "Yellownknife": "YZF",
+            "Halifax": "YHZ",
+            "Zürich": "ZRH",
+            "JED": "JED",
         }
         for query, airport_iata in expected.items():
             with self.subTest(query=query):
@@ -146,6 +154,9 @@ class SearchRecoveryTests(unittest.TestCase):
             "Von Bukarest nach Memmingen": ("OTP", "FMM"),
             "Lyon Dubrovnik": ("LYS", "DBV"),
             "Marbella Oran Aujourdhui": ("AGP", "ORN"),
+            "Dxb To Bali": ("DXB", "DPS"),
+            "Hong Kong Milan Today": ("HKG", "MXP"),
+            "Manila To Bahrain": ("MNL", "BAH"),
         }
         for query, route in expected.items():
             with self.subTest(query=query):
@@ -174,10 +185,29 @@ class SearchRecoveryTests(unittest.TestCase):
         self.assertEqual(switzerland.suggestions[0].query, "ZRH to TBS Today")
 
     def test_aircraft_type_is_not_misclassified_as_a_flight(self):
-        recovery = GeminiService.preflight_recovery("FA7X")
+        for query in ("FA7X", "Boeing 777-200", "Airbus A350-900"):
+            with self.subTest(query=query):
+                recovery = GeminiService.preflight_recovery(query)
+                self.assertEqual(recovery.reason, "unsupported_aircraft_type")
+                self.assertEqual(recovery.detected_query_type, "aircraft_type")
 
-        self.assertEqual(recovery.reason, "unsupported_aircraft_type")
-        self.assertEqual(recovery.detected_query_type, "aircraft_type")
+    def test_observed_flight_number_separators_and_airlines_parse(self):
+        expected = {
+            "j9.402": ("J9", "402"),
+            "F3346": ("F3", "346"),
+            "XC5052": ("XC", "5052"),
+            "Ibo853": ("I2", "853"),
+            "Con1778": ("DE", "1778"),
+        }
+        for query, flight in expected.items():
+            with self.subTest(query=query):
+                self.assertEqual(GeminiService._flight_from_query(query), flight)
+
+    def test_country_plus_destination_returns_correct_airport_choices(self):
+        recovery = GeminiService.preflight_recovery("Cipro Nuriberg")
+
+        self.assertEqual(recovery.reason, "choose_airport_route")
+        self.assertEqual(recovery.suggestions[0].query, "LCA to NUE Today")
 
     def test_unparsed_query_is_not_labelled_as_provider_no_match(self):
         recovery = GeminiService.recovery_for_empty_result("Rev", None)
@@ -518,6 +548,10 @@ class ProviderAndRankingTests(unittest.IsolatedAsyncioTestCase):
         status: FlightStatusEnum,
         departure_time: str,
     ) -> FlightRead:
+        arrival_time = (
+            datetime.strptime(departure_time, "%Y-%m-%d %H:%MZ")
+            + timedelta(hours=6)
+        ).strftime("%Y-%m-%d %H:%MZ")
         return FlightRead(
             id=identifier,
             number=number,
@@ -533,7 +567,7 @@ class ProviderAndRankingTests(unittest.IsolatedAsyncioTestCase):
             ),
             arrival=cls._segment(
                 iata="JFK",
-                scheduled="2026-08-17 18:00Z",
+                scheduled=arrival_time,
                 arrival=True,
             ),
         )
@@ -676,6 +710,7 @@ class ProviderAndRankingTests(unittest.IsolatedAsyncioTestCase):
             resolved_call=resolved,
             query="LX546",
             session=MagicMock(),
+            now=datetime(2026, 8, 20, tzinfo=timezone.utc),
         )
 
         self.assertEqual(
@@ -721,10 +756,48 @@ class ProviderAndRankingTests(unittest.IsolatedAsyncioTestCase):
             resolved_call=resolved,
             query="LX546",
             session=MagicMock(),
+            now=datetime(2026, 8, 20, tzinfo=timezone.utc),
         )
 
         self.assertEqual(requested_dates, ["2026-08-20", "2026-08-21"])
         self.assertEqual(response.flights_result[0].status, FlightStatusEnum.EXPECTED)
+
+    async def test_stale_expected_result_is_filtered_and_next_date_is_searched(self):
+        requested_dates = []
+
+        async def handler(*, departure_date: str, session, **kwargs):
+            requested_dates.append(departure_date)
+            return QuerySearchResponse(
+                flights_result=[
+                    self._flight(
+                        identifier=len(requested_dates),
+                        number="GF155",
+                        status=FlightStatusEnum.EXPECTED,
+                        departure_time=f"{departure_date} 12:00Z",
+                    )
+                ]
+            )
+
+        resolved = ResolvedFunctionCall(
+            function_name="extract_flight_info",
+            args={
+                "airline_iata": "GF",
+                "flight_number": "155",
+                "departure_date": "2026-08-20",
+            },
+            handler=handler,
+        )
+
+        response = await _execute_search_with_date_fallback(
+            resolved_call=resolved,
+            query="GF155",
+            session=MagicMock(),
+            now=datetime(2026, 8, 20, 20, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(requested_dates, ["2026-08-20", "2026-08-21"])
+        self.assertEqual(response.flights_result[0].number, "GF155")
+        self.assertEqual(resolved.args["departure_date"], "2026-08-21")
 
 
 if __name__ == "__main__":

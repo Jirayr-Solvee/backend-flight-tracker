@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from fastapi import HTTPException, status
 from sqlmodel import Session, select
@@ -1135,16 +1135,166 @@ class FlightQueryHandler:
         FlightStatusEnum.CANCELED.value: 31,
         FlightStatusEnum.ARRIVED.value: 40,
     }
+    TRACKABLE_SEARCH_STATUSES = {
+        FlightStatusEnum.EXPECTED.value,
+        FlightStatusEnum.CHECKIN.value,
+        FlightStatusEnum.BOARDING.value,
+        FlightStatusEnum.GATECLOSED.value,
+        FlightStatusEnum.DELAYED.value,
+        FlightStatusEnum.ENROUTE.value,
+        FlightStatusEnum.DEPARTED.value,
+        FlightStatusEnum.APPROACHING.value,
+        FlightStatusEnum.DIVERTED.value,
+    }
+    ACTIVE_SEARCH_STATUSES = {
+        FlightStatusEnum.ENROUTE.value,
+        FlightStatusEnum.DEPARTED.value,
+        FlightStatusEnum.APPROACHING.value,
+        FlightStatusEnum.DIVERTED.value,
+    }
 
     @staticmethod
     async def extract_random_flight(
         random: bool,
         session: Session
     ):
-        flight = FlightPersistence.get_random_flight(session=session)
+        candidates = FlightPersistence.get_random_flights(session=session, limit=100)
+        flight = next(
+            (
+                candidate
+                for candidate in candidates
+                if FlightQueryHandler.is_trackable_search_flight(candidate)
+            ),
+            None,
+        )
         return QuerySearchResponse(
             flights_result=[FlightRead.model_validate(flight, from_attributes=True)] if flight else []
         )
+
+    @classmethod
+    def filter_trackable_search_response(
+        cls,
+        response: QuerySearchResponse,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        """Mirror the released onboarding's active/upcoming flight filter."""
+        effective_now = now or datetime.now(timezone.utc)
+        original_count = len(response.flights_result) + len(
+            response.airport_flights_result
+        )
+        response.flights_result = [
+            flight
+            for flight in response.flights_result
+            if cls.is_trackable_search_flight(flight, now=effective_now)
+        ]
+        response.airport_flights_result = [
+            flight
+            for flight in response.airport_flights_result
+            if cls.is_trackable_search_flight(flight, now=effective_now)
+        ]
+        return original_count - (
+            len(response.flights_result) + len(response.airport_flights_result)
+        )
+
+    @classmethod
+    def trackable_search_result_count(
+        cls,
+        response: QuerySearchResponse,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        effective_now = now or datetime.now(timezone.utc)
+        return sum(
+            cls.is_trackable_search_flight(flight, now=effective_now)
+            for flight in response.flights_result
+        ) + sum(
+            cls.is_trackable_search_flight(flight, now=effective_now)
+            for flight in response.airport_flights_result
+        )
+
+    @classmethod
+    def search_response_is_landed_only(cls, response: QuerySearchResponse) -> bool:
+        flights = [*response.flights_result, *response.airport_flights_result]
+        return bool(flights) and all(
+            cls._search_status_value(flight.status) == FlightStatusEnum.ARRIVED.value
+            for flight in flights
+        )
+
+    @classmethod
+    def is_trackable_search_flight(
+        cls,
+        flight: FlightRead | AirportFlightRead | Flight,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        effective_now = now or datetime.now(timezone.utc)
+        status_value = cls._search_status_value(flight.status)
+        if status_value not in cls.TRACKABLE_SEARCH_STATUSES:
+            return False
+
+        arrival = getattr(flight, "arrival", None)
+        departure = getattr(flight, "departure", None)
+        actual_arrival = cls._search_segment_time(arrival, "runway_time_utc")
+        if actual_arrival and actual_arrival <= effective_now:
+            return False
+
+        expected_arrival = actual_arrival or cls._first_search_segment_time(
+            arrival,
+            "revised_time_utc",
+            "predicted_time_utc",
+            "scheduled_time_utc",
+        )
+        if expected_arrival:
+            return expected_arrival > effective_now
+
+        effective_departure = cls._first_search_segment_time(
+            departure,
+            "runway_time_utc",
+            "revised_time_utc",
+            "predicted_time_utc",
+            "scheduled_time_utc",
+        )
+        if effective_departure:
+            return (
+                effective_departure > effective_now
+                or status_value in cls.ACTIVE_SEARCH_STATUSES
+            )
+
+        return status_value in cls.ACTIVE_SEARCH_STATUSES
+
+    @staticmethod
+    def _search_status_value(status_value: Any) -> str:
+        return str(getattr(status_value, "value", status_value))
+
+    @classmethod
+    def _first_search_segment_time(
+        cls,
+        segment: Any,
+        *fields: str,
+    ) -> datetime | None:
+        for field in fields:
+            parsed = cls._search_segment_time(segment, field)
+            if parsed:
+                return parsed
+        return None
+
+    @staticmethod
+    def _search_segment_time(segment: Any, field: str) -> datetime | None:
+        value = getattr(segment, field, None) if segment else None
+        if not value:
+            return None
+
+        normalized = str(value).strip()
+        if normalized.endswith("Z"):
+            normalized = f"{normalized[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     @staticmethod
     async def extract_airline_live_flights(

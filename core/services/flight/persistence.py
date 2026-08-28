@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Sequence
 
 from sqlmodel import Session, select, case
@@ -278,6 +279,11 @@ class FlightPersistence:
     
     @staticmethod
     def get_random_flight(session: Session) -> Flight | None:
+        flights = FlightPersistence.get_random_flights(session=session, limit=1)
+        return flights[0] if flights else None
+
+    @staticmethod
+    def get_random_flights(session: Session, limit: int = 100) -> Sequence[Flight]:
         STATUSES_PRIORITY: list[str] = [
             "Expected",
             "CheckIn",
@@ -306,9 +312,11 @@ class FlightPersistence:
         statement = (
             select(Flight)
             .where(Flight.status.in_(STATUSES_PRIORITY)) # type: ignore
+            .where(Flight.date >= datetime.now(timezone.utc).date().isoformat())
             .join(Departure, isouter=True)
             .join(Arrival, isouter=True)
-            .order_by(live_score, status_priority)
+            .order_by(Flight.date, live_score, status_priority)
+            .limit(limit)
         )
 
-        return session.exec(statement).first()
+        return session.exec(statement).all()

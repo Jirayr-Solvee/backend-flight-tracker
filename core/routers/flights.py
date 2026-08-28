@@ -1,6 +1,7 @@
 import logging
 import time
-from datetime import date, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 
 from fastapi import (APIRouter, BackgroundTasks, Depends, Header, HTTPException,
                      Query, status)
@@ -24,7 +25,7 @@ from ..models.flight import (
 from ..models.live_activity import LiveActivityRegistration
 from ..models.user import User, UserFlightLink
 from ..services.flight.delay_risk import DelayRiskResponse, DelayRiskService
-from ..services.flight import FlightPersistence, FlightService
+from ..services.flight import FlightPersistence, FlightQueryHandler, FlightService
 from ..services.flight.api_client import AerodataboxUnavailableError
 from ..services.gemini.service import GeminiService, ResolvedFunctionCall
 from ..services.search_failure import RETENTION_DAYS, SearchFailureService
@@ -63,6 +64,7 @@ def _record_backend_search_failure(
     user: User,
     query: str,
     diagnostics: SearchDiagnosticsRead,
+    filtered_result_count: int = 0,
     structured_args: dict | None = None,
     app_version: str | None = None,
     build_number: str | None = None,
@@ -81,6 +83,7 @@ def _record_backend_search_failure(
         provider_outcome=diagnostics.provider_outcome,
         normalization_applied=diagnostics.normalization_applied,
         provider_result_count=diagnostics.provider_result_count,
+        filtered_result_count=filtered_result_count,
         provider_latency_ms=diagnostics.provider_latency_ms,
         structured_args=structured_args,
         app_version=app_version,
@@ -94,33 +97,34 @@ def _search_result_count(response: QuerySearchResponse) -> int:
     return len(response.flights_result) + len(response.airport_flights_result)
 
 
-def _actionable_search_result_count(response: QuerySearchResponse) -> int:
-    landed_statuses = {"arrived", "landed"}
-
-    def is_actionable(status_value) -> bool:
-        normalized = str(getattr(status_value, "value", status_value)).casefold()
-        return normalized not in landed_statuses
-
-    return sum(
-        is_actionable(flight.status)
-        for flight in response.flights_result
-    ) + sum(
-        is_actionable(flight.status)
-        for flight in response.airport_flights_result
-    )
+@dataclass
+class SearchExecutionResult:
+    response: QuerySearchResponse
+    provider_result_count: int
+    filtered_result_count: int
+    only_landed_results: bool
 
 
-async def _execute_search_with_date_fallback(
+async def _execute_search_with_date_fallback_details(
     *,
     resolved_call: ResolvedFunctionCall,
     query: str,
     session: Session,
-) -> QuerySearchResponse:
-    """Search the requested date, then a bounded upcoming window when ambiguous."""
+    now: datetime | None = None,
+) -> SearchExecutionResult:
+    """Search and return only results the released onboarding can track."""
     initial_args = dict(resolved_call.args)
     initial_response = await resolved_call.handler(
         **initial_args,
         session=session,
+    )
+    provider_result_count = _search_result_count(initial_response)
+    only_landed_results = FlightQueryHandler.search_response_is_landed_only(
+        initial_response
+    )
+    filtered_result_count = FlightQueryHandler.filter_trackable_search_response(
+        initial_response,
+        now=now,
     )
     max_days_by_function = {
         "extract_flight_info": 3,
@@ -131,17 +135,30 @@ async def _execute_search_with_date_fallback(
         GeminiService.upcoming_search_days(query),
         max_days_by_function.get(resolved_call.function_name, 0),
     )
-    if _search_result_count(initial_response) > 0 and (
-        max_days <= 0 or _actionable_search_result_count(initial_response) > 0
-    ):
-        return initial_response
+    if _search_result_count(initial_response) > 0:
+        return SearchExecutionResult(
+            response=initial_response,
+            provider_result_count=provider_result_count,
+            filtered_result_count=filtered_result_count,
+            only_landed_results=False,
+        )
     if max_days <= 0:
-        return initial_response
+        return SearchExecutionResult(
+            response=initial_response,
+            provider_result_count=provider_result_count,
+            filtered_result_count=filtered_result_count,
+            only_landed_results=only_landed_results,
+        )
 
     try:
         initial_date = date.fromisoformat(str(initial_args["departure_date"]))
     except (KeyError, TypeError, ValueError):
-        return initial_response
+        return SearchExecutionResult(
+            response=initial_response,
+            provider_result_count=provider_result_count,
+            filtered_result_count=filtered_result_count,
+            only_landed_results=only_landed_results,
+        )
 
     for offset in range(1, max_days + 1):
         candidate_args = {
@@ -156,13 +173,56 @@ async def _execute_search_with_date_fallback(
             **candidate_args,
             session=session,
         )
+        candidate_provider_count = _search_result_count(candidate_response)
+        previous_provider_count = provider_result_count
+        provider_result_count += candidate_provider_count
+        if candidate_provider_count:
+            candidate_landed_only = FlightQueryHandler.search_response_is_landed_only(
+                candidate_response
+            )
+            only_landed_results = (
+                candidate_landed_only
+                if previous_provider_count == 0
+                else only_landed_results and candidate_landed_only
+            )
+        filtered_result_count += FlightQueryHandler.filter_trackable_search_response(
+            candidate_response,
+            now=now,
+        )
         if _search_result_count(candidate_response) > 0:
             # Persist the date that actually produced the response so protected
             # diagnostics can explain a later client-side filtering failure.
             resolved_call.args = candidate_args
-            return candidate_response
+            return SearchExecutionResult(
+                response=candidate_response,
+                provider_result_count=provider_result_count,
+                filtered_result_count=filtered_result_count,
+                only_landed_results=False,
+            )
 
-    return initial_response
+    return SearchExecutionResult(
+        response=initial_response,
+        provider_result_count=provider_result_count,
+        filtered_result_count=filtered_result_count,
+        only_landed_results=only_landed_results and provider_result_count > 0,
+    )
+
+
+async def _execute_search_with_date_fallback(
+    *,
+    resolved_call: ResolvedFunctionCall,
+    query: str,
+    session: Session,
+    now: datetime | None = None,
+) -> QuerySearchResponse:
+    """Compatibility wrapper for tests and internal callers needing the response."""
+    result = await _execute_search_with_date_fallback_details(
+        resolved_call=resolved_call,
+        query=query,
+        session=session,
+        now=now,
+    )
+    return result.response
 
 
 @router.get("/live-positions", response_model=list[GlobalFlightPositionRead])
@@ -544,11 +604,12 @@ async def search_flights_from_text(
         query_type = ai_service.query_type_for_call(resolved_call)
         provider_started_at = time.perf_counter()
         try:
-            flights = await _execute_search_with_date_fallback(
+            execution = await _execute_search_with_date_fallback_details(
                 resolved_call=resolved_call,
                 query=normalized_term,
                 session=session,
             )
+            flights = execution.response
         except AerodataboxUnavailableError as exc:
             provider_latency_ms = _elapsed_ms(provider_started_at)
             failure_reason = (
@@ -590,7 +651,8 @@ async def search_flights_from_text(
             return response
 
         provider_latency_ms = _elapsed_ms(provider_started_at)
-        provider_result_count = _search_result_count(flights)
+        result_count = _search_result_count(flights)
+        provider_result_count = execution.provider_result_count
         provider_outcome = "results" if provider_result_count > 0 else "no_match"
         _log_search_provider(
             query_type=query_type,
@@ -599,11 +661,22 @@ async def search_flights_from_text(
             result_count=provider_result_count,
         )
 
-        if provider_result_count == 0:
-            flights.recovery = ai_service.recovery_for_empty_result(
-                query=normalized_term,
-                resolved_call=resolved_call,
-            )
+        if result_count == 0:
+            if provider_result_count > 0:
+                flights.recovery = SearchRecoveryRead(
+                    reason=(
+                        "landed_only"
+                        if execution.only_landed_results
+                        else "results_filtered_out"
+                    ),
+                    detected_query_type=query_type,
+                    suggestions=[],
+                )
+            else:
+                flights.recovery = ai_service.recovery_for_empty_result(
+                    query=normalized_term,
+                    resolved_call=resolved_call,
+                )
 
         flights.diagnostics = SearchDiagnosticsRead(
             query_type=query_type,
@@ -618,12 +691,13 @@ async def search_flights_from_text(
             provider_latency_ms=provider_latency_ms,
         )
 
-        if provider_result_count == 0:
+        if result_count == 0:
             _record_backend_search_failure(
                 session=session,
                 user=user,
                 query=normalized_term,
                 diagnostics=flights.diagnostics,
+                filtered_result_count=execution.filtered_result_count,
                 structured_args=resolved_call.args,
                 app_version=app_version,
                 build_number=build_number,

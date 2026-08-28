@@ -41,16 +41,27 @@ class GeminiService:
     }
 
     _country_airports = {
+        "bangladesh": ("DAC", "CGP", "ZYL"),
+        "cyprus": ("LCA", "PFO"),
         "mexico": ("MEX", "CUN", "GDL"),
         "turkey": ("IST", "SAW", "AYT"),
         "germany": ("FRA", "MUC", "BER", "DUS"),
         "georgia": ("TBS", "BUS", "KUT"),
         "indonesia": ("CGK", "DPS", "SUB"),
+        "kosovo": ("PRN",),
+        "lebanon": ("BEY",),
         "saudi_arabia": ("RUH", "JED", "DMM"),
         "switzerland": ("ZRH", "GVA", "BSL"),
+        "venezuela": ("CCS", "MAR", "VLN"),
     }
 
     _country_aliases = {
+        "bangladesh": {
+            "bangladesh", "বাংলাদেশ", "بنغلاديش", "bangladés",
+        },
+        "cyprus": {
+            "cyprus", "cipro", "chypre", "zypern", "kıbrıs", "قبرص",
+        },
         "mexico": {
             "mexico", "méxico", "مكسيكو", "المكسيك",
         },
@@ -70,6 +81,12 @@ class GeminiService:
             "indonesia", "indonésie", "indonesie", "indonesien",
             "indonésia", "إندونيسيا", "اندونيسيا",
         },
+        "kosovo": {
+            "kosovo", "kosova", "كوسوفو",
+        },
+        "lebanon": {
+            "lebanon", "liban", "libano", "líbano", "لبنان",
+        },
         "saudi_arabia": {
             "saudi arabia", "saudi", "arabie saoudite", "saudi-arabien",
             "arabia saudita", "arábia saudita", "السعودية",
@@ -78,6 +95,9 @@ class GeminiService:
         "switzerland": {
             "switzerland", "suisse", "schweiz", "svizzera", "suiza",
             "suíça", "سويسرا",
+        },
+        "venezuela": {
+            "venezuela", "venezüela", "فنزويلا",
         },
     }
 
@@ -99,6 +119,11 @@ class GeminiService:
     _aircraft_type_aliases = {
         "fa7x", "falcon 7x", "dassault falcon 7x",
     }
+    _aircraft_type_pattern = re.compile(
+        r"^(?:boeing|airbus|embraer|bombardier|cessna|dassault|gulfstream|"
+        r"beechcraft|atr)\s+[a-z0-9][a-z0-9 .+-]{1,30}$",
+        re.IGNORECASE,
+    )
 
     _explicit_date_words = {
         "today", "now", "tomorrow", "yesterday",
@@ -322,6 +347,12 @@ class GeminiService:
                 ],
             )
 
+        # When two known locations form a clear route, let the deterministic
+        # parser execute it instead of intercepting a country word as an
+        # ambiguous broad-location search.
+        if cls._route_from_aliases(normalized.casefold()):
+            return None
+
         countries = cls._countries_in_query(normalized)
         if len(countries) >= 2:
             departure, arrival = countries[0], countries[1]
@@ -393,7 +424,9 @@ class GeminiService:
     @classmethod
     def aircraft_type_from_query(cls, query: str) -> str | None:
         normalized = cls._fold_text(cls.normalize_query(query)).strip()
-        return normalized if normalized in cls._aircraft_type_aliases else None
+        if normalized in cls._aircraft_type_aliases:
+            return normalized
+        return normalized if cls._aircraft_type_pattern.fullmatch(normalized) else None
 
     @classmethod
     def flight_number_without_airline(cls, query: str) -> str | None:
@@ -632,6 +665,9 @@ class GeminiService:
             "airline_no_flights": "provider_no_match",
             "random_flight_unavailable": "provider_no_match",
             "provider_no_match": "provider_no_match",
+            "landed_only": "landed_only",
+            "results_filtered_out": "results_filtered_out",
+            "no_upcoming_results": "results_filtered_out",
             "provider_unavailable": "provider_unavailable",
             "provider_rate_limited": "provider_rate_limited",
             "aircraft_registration_not_live": "registration_not_live",
@@ -659,11 +695,11 @@ class GeminiService:
     ) -> list[SearchSuggestionRead]:
         departure_airports = cls._country_airports[departure_country]
         arrival_airports = cls._country_airports[arrival_country]
-        pairs = [
-            (departure_airports[0], arrival_airports[0]),
-            (departure_airports[1], arrival_airports[0]),
-            (departure_airports[0], arrival_airports[1]),
-        ]
+        pairs = [(departure_airports[0], arrival_airports[0])]
+        if len(departure_airports) > 1:
+            pairs.append((departure_airports[1], arrival_airports[0]))
+        if len(arrival_airports) > 1:
+            pairs.append((departure_airports[0], arrival_airports[1]))
         return [
             SearchSuggestionRead(
                 label=f"{departure} → {arrival}",
@@ -1001,8 +1037,8 @@ class GeminiService:
         lowered = query.casefold()
         for alias, airline_iata in cls._airline_aliases_by_length():
             match = re.search(
-                rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])"
-                r"(?:\s+flight)?\s+([0-9]{1,4}[a-z]?)\b",
+                rf"(?<![a-z0-9]){re.escape(alias)}"
+                r"(?:\s+flight)?[\s./-]*([0-9]{1,4}[a-z]?)(?![a-z0-9])",
                 lowered,
             )
             if match:
@@ -1010,8 +1046,8 @@ class GeminiService:
 
         upper = query.upper()
         for pattern in (
-            r"(?<![A-Z0-9])([A-Z]{3})[\s-]*([0-9]{1,4}[A-Z]?)(?![A-Z0-9])",
-            r"(?<![A-Z0-9])([A-Z0-9]{2})[\s-]*([0-9]{1,4}[A-Z]?)(?![A-Z0-9])",
+            r"(?<![A-Z0-9])([A-Z]{3})[\s./-]*([0-9]{1,4}[A-Z]?)(?![A-Z0-9])",
+            r"(?<![A-Z0-9])([A-Z0-9]{2})[\s./-]*([0-9]{1,4}[A-Z]?)(?![A-Z0-9])",
         ):
             match = re.search(pattern, upper)
             if not match:
@@ -1162,6 +1198,12 @@ class GeminiService:
     @staticmethod
     def _airport_aliases() -> dict[str, str]:
         return {
+            "amritsar": "ATQ",
+            "atq": "ATQ",
+            "kannur": "CNN",
+            "cnn": "CNN",
+            "abha": "ABH",
+            "abh": "ABH",
             "los angeles": "LAX",
             "la": "LAX",
             "lax": "LAX",
@@ -1178,6 +1220,8 @@ class GeminiService:
             "parís": "CDG",
             "cdg": "CDG",
             "istanbul": "IST",
+            "اسطنبول": "IST",
+            "الاسطنبول": "IST",
             "ist": "IST",
             "dubai": "DXB",
             "dxb": "DXB",
@@ -1218,6 +1262,11 @@ class GeminiService:
             "riyad": "RUH",
             "الرياض": "RUH",
             "ruh": "RUH",
+            "jeddah": "JED",
+            "jeddah airport": "JED",
+            "جدة": "JED",
+            "جده": "JED",
+            "jed": "JED",
             "bucharest": "OTP",
             "bukarest": "OTP",
             "bucarest": "OTP",
@@ -1238,6 +1287,78 @@ class GeminiService:
             "orn": "ORN",
             "kathmandu": "KTM",
             "ktm": "KTM",
+            "bali": "DPS",
+            "denpasar": "DPS",
+            "dps": "DPS",
+            "hong kong": "HKG",
+            "hongkong": "HKG",
+            "hkg": "HKG",
+            "munich": "MUC",
+            "münchen": "MUC",
+            "muenchen": "MUC",
+            "muc": "MUC",
+            "milan": "MXP",
+            "milano": "MXP",
+            "mxp": "MXP",
+            "nuremberg": "NUE",
+            "nürnberg": "NUE",
+            "nurnberg": "NUE",
+            "nuriberg": "NUE",
+            "nue": "NUE",
+            "tripoli": "TIP",
+            "طرابلس": "TIP",
+            "tip": "TIP",
+            "mitiga": "MJI",
+            "معيتيقة": "MJI",
+            "امعتيقه": "MJI",
+            "امعايقه": "MJI",
+            "mji": "MJI",
+            "cairo": "CAI",
+            "القاهرة": "CAI",
+            "cai": "CAI",
+            "manila": "MNL",
+            "مانيلا": "MNL",
+            "mnl": "MNL",
+            "bahrain": "BAH",
+            "البحرين": "BAH",
+            "bah": "BAH",
+            "dusseldorf": "DUS",
+            "düsseldorf": "DUS",
+            "düsseldorfer": "DUS",
+            "dus": "DUS",
+            "toronto": "YYZ",
+            "yyz": "YYZ",
+            "yellowknife": "YZF",
+            "yellownknife": "YZF",
+            "yzf": "YZF",
+            "halifax": "YHZ",
+            "yhz": "YHZ",
+            "washington dc": "IAD",
+            "washington d.c.": "IAD",
+            "iad": "IAD",
+            "zurich": "ZRH",
+            "zürich": "ZRH",
+            "zrh": "ZRH",
+            "skopje": "SKP",
+            "skp": "SKP",
+            "dortmund": "DTM",
+            "dtm": "DTM",
+            "basel": "BSL",
+            "mlh": "BSL",
+            "bsl": "BSL",
+            "reno": "RNO",
+            "rno": "RNO",
+            "new orleans": "MSY",
+            "msy": "MSY",
+            "dhaka": "DAC",
+            "dac": "DAC",
+            "medina": "MED",
+            "med": "MED",
+            "nis": "INI",
+            "niš": "INI",
+            "ini": "INI",
+            "nova lima": "CNF",
+            "cnf": "CNF",
         }
 
     @classmethod
@@ -1263,15 +1384,21 @@ class GeminiService:
             "british airways": "BA",
             "delta": "DL",
             "delta air lines": "DL",
+            "condor": "DE",
+            "con": "DE",
+            "corendon": "XC",
             "easyjet": "U2",
             "emirates": "EK",
             "etihad": "EY",
             "flynas": "XY",
             "flynass": "XY",
+            "flyadeal": "F3",
             "frontier": "F9",
             "indigo": "6E",
             "jet blue": "B6",
             "jetblue": "B6",
+            "jazeera": "J9",
+            "jazeera airways": "J9",
             "klm": "KL",
             "lufthansa": "LH",
             "qantas": "QF",
@@ -1288,6 +1415,7 @@ class GeminiService:
             "vueling": "VY",
             "wizz": "W6",
             "wizz air": "W6",
+            "ibo": "I2",
         }
 
     @classmethod
