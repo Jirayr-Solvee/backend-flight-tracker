@@ -44,7 +44,7 @@ for key, value in {
 
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from core.models.experiment import ExperimentConversion
+from core.models.experiment import ExperimentConversion, ExperimentExposure
 from core.models.subscription import Subscription
 from core.models.subscription_lifecycle import AppStoreSubscriptionLifecycleEvent
 from core.models.transaction import Transaction
@@ -357,6 +357,19 @@ class SubscriptionLifecycleTests(unittest.TestCase):
         self.assertEqual(event.auto_renew_status, 0)
 
     def test_experiment_lifecycle_summary_counts_events_and_subscriptions(self):
+        exposure = ExperimentExposure(
+            id="activation_experience_2026_08:installation-1",
+            experiment_id="activation_experience_2026_08",
+            variant="treatment_simplified",
+            eligible=True,
+            installation_id="11111111-2222-4333-8444-555555555555",
+            app_version="3.4",
+            build_number="109",
+            analytics_environment="production",
+            user_id="user-1",
+            source="onboarding_exposure",
+            exposed_at_ms=1_000,
+        )
         conversion = ExperimentConversion(
             id="transaction-1",
             original_transaction_id="original-1",
@@ -364,7 +377,7 @@ class SubscriptionLifecycleTests(unittest.TestCase):
             variant="treatment_simplified",
             eligible=True,
             installation_id="11111111-2222-4333-8444-555555555555",
-            exposure_id="activation_experience_2026_08:installation-1",
+            exposure_id=exposure.id,
             app_version="3.4",
             build_number="109",
             conversion_app_version="3.4",
@@ -375,6 +388,7 @@ class SubscriptionLifecycleTests(unittest.TestCase):
             purchase_environment="Production",
             starts_trial=True,
         )
+        self.session.add(exposure)
         self.session.add(conversion)
         for index, (notification_type, subtype) in enumerate(
             (

@@ -313,6 +313,11 @@ def get_experiment_lifecycle_summary(
     app_version: str | None = Query(default=None, max_length=40),
     session: Session = Depends(get_session),
 ):
+    exposure_statement = select(ExperimentExposure).where(
+        ExperimentExposure.experiment_id == experiment_id,
+        ExperimentExposure.eligible == True,  # noqa: E712
+        ExperimentExposure.analytics_environment == "production",
+    )
     conversion_statement = select(ExperimentConversion).where(
         ExperimentConversion.experiment_id == experiment_id,
         ExperimentConversion.eligible == True,  # noqa: E712
@@ -320,14 +325,23 @@ def get_experiment_lifecycle_summary(
         ExperimentConversion.purchase_environment == "Production",
     )
     if app_version:
+        exposure_statement = exposure_statement.where(
+            ExperimentExposure.app_version == app_version
+        )
         conversion_statement = conversion_statement.where(
             ExperimentConversion.app_version == app_version
         )
+    exposures = session.exec(exposure_statement).all()
     conversions = session.exec(conversion_statement).all()
+    exposure_variants = {
+        exposure.installation_id: exposure.variant for exposure in exposures
+    }
 
     assignments: dict[str, str] = {}
     tracked_subscriptions: dict[str, set[str]] = {}
     for conversion in conversions:
+        if exposure_variants.get(conversion.installation_id) != conversion.variant:
+            continue
         assignments.setdefault(conversion.original_transaction_id, conversion.variant)
         tracked_subscriptions.setdefault(conversion.variant, set()).add(
             conversion.original_transaction_id
@@ -354,7 +368,11 @@ def get_experiment_lifecycle_summary(
                 metric, set()
             ).add(event.original_transaction_id)
 
-    variants = sorted(set(tracked_subscriptions) | set(metric_event_ids))
+    variants = sorted(
+        {exposure.variant for exposure in exposures}
+        | set(tracked_subscriptions)
+        | set(metric_event_ids)
+    )
     arms = []
     for variant in variants:
         arm_event_ids = metric_event_ids.get(variant, {})
