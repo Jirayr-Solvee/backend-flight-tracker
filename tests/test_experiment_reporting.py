@@ -44,17 +44,25 @@ for key, value in {
 
 from appstoreserverlibrary.models.Environment import Environment
 from appstoreserverlibrary.models.OfferDiscountType import OfferDiscountType
+from fastapi import HTTPException
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from core.models.experiment import ExperimentConversion, ExperimentExposure
+from core.models.experiment import (
+    ExperimentConversion,
+    ExperimentExposure,
+    ExperimentGoalSelection,
+)
 from core.models.transaction import Transaction
 from core.models.user import User
 from core.routers.subscriptions import (
     CreateTransactionRequest,
     ExperimentContext,
+    ExperimentGoalSelectionRequest,
     create_or_update_transaction,
+    get_experiment_goal_summary,
     get_experiment_summary,
     report_experiment_exposure,
+    report_experiment_goal_selection,
 )
 
 
@@ -248,6 +256,105 @@ class ExperimentReportingTests(unittest.TestCase):
         )
         self.assertEqual(summary["arms"][0]["exposed_installations"], 0)
         self.assertEqual(summary["arms"][0]["verified_trial_installations"], 0)
+
+    def test_final_goal_selection_is_upserted_and_aggregated(self):
+        context = self.context()
+        first_request = ExperimentGoalSelectionRequest(
+            experiment=context,
+            selected_goal_keys=["gate_delay_alerts", "flight_history"],
+            selected_at_ms=1_786_976_310_000,
+        )
+        second_request = ExperimentGoalSelectionRequest(
+            experiment=context,
+            selected_goal_keys=["family_friends", "copilot_insights"],
+            selected_at_ms=1_786_976_320_000,
+        )
+
+        self.assertEqual(
+            report_experiment_goal_selection(
+                first_request,
+                self.user,
+                self.session,
+            ),
+            {"detail": "success"},
+        )
+        self.assertEqual(
+            report_experiment_goal_selection(
+                second_request,
+                self.user,
+                self.session,
+            ),
+            {"detail": "success"},
+        )
+
+        selections = self.session.exec(select(ExperimentGoalSelection)).all()
+        self.assertEqual(len(selections), 1)
+        self.assertEqual(
+            selections[0].selected_goal_keys,
+            "copilot_insights,family_friends",
+        )
+        self.assertEqual(selections[0].selected_at_ms, 1_786_976_320_000)
+
+        exposure = self.session.get(ExperimentExposure, context.exposure_id)
+        self.assertIsNotNone(exposure)
+        self.assertEqual(exposure.source, "onboarding_goal_selection")
+        report_experiment_exposure(context, self.user, self.session)
+        self.session.refresh(exposure)
+        self.assertEqual(exposure.source, "onboarding_exposure")
+
+        summary = get_experiment_goal_summary(
+            "activation_experience_2026_08",
+            app_version="3.4",
+            session=self.session,
+        )
+        self.assertEqual(summary["arms"][0]["responding_installations"], 1)
+        self.assertEqual(
+            summary["arms"][0]["choices"],
+            [
+                {
+                    "choice_key": "copilot_insights",
+                    "selected_installations": 1,
+                    "selection_rate": 1.0,
+                },
+                {
+                    "choice_key": "family_friends",
+                    "selected_installations": 1,
+                    "selection_rate": 1.0,
+                },
+                {
+                    "choice_key": "flight_history",
+                    "selected_installations": 0,
+                    "selection_rate": 0.0,
+                },
+                {
+                    "choice_key": "gate_delay_alerts",
+                    "selected_installations": 0,
+                    "selection_rate": 0.0,
+                },
+            ],
+        )
+        self.assertEqual(
+            summary["arms"][0]["combinations"],
+            [
+                {
+                    "choice_keys": ["copilot_insights", "family_friends"],
+                    "installations": 1,
+                    "selection_rate": 1.0,
+                }
+            ],
+        )
+
+    def test_goal_selection_rejects_control_assignment(self):
+        request = ExperimentGoalSelectionRequest(
+            experiment=self.context(variant="control_current"),
+            selected_goal_keys=["gate_delay_alerts"],
+            selected_at_ms=1_786_976_310_000,
+        )
+
+        with self.assertRaises(HTTPException) as caught:
+            report_experiment_goal_selection(request, self.user, self.session)
+        self.assertEqual(caught.exception.status_code, 422)
+        self.assertIn("eligible treatment", caught.exception.detail)
 
 
 if __name__ == "__main__":

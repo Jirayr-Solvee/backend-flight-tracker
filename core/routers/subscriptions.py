@@ -9,7 +9,12 @@ from sqlmodel import select
 
 from ..dependency import check_lambda_auth_token, get_current_user
 from ..models import Session, get_session
-from ..models.experiment import ExperimentConversion, ExperimentExposure
+from ..models.experiment import (
+    ExperimentConversion,
+    ExperimentExposure,
+    ExperimentGoalSelection,
+    current_time_ms,
+)
 from ..models.subscription import Subscription
 from ..models.subscription_lifecycle import AppStoreSubscriptionLifecycleEvent
 from ..models.transaction import Transaction
@@ -58,6 +63,30 @@ class ExperimentContext(BaseModel):
         expected = f"{self.experiment_id}:{self.installation_id}"
         if self.exposure_id.casefold() != expected.casefold():
             raise ValueError("exposure_id must match experiment_id and installation_id")
+        return self
+
+
+ActivationGoalKey = Literal[
+    "gate_delay_alerts",
+    "family_friends",
+    "copilot_insights",
+    "flight_history",
+]
+
+
+class ExperimentGoalSelectionRequest(BaseModel):
+    experiment: ExperimentContext
+    selected_goal_keys: list[ActivationGoalKey] = PydanticField(
+        min_length=1,
+        max_length=4,
+    )
+    selected_at_ms: int = PydanticField(ge=0)
+
+    @model_validator(mode="after")
+    def validate_goal_keys(self):
+        if len(set(self.selected_goal_keys)) != len(self.selected_goal_keys):
+            raise ValueError("selected_goal_keys must be unique")
+        self.selected_goal_keys = sorted(self.selected_goal_keys)
         return self
 
 
@@ -110,7 +139,12 @@ def _upsert_experiment_exposure(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Experiment assignment conflict",
             )
-        if existing.source == "purchase_registration" and source == "onboarding_exposure":
+        source_priority = {
+            "purchase_registration": 0,
+            "onboarding_goal_selection": 1,
+            "onboarding_exposure": 2,
+        }
+        if source_priority.get(source, 0) > source_priority.get(existing.source, 0):
             existing.source = source
             session.add(existing)
         return existing
@@ -207,6 +241,185 @@ def report_experiment_exposure(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
         )
+
+
+@router.post("/experiments/goals")
+def report_experiment_goal_selection(
+    data: ExperimentGoalSelectionRequest,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    context = data.experiment
+    if not context.eligible or context.variant != "treatment_simplified":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Goal selection is only valid for the eligible treatment",
+        )
+    if context.exposed_at_ms is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Exposure timestamp is required",
+        )
+
+    exposure_id = _canonical_exposure_id(context)
+    canonical_keys = ",".join(data.selected_goal_keys)
+    try:
+        _upsert_experiment_exposure(
+            context=context,
+            user=user,
+            session=session,
+            source="onboarding_goal_selection",
+        )
+        existing = session.get(ExperimentGoalSelection, exposure_id)
+        if existing:
+            if (
+                existing.experiment_id != context.experiment_id
+                or existing.variant != context.variant
+                or existing.installation_id != str(context.installation_id)
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Experiment assignment conflict",
+                )
+            existing.selected_goal_keys = canonical_keys
+            existing.selected_at_ms = data.selected_at_ms
+            existing.last_reported_at_ms = current_time_ms()
+            session.add(existing)
+        else:
+            session.add(
+                ExperimentGoalSelection(
+                    id=exposure_id,
+                    experiment_id=context.experiment_id,
+                    variant=context.variant,
+                    eligible=context.eligible,
+                    installation_id=str(context.installation_id),
+                    exposure_id=exposure_id,
+                    app_version=context.app_version,
+                    build_number=context.build_number,
+                    analytics_environment=context.analytics_environment,
+                    user_id=user.id,
+                    selected_goal_keys=canonical_keys,
+                    selected_at_ms=data.selected_at_ms,
+                )
+            )
+        session.commit()
+        return {"detail": "success"}
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception:
+        session.rollback()
+        logger.exception(
+            "Unable to record experiment goal selection user_id=%s",
+            user.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
+
+
+@router.get(
+    "/experiments/{experiment_id}/goal-summary",
+    dependencies=[Depends(check_lambda_auth_token)],
+)
+def get_experiment_goal_summary(
+    experiment_id: str,
+    app_version: str | None = Query(default=None, max_length=40),
+    session: Session = Depends(get_session),
+):
+    statement = select(ExperimentGoalSelection).where(
+        ExperimentGoalSelection.experiment_id == experiment_id,
+        ExperimentGoalSelection.eligible == True,  # noqa: E712
+        ExperimentGoalSelection.analytics_environment == "production",
+    )
+    if app_version:
+        statement = statement.where(
+            ExperimentGoalSelection.app_version == app_version
+        )
+
+    selections = session.exec(statement).all()
+    variants = sorted({selection.variant for selection in selections})
+    arms = []
+    for variant in variants:
+        arm_selections = [
+            selection
+            for selection in selections
+            if selection.variant == variant
+        ]
+        responding_installations = len(
+            {selection.installation_id for selection in arm_selections}
+        )
+        choice_installations: dict[str, set[str]] = {
+            key: set()
+            for key in (
+                "gate_delay_alerts",
+                "family_friends",
+                "copilot_insights",
+                "flight_history",
+            )
+        }
+        combination_installations: dict[tuple[str, ...], set[str]] = {}
+        for selection in arm_selections:
+            keys = tuple(
+                key
+                for key in selection.selected_goal_keys.split(",")
+                if key
+            )
+            combination_installations.setdefault(keys, set()).add(
+                selection.installation_id
+            )
+            for key in keys:
+                choice_installations.setdefault(key, set()).add(
+                    selection.installation_id
+                )
+
+        choices = [
+            {
+                "choice_key": key,
+                "selected_installations": len(installations),
+                "selection_rate": (
+                    round(len(installations) / responding_installations, 4)
+                    if responding_installations
+                    else None
+                ),
+            }
+            for key, installations in choice_installations.items()
+        ]
+        choices.sort(
+            key=lambda item: (-item["selected_installations"], item["choice_key"])
+        )
+
+        combinations = [
+            {
+                "choice_keys": list(keys),
+                "installations": len(installations),
+                "selection_rate": (
+                    round(len(installations) / responding_installations, 4)
+                    if responding_installations
+                    else None
+                ),
+            }
+            for keys, installations in combination_installations.items()
+        ]
+        combinations.sort(
+            key=lambda item: (-item["installations"], item["choice_keys"])
+        )
+        arms.append(
+            {
+                "variant": variant,
+                "responding_installations": responding_installations,
+                "choices": choices,
+                "combinations": combinations,
+            }
+        )
+
+    return {
+        "experiment_id": experiment_id,
+        "app_version": app_version,
+        "analytics_environment": "production",
+        "arms": arms,
+    }
 
 
 @router.get(

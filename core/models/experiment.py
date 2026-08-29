@@ -49,3 +49,23 @@ class ExperimentConversion(SQLModel, table=True):
     trial_duration_days: int | None = None
     purchase_date_ms: int | None = None
     recorded_at_ms: int = Field(default_factory=current_time_ms)
+
+
+class ExperimentGoalSelection(SQLModel, table=True):
+    id: str = Field(
+        primary_key=True,
+        description="Stable experiment exposure ID; one final goal set per installation",
+    )
+    experiment_id: str = Field(index=True)
+    variant: str = Field(index=True)
+    eligible: bool = Field(index=True)
+    installation_id: str = Field(index=True)
+    exposure_id: str = Field(index=True)
+    app_version: str = Field(index=True)
+    build_number: str
+    analytics_environment: str = Field(index=True)
+    user_id: str = Field(index=True)
+    selected_goal_keys: str
+    selected_at_ms: int
+    first_reported_at_ms: int = Field(default_factory=current_time_ms)
+    last_reported_at_ms: int = Field(default_factory=current_time_ms)
