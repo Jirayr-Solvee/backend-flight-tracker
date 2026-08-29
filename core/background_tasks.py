@@ -16,6 +16,7 @@ from .models.email import S3EmailNotification
 from .models.flight import Flight, FlightStatusEnum, UserFlightLink
 from .models.live_activity import LiveActivityRegistration
 from .models.user import User
+from .services.activation_recovery import emit_due_activation_recovery_alerts
 from .services.apn.live_activity import LiveActivityService
 from .services.apn.service import ApnService
 from .services.flight import FlightPersistence
@@ -348,5 +349,17 @@ async def reconcile_live_activity_updates():
                 await LiveActivityService.send_updates_for_flight(flight_id)
         except Exception:
             logger.exception("Unable to reconcile Live Activity updates")
+
+        await asyncio.sleep(60)
+
+
+async def monitor_activation_recovery_alerts():
+    """Create a durable alert when verified-purchase recovery exceeds five minutes."""
+    while True:
+        try:
+            with Session(engine) as session:
+                emit_due_activation_recovery_alerts(session)
+        except Exception:
+            logger.exception("Unable to monitor post-purchase activation recovery")
 
         await asyncio.sleep(60)

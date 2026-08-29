@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 from typing import Literal
 from uuid import UUID
 
@@ -9,6 +10,7 @@ from sqlmodel import select
 
 from ..dependency import check_lambda_auth_token, get_current_user
 from ..models import Session, get_session
+from ..models.activation_recovery import PurchaseActivationRecovery
 from ..models.experiment import (
     ExperimentConversion,
     ExperimentExposure,
@@ -18,7 +20,7 @@ from ..models.experiment import (
 from ..models.subscription import Subscription
 from ..models.subscription_lifecycle import AppStoreSubscriptionLifecycleEvent
 from ..models.transaction import Transaction
-from ..models.user import User
+from ..models.user import User, UserSubscriptionLink
 from ..services.app_store.service import AppStoreService
 from ..services.revenue_measurement import upsert_verified_revenue_event
 from ..services.subscription_lifecycle import lifecycle_metrics
@@ -93,6 +95,30 @@ class ExperimentGoalSelectionRequest(BaseModel):
 class CreateTransactionRequest(BaseModel):
     jws_payload: str
     experiment: ExperimentContext | None = None
+
+
+class ActivationRecoveryRequest(BaseModel):
+    transaction_id: str = PydanticField(
+        min_length=1,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    )
+    state: Literal["recovery_pending", "resolved"]
+    flight_id: int | None = PydanticField(default=None, ge=1)
+    failure_reason: str | None = PydanticField(
+        default=None,
+        min_length=1,
+        max_length=80,
+        pattern=r"^[a-z0-9_]+$",
+    )
+
+    @model_validator(mode="after")
+    def validate_state_details(self):
+        if self.state == "recovery_pending" and self.failure_reason is None:
+            raise ValueError("failure_reason is required while recovery is pending")
+        if self.state == "resolved":
+            self.failure_reason = None
+        return self
 
 
 def _enum_value(value) -> str:
@@ -317,6 +343,151 @@ def report_experiment_goal_selection(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
         )
+
+
+def _verified_transaction_for_user(
+    transaction_id: str,
+    user: User,
+    session: Session,
+) -> Transaction:
+    transaction = session.get(Transaction, transaction_id)
+    if transaction is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Verified transaction was not found",
+        )
+
+    subscription_link = session.exec(
+        select(UserSubscriptionLink).where(
+            UserSubscriptionLink.user_id == user.id,
+            UserSubscriptionLink.subscription_id == transaction.subscription_id,
+        )
+    ).first()
+    if transaction.app_account_token != user.id and subscription_link is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Verified transaction was not found",
+        )
+    return transaction
+
+
+@router.post("/activation-recovery")
+def report_activation_recovery(
+    data: ActivationRecoveryRequest,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Track whether a verified purchase is still waiting for its flight."""
+
+    try:
+        transaction = _verified_transaction_for_user(
+            data.transaction_id,
+            user,
+            session,
+        )
+        if _enum_value(transaction.environment).casefold() != "production":
+            return {"detail": "ignored_non_production"}
+
+        recovery = session.get(PurchaseActivationRecovery, data.transaction_id)
+        current_time = int(time.time())
+
+        if data.state == "resolved":
+            if recovery is None:
+                return {"detail": "already_resolved"}
+            recovery.state = "resolved"
+            recovery.resolved_at = recovery.resolved_at or current_time
+            recovery.last_reported_at = current_time
+            recovery.failure_reason = None
+            if data.flight_id is not None:
+                recovery.flight_id = data.flight_id
+            session.add(recovery)
+            session.commit()
+            return {"detail": "resolved"}
+
+        if recovery is not None and recovery.state == "resolved":
+            return {"detail": "already_resolved"}
+
+        conversion = session.get(ExperimentConversion, data.transaction_id)
+        if recovery is None:
+            recovery = PurchaseActivationRecovery(
+                transaction_id=data.transaction_id,
+                original_transaction_id=transaction.subscription_id,
+                user_id=user.id,
+                first_pending_at=current_time,
+                alert_due_at=current_time + 300,
+                last_reported_at=current_time,
+            )
+
+        recovery.state = "recovery_pending"
+        recovery.last_reported_at = current_time
+        recovery.failure_reason = data.failure_reason
+        if data.flight_id is not None:
+            recovery.flight_id = data.flight_id
+        if conversion is not None:
+            recovery.experiment_variant = conversion.variant
+            recovery.app_version = conversion.conversion_app_version
+            recovery.build_number = conversion.conversion_build_number
+
+        session.add(recovery)
+        session.commit()
+        return {
+            "detail": "recovery_pending",
+            "alert_due_at": recovery.alert_due_at,
+        }
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception:
+        session.rollback()
+        logger.exception(
+            "Unable to record activation recovery user_id=%s transaction_id=%s",
+            user.id,
+            data.transaction_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
+
+
+@router.get(
+    "/activation-recovery/alerts",
+    dependencies=[Depends(check_lambda_auth_token)],
+)
+def get_activation_recovery_alerts(
+    include_resolved: bool = Query(default=False),
+    session: Session = Depends(get_session),
+):
+    statement = select(PurchaseActivationRecovery).where(
+        PurchaseActivationRecovery.alerted_at.is_not(None)
+    )
+    if not include_resolved:
+        statement = statement.where(
+            PurchaseActivationRecovery.state == "recovery_pending"
+        )
+
+    recoveries = session.exec(
+        statement.order_by(PurchaseActivationRecovery.alerted_at.desc())
+    ).all()
+    return {
+        "count": len(recoveries),
+        "alerts": [
+            {
+                "transaction_id": recovery.transaction_id,
+                "user_id": recovery.user_id,
+                "flight_id": recovery.flight_id,
+                "failure_reason": recovery.failure_reason,
+                "experiment_variant": recovery.experiment_variant,
+                "app_version": recovery.app_version,
+                "build_number": recovery.build_number,
+                "first_pending_at": recovery.first_pending_at,
+                "alerted_at": recovery.alerted_at,
+                "state": recovery.state,
+                "resolved_at": recovery.resolved_at,
+            }
+            for recovery in recoveries
+        ],
+    }
 
 
 @router.get(

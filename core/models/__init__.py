@@ -1,5 +1,6 @@
 from sqlmodel import Session, SQLModel, create_engine
 
+from .activation_recovery import PurchaseActivationRecovery
 from .apple_ads import AppleAdsAttribution, AppleAdsSpendDaily, AppStoreRevenueEvent
 from .device import Device
 from .experiment import (

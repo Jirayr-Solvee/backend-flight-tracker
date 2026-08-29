@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel
 
 from .background_tasks import (check_and_create_webhook_for_flight,
+                               monitor_activation_recovery_alerts,
                                reconcile_live_activity_updates,
                                remove_hanging_webhooks)
 from .config import settings
@@ -372,6 +373,7 @@ async def lifespan(app: FastAPI):
         remove_hanging_webhooks(),
         check_and_create_webhook_for_flight(),
         reconcile_live_activity_updates(),
+        monitor_activation_recovery_alerts(),
     ]
     tasks = [asyncio.create_task(fn) for fn in background_fn]
 
