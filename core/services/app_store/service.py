@@ -133,3 +133,44 @@ class AppStoreService:
             ),
         )
         return None
+
+    @staticmethod
+    def process_renewal_info(signed_renewal_info: str):
+        root_certs = AppStoreService._get_root_certs()
+        environments = get_apple_environments()
+        errors: list[Exception] = []
+
+        for environment in environments:
+            try:
+                verifier = AppStoreService._get_verifier(
+                    root_certs=root_certs,
+                    environment=environment,
+                )
+                payload = verifier.verify_and_decode_renewal_info(
+                    signed_renewal_info=signed_renewal_info
+                )
+
+                if environment != environments[0]:
+                    logger.info(
+                        "Accepted App Store renewal info using fallback environment=%s",
+                        AppStoreService._environment_name(environment),
+                    )
+
+                return payload
+            except Exception as exc:
+                errors.append(exc)
+
+        attempted = [
+            AppStoreService._environment_name(environment)
+            for environment in environments
+        ]
+        logger.error(
+            "process_renewal_info failed to decode signed payload after attempted_environments=%s",
+            attempted,
+            exc_info=(
+                (type(errors[-1]), errors[-1], errors[-1].__traceback__)
+                if errors
+                else None
+            ),
+        )
+        return None

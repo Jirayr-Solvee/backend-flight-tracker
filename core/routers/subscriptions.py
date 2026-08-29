@@ -11,10 +11,12 @@ from ..dependency import check_lambda_auth_token, get_current_user
 from ..models import Session, get_session
 from ..models.experiment import ExperimentConversion, ExperimentExposure
 from ..models.subscription import Subscription
+from ..models.subscription_lifecycle import AppStoreSubscriptionLifecycleEvent
 from ..models.transaction import Transaction
 from ..models.user import User
 from ..services.app_store.service import AppStoreService
 from ..services.revenue_measurement import upsert_verified_revenue_event
+from ..services.subscription_lifecycle import lifecycle_metrics
 from ..utils import calculate_premium_valid_until
 
 logger = logging.getLogger(__name__)
@@ -283,6 +285,100 @@ def get_experiment_summary(
         "experiment_id": experiment_id,
         "app_version": app_version,
         "analytics_environment": "production",
+        "purchase_environment": "Production",
+        "arms": arms,
+    }
+
+
+LIFECYCLE_METRIC_NAMES = (
+    "auto_renew_disabled",
+    "auto_renew_enabled",
+    "renewal",
+    "expiration",
+    "billing_failure",
+    "grace_period_started",
+    "grace_period_expired",
+    "refund",
+    "refund_reversed",
+    "refund_declined",
+)
+
+
+@router.get(
+    "/experiments/{experiment_id}/lifecycle-summary",
+    dependencies=[Depends(check_lambda_auth_token)],
+)
+def get_experiment_lifecycle_summary(
+    experiment_id: str,
+    app_version: str | None = Query(default=None, max_length=40),
+    session: Session = Depends(get_session),
+):
+    conversion_statement = select(ExperimentConversion).where(
+        ExperimentConversion.experiment_id == experiment_id,
+        ExperimentConversion.eligible == True,  # noqa: E712
+        ExperimentConversion.analytics_environment == "production",
+        ExperimentConversion.purchase_environment == "Production",
+    )
+    if app_version:
+        conversion_statement = conversion_statement.where(
+            ExperimentConversion.app_version == app_version
+        )
+    conversions = session.exec(conversion_statement).all()
+
+    assignments: dict[str, str] = {}
+    tracked_subscriptions: dict[str, set[str]] = {}
+    for conversion in conversions:
+        assignments.setdefault(conversion.original_transaction_id, conversion.variant)
+        tracked_subscriptions.setdefault(conversion.variant, set()).add(
+            conversion.original_transaction_id
+        )
+
+    events = session.exec(
+        select(AppStoreSubscriptionLifecycleEvent).where(
+            AppStoreSubscriptionLifecycleEvent.purchase_environment == "Production"
+        )
+    ).all()
+    metric_event_ids: dict[str, dict[str, set[str]]] = {}
+    metric_subscription_ids: dict[str, dict[str, set[str]]] = {}
+    for event in events:
+        if not event.original_transaction_id:
+            continue
+        variant = assignments.get(event.original_transaction_id)
+        if not variant:
+            continue
+        for metric in lifecycle_metrics(event):
+            metric_event_ids.setdefault(variant, {}).setdefault(metric, set()).add(
+                event.id
+            )
+            metric_subscription_ids.setdefault(variant, {}).setdefault(
+                metric, set()
+            ).add(event.original_transaction_id)
+
+    variants = sorted(set(tracked_subscriptions) | set(metric_event_ids))
+    arms = []
+    for variant in variants:
+        arm_event_ids = metric_event_ids.get(variant, {})
+        arm_subscription_ids = metric_subscription_ids.get(variant, {})
+        arms.append(
+            {
+                "variant": variant,
+                "tracked_subscriptions": len(
+                    tracked_subscriptions.get(variant, set())
+                ),
+                "events": {
+                    metric: len(arm_event_ids.get(metric, set()))
+                    for metric in LIFECYCLE_METRIC_NAMES
+                },
+                "affected_subscriptions": {
+                    metric: len(arm_subscription_ids.get(metric, set()))
+                    for metric in LIFECYCLE_METRIC_NAMES
+                },
+            }
+        )
+
+    return {
+        "experiment_id": experiment_id,
+        "app_version": app_version,
         "purchase_environment": "Production",
         "arms": arms,
     }

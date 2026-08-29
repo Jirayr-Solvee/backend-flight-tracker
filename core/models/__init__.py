@@ -7,6 +7,7 @@ from .flight import Airline, Airport, Arrival, Departure, Flight
 from .live_activity import LiveActivityRegistration
 from .search_failure import SearchFailureSample
 from .subscription import Subscription
+from .subscription_lifecycle import AppStoreSubscriptionLifecycleEvent
 from .transaction import Transaction
 
 DATABASE_URL = "sqlite:///./database.db"
