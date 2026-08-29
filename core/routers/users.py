@@ -12,7 +12,10 @@ from ..dependency import check_guest_auth_token, get_current_user
 from ..models import get_session
 from ..models.device import Device
 from ..models.flight import Flight, FlightRead
-from ..models.live_activity import LiveActivityRegistration
+from ..models.live_activity import (
+    LiveActivityPushToStartRegistration,
+    LiveActivityRegistration,
+)
 from ..models.user import User, UserFlightLink
 from ..services.apn.live_activity import LiveActivityService
 from ..utils import create_jwt, verify_apple_identity_token
@@ -214,6 +217,95 @@ class RegisterLiveActivityRequest(BaseModel):
         except ValueError as error:
             raise ValueError("push_token must be hexadecimal") from error
         return normalized
+
+
+class RegisterLiveActivityPushToStartRequest(BaseModel):
+    device_id: str
+    push_token: str = Field(min_length=32, max_length=512)
+    apns_environment: Literal["sandbox", "production"] = "production"
+    uses_12_hour_time: bool = False
+
+    @field_validator("push_token")
+    @classmethod
+    def validate_push_token(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if len(normalized) % 2 != 0:
+            raise ValueError("push_token must contain full bytes")
+        try:
+            bytes.fromhex(normalized)
+        except ValueError as error:
+            raise ValueError("push_token must be hexadecimal") from error
+        return normalized
+
+
+@router.put("/me/live-activity-push-to-start", response_model=dict)
+def register_live_activity_push_to_start(
+    data: RegisterLiveActivityPushToStartRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Register or rotate this device's ActivityKit push-to-start token."""
+    device = session.exec(
+        select(Device).where(
+            Device.id == data.device_id,
+            Device.user_id == user.id,
+        )
+    ).first()
+    if device is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Device not found",
+        )
+
+    try:
+        registration = session.get(
+            LiveActivityPushToStartRegistration, data.device_id
+        )
+        now = int(time.time())
+        if registration is None:
+            registration = LiveActivityPushToStartRegistration(
+                device_id=data.device_id,
+                push_token=data.push_token,
+                apns_environment=data.apns_environment,
+                uses_12_hour_time=data.uses_12_hour_time,
+                created_at=now,
+                updated_at=now,
+            )
+        else:
+            token_changed = registration.push_token != data.push_token
+            registration.push_token = data.push_token
+            registration.apns_environment = data.apns_environment
+            registration.uses_12_hour_time = data.uses_12_hour_time
+            registration.active = True
+            registration.updated_at = now
+            if token_changed:
+                registration.last_started_flight_id = None
+                registration.last_start_at = None
+                registration.last_apns_status = None
+                registration.last_apns_reason = None
+
+        session.add(registration)
+        session.commit()
+        background_tasks.add_task(
+            LiveActivityService.start_due_activities, data.device_id
+        )
+        logger.info(
+            "Live Activity push-to-start token registered: device_id=%s environment=%s",
+            data.device_id,
+            data.apns_environment,
+        )
+        return {"detail": "Live Activity push-to-start token registered"}
+    except Exception:
+        session.rollback()
+        logger.exception(
+            "Unable to register Live Activity push-to-start token: device_id=%s",
+            data.device_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
 
 
 @router.put("/me/live-activities/{activity_id}", response_model=dict)

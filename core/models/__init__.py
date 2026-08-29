@@ -8,7 +8,10 @@ from .experiment import (
     ExperimentGoalSelection,
 )
 from .flight import Airline, Airport, Arrival, Departure, Flight
-from .live_activity import LiveActivityRegistration
+from .live_activity import (
+    LiveActivityPushToStartRegistration,
+    LiveActivityRegistration,
+)
 from .search_failure import SearchFailureSample
 from .subscription import Subscription
 from .subscription_lifecycle import AppStoreSubscriptionLifecycleEvent

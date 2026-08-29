@@ -47,15 +47,24 @@ for key, value in {
 
 from core.models.device import Device
 from core.models.flight import Airline, Airport, Arrival, Departure, Flight
-from core.models.live_activity import LiveActivityRegistration
+from core.models.live_activity import (
+    LiveActivityPushToStartRegistration,
+    LiveActivityRegistration,
+)
 from core.models.user import User, UserFlightLink
 from core.background_tasks import create_webhook_for_flight
 from core.routers.users import (
+    RegisterLiveActivityPushToStartRequest,
     RegisterLiveActivityRequest,
     register_live_activity,
+    register_live_activity_push_to_start,
     unregister_live_activity,
 )
-from core.services.apn.live_activity import LiveActivityService, make_live_activity_payload
+from core.services.apn.live_activity import (
+    LiveActivityService,
+    make_live_activity_payload,
+    make_push_to_start_payload,
+)
 
 
 class LiveActivityPayloadTests(unittest.TestCase):
@@ -169,6 +178,21 @@ class LiveActivityPayloadTests(unittest.TestCase):
         self.assertEqual(state["progress"], 1.0)
         self.assertEqual(state["departureTimeLabel"], "9:25 AM")
         self.assertEqual(state["arrivalTimeLabel"], "5:55 PM")
+
+    def test_push_to_start_payload_contains_attributes_and_initial_state(self):
+        now = datetime(2026, 8, 3, 13, 0, tzinfo=timezone.utc)
+
+        payload = make_push_to_start_payload(self._flight(), now=now)
+        aps = payload["aps"]
+
+        self.assertEqual(aps["event"], "start")
+        self.assertEqual(aps["attributes-type"], "mainWidgetAttributes")
+        self.assertEqual(aps["attributes"], {"flightId": 42})
+        self.assertEqual(aps["content-state"]["flightId"], 42)
+        self.assertEqual(
+            aps["alert"]["title-loc-key"],
+            "Live tracking started for %@",
+        )
 
 
 class LiveActivityRegistrationTests(unittest.TestCase):
@@ -291,8 +315,128 @@ class LiveActivityRegistrationTests(unittest.TestCase):
 
             self.assertEqual(raised.exception.status_code, 409)
 
+    def test_push_to_start_registration_is_scoped_to_the_users_device(self):
+        with Session(self.engine) as session:
+            user, device, _ = self._seed_registration_owner(session)
+            background_tasks = BackgroundTasks()
+
+            response = register_live_activity_push_to_start(
+                data=RegisterLiveActivityPushToStartRequest(
+                    device_id=device.id,
+                    push_token="ab" * 32,
+                    apns_environment="sandbox",
+                    uses_12_hour_time=True,
+                ),
+                background_tasks=background_tasks,
+                user=user,
+                session=session,
+            )
+
+            self.assertEqual(
+                response,
+                {"detail": "Live Activity push-to-start token registered"},
+            )
+            self.assertEqual(len(background_tasks.tasks), 1)
+            self.assertIs(
+                background_tasks.tasks[0].func,
+                LiveActivityService.start_due_activities,
+            )
+            registration = session.get(
+                LiveActivityPushToStartRegistration, device.id
+            )
+            self.assertIsNotNone(registration)
+            self.assertEqual(registration.push_token, "ab" * 32)
+            self.assertEqual(registration.apns_environment, "sandbox")
+            self.assertTrue(registration.uses_12_hour_time)
+
+            registration.last_started_flight_id = 42
+            registration.last_start_at = 123
+            session.add(registration)
+            session.commit()
+            register_live_activity_push_to_start(
+                data=RegisterLiveActivityPushToStartRequest(
+                    device_id=device.id,
+                    push_token="cd" * 32,
+                    apns_environment="sandbox",
+                    uses_12_hour_time=True,
+                ),
+                background_tasks=BackgroundTasks(),
+                user=user,
+                session=session,
+            )
+            session.refresh(registration)
+            self.assertEqual(registration.push_token, "cd" * 32)
+            self.assertIsNone(registration.last_started_flight_id)
+            self.assertIsNone(registration.last_start_at)
+
 
 class LiveActivityDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_due_flight_is_started_once_with_push_to_start_token(self):
+        test_engine = create_engine("sqlite://")
+        SQLModel.metadata.create_all(test_engine)
+
+        with Session(test_engine) as session:
+            user = User(id="user-start")
+            device = Device(id="device-start", user_id=user.id)
+            flight = LiveActivityPayloadTests._flight(status="Expected")
+            session.add(user)
+            session.add(device)
+            session.add(flight)
+            session.commit()
+            session.refresh(flight)
+            session.add(UserFlightLink(user_id=user.id, flight_id=flight.id))
+            session.add(
+                LiveActivityPushToStartRegistration(
+                    device_id=device.id,
+                    push_token="ab" * 32,
+                    apns_environment="sandbox",
+                )
+            )
+            session.commit()
+            flight_id = flight.id
+
+        class FakeAPNsClient:
+            def __init__(self):
+                self.requests = []
+
+            async def send_notification(self, request):
+                self.requests.append(request)
+                return NotificationResult(
+                    notification_id=request.notification_id,
+                    status="200",
+                )
+
+        client = FakeAPNsClient()
+        now = datetime(2026, 8, 3, 13, 0, tzinfo=timezone.utc)
+        with mock.patch(
+            "core.services.apn.live_activity.engine", test_engine
+        ), mock.patch(
+            "core.services.apn.live_activity.get_apns_client",
+            return_value=client,
+        ) as client_factory:
+            await LiveActivityService.start_due_activities(
+                device_id="device-start",
+                now=now,
+            )
+            await LiveActivityService.start_due_activities(
+                device_id="device-start",
+                now=now,
+            )
+
+        self.assertEqual(len(client.requests), 1)
+        request = client.requests[0]
+        self.assertEqual(request.push_type, PushType.LIVEACTIVITY)
+        self.assertEqual(request.message["aps"]["event"], "start")
+        self.assertEqual(request.message["aps"]["attributes"]["flightId"], flight_id)
+        client_factory.assert_called_with(use_sandbox=True)
+
+        with Session(test_engine) as session:
+            registration = session.get(
+                LiveActivityPushToStartRegistration, "device-start"
+            )
+            self.assertEqual(registration.last_started_flight_id, flight_id)
+            self.assertEqual(registration.last_apns_status, "200")
+
     async def test_delivery_uses_liveactivity_topic_deduplicates_and_ends(self):
         test_engine = create_engine("sqlite://")
         SQLModel.metadata.create_all(test_engine)

@@ -22,3 +22,21 @@ class LiveActivityRegistration(SQLModel, table=True):
     last_apns_status: str | None = None
     last_apns_reason: str | None = None
     last_content_state_json: str | None = None
+
+
+class LiveActivityPushToStartRegistration(SQLModel, table=True):
+    """A device token that can start this app's Live Activity while closed."""
+
+    __tablename__ = "live_activity_push_to_start_registration"
+
+    device_id: str = Field(foreign_key="device.id", primary_key=True)
+    push_token: str = Field(index=True)
+    apns_environment: str = Field(default="production")
+    uses_12_hour_time: bool = Field(default=False)
+    active: bool = Field(default=True, index=True)
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    updated_at: int = Field(default_factory=lambda: int(time.time()))
+    last_started_flight_id: int | None = Field(default=None, index=True)
+    last_start_at: int | None = None
+    last_apns_status: str | None = None
+    last_apns_reason: str | None = None

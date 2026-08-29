@@ -11,8 +11,13 @@ from sqlmodel import Session, select
 
 from ...config import settings
 from ...models import engine
+from ...models.device import Device
 from ...models.flight import Flight, FlightOriginAndDestinationInformation
-from ...models.live_activity import LiveActivityRegistration
+from ...models.live_activity import (
+    LiveActivityPushToStartRegistration,
+    LiveActivityRegistration,
+)
+from ...models.user import UserFlightLink
 from .service import get_apns_client
 
 logger = logging.getLogger(__name__)
@@ -26,6 +31,18 @@ INVALID_TOKEN_REASONS = {
     "Unregistered",
 }
 TRANSIENT_APNS_STATUSES = {"429", "500", "503"}
+PUSH_TO_START_WINDOW = timedelta(hours=4)
+PUSH_TO_START_ACTIVE_LOOKBACK = timedelta(hours=12)
+PUSH_TO_START_STATUSES = {
+    "Expected",
+    "EnRoute",
+    "CheckIn",
+    "Boarding",
+    "GateClosed",
+    "Departed",
+    "Delayed",
+    "Approaching",
+}
 
 
 def _status_value(flight: Flight) -> str:
@@ -215,7 +232,170 @@ def make_live_activity_payload(
     return {"aps": aps}, event, content_state_json
 
 
+def make_push_to_start_payload(
+    flight: Flight,
+    *,
+    uses_12_hour_time: bool = False,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    now = now or datetime.now(timezone.utc)
+    content_state = make_content_state(
+        flight, uses_12_hour_time=uses_12_hour_time
+    )
+    aps: dict[str, Any] = {
+        "timestamp": int(now.timestamp()),
+        "event": "start",
+        "attributes-type": "mainWidgetAttributes",
+        "attributes": {"flightId": flight.id},
+        "content-state": content_state,
+        "alert": {
+            "title-loc-key": "Live tracking started for %@",
+            "title-loc-args": [flight.number],
+            "loc-key": (
+                "Sofly is monitoring live status, gate, terminal, and delay updates."
+            ),
+            "sound": "default",
+        },
+    }
+    arrival_date = _preferred_utc(flight.arrival)
+    if arrival_date is not None:
+        aps["stale-date"] = int((arrival_date + timedelta(hours=1)).timestamp())
+    return {"aps": aps}
+
+
+def _push_to_start_candidate(
+    flights: list[Flight], now: datetime
+) -> Flight | None:
+    candidates: list[tuple[datetime, Flight]] = []
+    for flight in flights:
+        status = _status_value(flight)
+        if status not in PUSH_TO_START_STATUSES:
+            continue
+
+        departure = _preferred_utc(flight.departure)
+        arrival = _preferred_utc(flight.arrival)
+        if departure is None or arrival is None:
+            continue
+        if departure > now + PUSH_TO_START_WINDOW:
+            continue
+        if departure < now - PUSH_TO_START_ACTIVE_LOOKBACK:
+            continue
+        if arrival < now:
+            continue
+        candidates.append((departure, flight))
+
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])[1]
+
+
 class LiveActivityService:
+    @staticmethod
+    async def start_due_activities(
+        device_id: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        with Session(engine) as session:
+            statement = select(LiveActivityPushToStartRegistration).where(
+                LiveActivityPushToStartRegistration.active == True  # noqa: E712
+            )
+            if device_id is not None:
+                statement = statement.where(
+                    LiveActivityPushToStartRegistration.device_id == device_id
+                )
+            registrations = list(session.exec(statement).all())
+            if not registrations:
+                return
+
+            now = now or datetime.now(timezone.utc)
+            for registration in registrations:
+                device = session.get(Device, registration.device_id)
+                if device is None:
+                    registration.active = False
+                    registration.updated_at = int(now.timestamp())
+                    session.add(registration)
+                    continue
+
+                flights = list(
+                    session.exec(
+                        select(Flight)
+                        .join(UserFlightLink)  # type: ignore[arg-type]
+                        .where(UserFlightLink.user_id == device.user_id)
+                    ).all()
+                )
+                flight = _push_to_start_candidate(flights, now)
+                if flight is None or registration.last_started_flight_id == flight.id:
+                    continue
+
+                payload = make_push_to_start_payload(
+                    flight,
+                    uses_12_hour_time=registration.uses_12_hour_time,
+                    now=now,
+                )
+                request = NotificationRequest(
+                    device_token=registration.push_token,
+                    message=payload,
+                    notification_id=str(uuid.uuid4()),
+                    time_to_live=3_600,
+                    priority=10,
+                    collapse_key=f"flight-start-{flight.id}",
+                    push_type=PushType.LIVEACTIVITY,
+                    apns_topic=f"{settings.BUNDLE_ID}.push-type.liveactivity",
+                )
+
+                result = None
+                try:
+                    for attempt in range(1, 4):
+                        result = await get_apns_client(
+                            use_sandbox=registration.apns_environment == "sandbox"
+                        ).send_notification(request)
+                        if (
+                            result.is_successful
+                            or str(result.status) not in TRANSIENT_APNS_STATUSES
+                        ):
+                            break
+                        if attempt < 3:
+                            await asyncio.sleep(float(attempt))
+                except Exception as error:
+                    registration.last_apns_status = "exception"
+                    registration.last_apns_reason = type(error).__name__
+                    registration.updated_at = int(time.time())
+                    session.add(registration)
+                    logger.exception(
+                        "Live Activity push-to-start delivery raised: device_id=%s flight_id=%s",
+                        registration.device_id,
+                        flight.id,
+                    )
+                    continue
+
+                registration.updated_at = int(time.time())
+                if result is None:
+                    registration.last_apns_status = "no_response"
+                    registration.last_apns_reason = "No APNs result"
+                else:
+                    registration.last_apns_status = str(result.status)
+                    registration.last_apns_reason = str(result.description)
+                    if result.is_successful:
+                        registration.last_started_flight_id = flight.id
+                        registration.last_start_at = int(time.time())
+                        logger.info(
+                            "Live Activity push-to-start delivered: device_id=%s flight_id=%s apns_id=%s",
+                            registration.device_id,
+                            flight.id,
+                            request.notification_id,
+                        )
+                    elif str(result.description) in INVALID_TOKEN_REASONS:
+                        registration.active = False
+                        logger.warning(
+                            "Live Activity push-to-start token rejected: device_id=%s status=%s reason=%s",
+                            registration.device_id,
+                            result.status,
+                            result.description,
+                        )
+                session.add(registration)
+
+            session.commit()
+
     @staticmethod
     async def send_updates_for_flight(flight_id: int) -> None:
         with Session(engine) as session:

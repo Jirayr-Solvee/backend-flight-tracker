@@ -330,6 +330,11 @@ async def reconcile_live_activity_updates():
     """Retry changed ActivityKit states independently of request background tasks."""
     while True:
         try:
+            await LiveActivityService.start_due_activities()
+        except Exception:
+            logger.exception("Unable to start due Live Activities")
+
+        try:
             with Session(engine) as session:
                 flight_ids = set(
                     session.exec(
