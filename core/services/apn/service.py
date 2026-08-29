@@ -125,19 +125,32 @@ class ApnService:
         tasks = []
 
         for device in notification_batch.devices:
+            notification = notification_batch.notification
+            alert: dict[str, object] = {
+                "title": notification.title,
+                "body": notification.body,
+            }
+            if device.supports_localized_push:
+                if notification.title_loc_key:
+                    alert["title-loc-key"] = notification.title_loc_key
+                    alert["title-loc-args"] = notification.title_loc_args
+                    alert.pop("title", None)
+                if notification.body_loc_key:
+                    alert["loc-key"] = notification.body_loc_key
+                    alert["loc-args"] = notification.body_loc_args
+                    alert.pop("body", None)
+
             request = NotificationRequest(
                 device_token=device.token,
                 message={
                     "aps": {
-                        "alert": {
-                            "title": notification_batch.notification.title,
-                            "body": notification_batch.notification.body,
-                        },
+                        "alert": alert,
                         "badge": device.badge,
                     },
-                    **notification_batch.notification.apns_custom_payload(),
+                    **notification.apns_custom_payload(),
+                    "request_review": notification_batch.invoke_review,
                 },
-                notification_id=notification_batch.notification.notification_id,
+                notification_id=notification.notification_id,
                 time_to_live=3600,
                 push_type=PushType.ALERT,
             )
@@ -156,7 +169,12 @@ class ApnService:
         Return a list of FCM tokens of all users linked to a specific flight
         """
         stmt = (
-            select(User.id, Device.apn_token, User.notification_count)
+            select(
+                User.id,
+                Device.apn_token,
+                User.notification_count,
+                Device.supports_localized_push,
+            )
             .join(User)  # type: ignore
             .join(UserFlightLink)  # type: ignore
             .join(Flight)  # type: ignore
@@ -173,7 +191,16 @@ class ApnService:
         result = session.exec(stmt).all()
 
         if result:
-            return [DeviceInfo(token=token, badge=notification_count + 1, user_id=user_id, notification_count=notification_count) for user_id, token, notification_count in result]  # type: ignore
+            return [
+                DeviceInfo(
+                    token=token,
+                    badge=notification_count + 1,
+                    user_id=user_id,
+                    notification_count=notification_count,
+                    supports_localized_push=supports_localized_push,
+                )
+                for user_id, token, notification_count, supports_localized_push in result
+            ]  # type: ignore
 
         return []
 
@@ -206,6 +233,21 @@ class ApnService:
         }
 
         body = status_messages.get(status, "Your flight STATUS have been changed")
+        priority_by_status = {
+            FlightStatusEnum.CANCELED: 120,
+            FlightStatusEnum.DIVERTED: 120,
+            FlightStatusEnum.CANCELEDUNCERTAIN: 115,
+            FlightStatusEnum.DELAYED: 110,
+            FlightStatusEnum.BOARDING: 105,
+            FlightStatusEnum.GATECLOSED: 105,
+            FlightStatusEnum.DEPARTED: 100,
+            FlightStatusEnum.ARRIVED: 100,
+            FlightStatusEnum.CHECKIN: 95,
+            FlightStatusEnum.APPROACHING: 90,
+            FlightStatusEnum.ENROUTE: 85,
+            FlightStatusEnum.EXPECTED: 40,
+            FlightStatusEnum.UNKNOWN: 10,
+        }
 
         return Notification(
             title=title,
@@ -214,6 +256,10 @@ class ApnService:
             update_type="status",
             previous_value=previous_status,
             new_value=status.value,
+            title_loc_key="Flight %@ status updated",
+            title_loc_args=[flight_full_number],
+            body_loc_key=body,
+            priority=priority_by_status.get(status, 80),
         )
 
     @staticmethod
@@ -236,7 +282,7 @@ class ApnService:
 
         batch = NotificationBatch(notification=notification, devices=devices_info)
 
-        if status == FlightStatusEnum.ARRIVED:
+        if status not in {FlightStatusEnum.UNKNOWN, FlightStatusEnum.EXPECTED}:
             batch.invoke_review = True
 
         return batch
@@ -284,6 +330,15 @@ class ApnService:
                     flight_id=flight_id,
                     update_type="time",
                     new_value=new_time_stamp,
+                    title_loc_key="Flight %@ schedule updated",
+                    title_loc_args=[flight_number],
+                    body_loc_key=(
+                        "A new departure time is available for flight %@."
+                        if location_type == "Departure"
+                        else "A new arrival time is available for flight %@."
+                    ),
+                    body_loc_args=[flight_number],
+                    priority=55,
                 ),
                 False,
             )
@@ -305,8 +360,12 @@ class ApnService:
                     update_type="time",
                     previous_value=old_time_stamp,
                     new_value=new_time_stamp,
+                    title_loc_key="Flight %@ schedule updated",
+                    title_loc_args=[flight_number],
+                    body_loc_key="Flight schedule information has been updated.",
+                    priority=60,
                 ),
-                False,
+                True,
             )
 
         # delay
@@ -324,6 +383,15 @@ class ApnService:
                     update_type="delay",
                     previous_value=old_time_stamp,
                     new_value=new_time_stamp,
+                    title_loc_key="Flight %@ schedule updated",
+                    title_loc_args=[flight_number],
+                    body_loc_key=(
+                        "Flight %@ departure is delayed by %@ min."
+                        if location_type == "Departure"
+                        else "Flight %@ arrival is delayed by %@ min."
+                    ),
+                    body_loc_args=[flight_number, str(difference_in_minutes)],
+                    priority=115,
                 ),
                 True,
             )
@@ -343,8 +411,17 @@ class ApnService:
                     update_type="time",
                     previous_value=old_time_stamp,
                     new_value=new_time_stamp,
+                    title_loc_key="Flight %@ schedule updated",
+                    title_loc_args=[flight_number],
+                    body_loc_key=(
+                        "Flight %@ departure moved %@ min earlier."
+                        if location_type == "Departure"
+                        else "Flight %@ arrival moved %@ min earlier."
+                    ),
+                    body_loc_args=[flight_number, str(abs(difference_in_minutes))],
+                    priority=90,
                 ),
-                False,
+                True,
             )
 
         # on time
@@ -362,8 +439,17 @@ class ApnService:
                     update_type="time",
                     previous_value=old_time_stamp,
                     new_value=new_time_stamp,
+                    title_loc_key="Flight %@ schedule updated",
+                    title_loc_args=[flight_number],
+                    body_loc_key=(
+                        "Flight %@ departure remains on time."
+                        if location_type == "Departure"
+                        else "Flight %@ arrival remains on time."
+                    ),
+                    body_loc_args=[flight_number],
+                    priority=65,
                 ),
-                False,
+                True,
             )
         
 
@@ -404,7 +490,7 @@ class ApnService:
     ) -> Notification:
         if not old_value and new_value:
             title = f"New {location_type} {gate_type} available"
-            body = f"A new {gate_type.lower()} is now available for flight {flight_number}."
+            body = f"{gate_type.capitalize()} {new_value} is now available for flight {flight_number}."
         else:
             title = f"{location_type} {gate_type} changed"
             body = f"The {gate_type.lower()} has changed from {old_value} to {new_value} for flight {flight_number}."
@@ -415,6 +501,19 @@ class ApnService:
             "baggage belt": "baggage",
             "checkin desk": "check_in",
         }
+        loc_field_names = {
+            "gate": "Gate",
+            "terminal": "Terminal",
+            "baggage belt": "Baggage belt",
+            "checkin desk": "Check-in desk",
+        }
+        loc_field = loc_field_names.get(gate_type, "Flight detail")
+        if old_value:
+            body_loc_key = f"{loc_field} changed from %@ to %@ for flight %@."
+            body_loc_args = [old_value, new_value or "", flight_number]
+        else:
+            body_loc_key = f"{loc_field} %@ is now available for flight %@."
+            body_loc_args = [new_value or "", flight_number]
 
         return Notification(
             title=title,
@@ -423,6 +522,16 @@ class ApnService:
             update_type=update_type_by_field.get(gate_type, "flight_details"),
             previous_value=old_value or "",
             new_value=new_value or "",
+            title_loc_key="Flight %@ details updated",
+            title_loc_args=[flight_number],
+            body_loc_key=body_loc_key,
+            body_loc_args=body_loc_args,
+            priority={
+                "gate": 110,
+                "terminal": 95,
+                "checkin desk": 90,
+                "baggage belt": 85,
+            }.get(gate_type, 75),
         )
 
     @staticmethod
@@ -444,7 +553,11 @@ class ApnService:
             flight_number=flight_number,
         )
 
-        return NotificationBatch(notification=notification, devices=devices_info)
+        return NotificationBatch(
+            notification=notification,
+            devices=devices_info,
+            invoke_review=True,
+        )
 
     @staticmethod
     def create_aircraft_updated_notification(
@@ -459,12 +572,20 @@ class ApnService:
 
         if not old_reg and new_reg:
             body = f"Aircraft {new_reg} ({new_model or 'Unknown Model'}) has been assigned to your flight."
+            body_loc_key = "Aircraft %@ (%@) has been assigned to your flight."
+            body_loc_args = [new_reg, new_model or "Unknown model"]
         elif old_reg != new_reg:
             body = f"Aircraft changed to {new_reg} ({new_model or 'Unknown Model'})."
+            body_loc_key = "Aircraft changed to %@ (%@)."
+            body_loc_args = [new_reg or "", new_model or "Unknown model"]
         elif old_model != new_model:
             body = f"The aircraft model for your flight {new_reg} has been updated to {new_model}."
+            body_loc_key = "Aircraft %@ model updated to %@."
+            body_loc_args = [new_reg or "", new_model or "Unknown model"]
         else:
             body = f"Aircraft information has been updated for flight {flight_number}."
+            body_loc_key = "Aircraft information has been updated for flight %@."
+            body_loc_args = [flight_number]
 
         previous_value = old_reg or old_model or ""
         new_value = new_reg or new_model or ""
@@ -476,6 +597,11 @@ class ApnService:
             update_type="aircraft",
             previous_value=previous_value,
             new_value=new_value,
+            title_loc_key="Aircraft updated for %@",
+            title_loc_args=[flight_number],
+            body_loc_key=body_loc_key,
+            body_loc_args=body_loc_args,
+            priority=50,
         )
 
     @staticmethod
@@ -497,4 +623,8 @@ class ApnService:
             new_model=new_model,
         )
 
-        return NotificationBatch(notification=notification, devices=devices_info)
+        return NotificationBatch(
+            notification=notification,
+            devices=devices_info,
+            invoke_review=True,
+        )

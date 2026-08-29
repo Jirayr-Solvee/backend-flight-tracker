@@ -142,6 +142,7 @@ async def create_user(
 class RefreshApnToken(BaseModel):
     device_id: str
     apn_token: str
+    supports_localized_push: bool = False
 
 
 @router.put("/me/apn/refresh", response_model=dict)
@@ -174,6 +175,7 @@ def refresh_apn_token(
         # at this opint of time teh only thing left is to activate it ( or transfer it into teh new user)
         device.apn_token = data.apn_token
         device.apn_token_active = True
+        device.supports_localized_push = data.supports_localized_push
         device.user_id = user.id
         session.add(device)
         session.commit()

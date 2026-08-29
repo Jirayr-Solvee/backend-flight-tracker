@@ -29,6 +29,23 @@ logger = logging.getLogger(__name__)
 from ..services.flight import FlightPersistence
 
 
+def partition_notification_refresh_tokens(
+    notification_batches: list[NotificationBatch],
+) -> tuple[set[str], set[str]]:
+    refresh_tokens: set[str] = set()
+    review_tokens: set[str] = set()
+
+    for batch in notification_batches:
+        tokens = {device.token for device in batch.devices}
+        if batch.invoke_review:
+            review_tokens.update(tokens)
+        else:
+            refresh_tokens.update(tokens)
+
+    refresh_tokens -= review_tokens
+    return refresh_tokens, review_tokens
+
+
 @router.post("/aerodatabox", summary="Receive flight updates from AeroDataBox")
 async def receive_aerodatabox_update(
     payload: FlightNotificationContract,
@@ -117,31 +134,24 @@ async def receive_aerodatabox_update(
 
         session.commit()
 
-        async def send_mutiple_batches(notification_batchs: list[NotificationBatch]):
-            tokens = set()
-            review_tokens = set()
-
-            for batch in notification_batchs:
-                tks = [dv.token for dv in batch.devices]
-                if batch.invoke_review:
-                    tokens.update(tks)
-                else:
-                    review_tokens.update(tks)
-
+        async def send_multiple_batches(notification_batches: list[NotificationBatch]):
+            for batch in notification_batches:
                 await ApnService.send_multiple_push_notification(
                     notification_batch=batch
                 )
 
-            tokens -= review_tokens
+            refresh_tokens, review_tokens = partition_notification_refresh_tokens(
+                notification_batches
+            )
 
-            if tokens:
-                await ApnService.send_multiple_silent_push_notification(tokens=list(tokens), invoke_review=False)
+            if refresh_tokens:
+                await ApnService.send_multiple_silent_push_notification(tokens=list(refresh_tokens), invoke_review=False)
 
             if review_tokens:
                 await ApnService.send_multiple_silent_push_notification(tokens=list(review_tokens), invoke_review=True)
 
         if global_notification_batchs:
-            background_tasks.add_task(send_mutiple_batches, global_notification_batchs)
+            background_tasks.add_task(send_multiple_batches, global_notification_batchs)
 
         # ActivityKit updates use a separate per-activity APNs token. Schedule
         # them after the database commit so the payload always reflects the

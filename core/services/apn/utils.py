@@ -67,7 +67,30 @@ def extract_all_notifications_for_flight(
         )
         notification_batches.extend(nested_notifications_batches)
 
-    return notification_batches
+    return consolidate_notification_batches(notification_batches)
+
+
+def consolidate_notification_batches(
+    notification_batches: list[NotificationBatch],
+) -> list[NotificationBatch]:
+    """Return at most one useful visible alert for a provider snapshot."""
+    if not notification_batches:
+        return []
+
+    _, primary = max(
+        enumerate(notification_batches),
+        key=lambda item: (item[1].notification.priority, -item[0]),
+    )
+
+    return [
+        primary.model_copy(
+            update={
+                "invoke_review": any(
+                    batch.invoke_review for batch in notification_batches
+                )
+            }
+        )
+    ]
 
 
 def extract_basic_notifications_for_flight(
@@ -139,7 +162,9 @@ def extract_nested_notifications_for_flight(
         old_value = getattr(db_info, flight_key)
         new_value = getattr(webhook_data, webhook_key)
 
-        if old_value != new_value:
+        # Providers sometimes retract provisional fields. Persist that change,
+        # but do not tell users that a value changed to the literal "None".
+        if old_value != new_value and new_value:
             batch = ApnService.create_gate_change_notification_batch(
                 flight_id=flight_id,
                 location_type=direction,
