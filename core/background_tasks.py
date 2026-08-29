@@ -14,7 +14,9 @@ from .models.aerodatabox import (FlightNotificationContractSubscription,
 from .models.device import Device
 from .models.email import S3EmailNotification
 from .models.flight import Flight, FlightStatusEnum, UserFlightLink
+from .models.live_activity import LiveActivityRegistration
 from .models.user import User
+from .services.apn.live_activity import LiveActivityService
 from .services.apn.service import ApnService
 from .services.flight import FlightPersistence
 from .services.gemini.service import GeminiService
@@ -107,21 +109,22 @@ async def handle_incoming_email(notification: S3EmailNotification):
 
 async def create_webhook_for_flight(
     flight_full_number: str,
-    flight_id: str,
+    flight_id: int,
 ):
     if settings.DEV_ENV:
         return
 
     with Session(engine) as session:
         try:
-            flight = session.exec(
-                select(Flight).where(Flight.number == flight_full_number)
-            ).first()
+            flight = session.get(Flight, flight_id)
 
-            if not flight:
+            if not flight or flight.number != flight_full_number:
                 logger.warning(
                     f"Unable to find flight number={flight_full_number}, id={flight_id} while creating a webhook"
                 )
+                return
+
+            if flight.subscription_id and flight.has_subscribed:
                 return
 
             similar_flight_with_subscription = session.exec(
@@ -175,7 +178,11 @@ async def delete_webhook(
             res = await client.delete(fetcher_url)
             if res.status_code == 200:
                 with Session(engine) as session:
-                    session.exec(update(Flight).where(Flight.subscription_id == subscription_id).values(subscription_id=None))  # type: ignore
+                    session.exec(
+                        update(Flight)
+                        .where(Flight.subscription_id == subscription_id)
+                        .values(subscription_id=None, has_subscribed=False)
+                    )
                     session.commit()
                     return
             logger.warning(
@@ -317,3 +324,24 @@ async def check_and_create_webhook_for_flight():
                         await create_webhook_for_flight(flight_full_number=flight_number, flight_id=flight.id)  # type: ignore
 
         await asyncio.sleep(600)
+
+
+async def reconcile_live_activity_updates():
+    """Retry changed ActivityKit states independently of request background tasks."""
+    while True:
+        try:
+            with Session(engine) as session:
+                flight_ids = set(
+                    session.exec(
+                        select(LiveActivityRegistration.flight_id).where(
+                            LiveActivityRegistration.active == True  # noqa: E712
+                        )
+                    ).all()
+                )
+
+            for flight_id in flight_ids:
+                await LiveActivityService.send_updates_for_flight(flight_id)
+        except Exception:
+            logger.exception("Unable to reconcile Live Activity updates")
+
+        await asyncio.sleep(60)

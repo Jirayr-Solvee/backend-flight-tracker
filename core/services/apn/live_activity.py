@@ -22,6 +22,7 @@ TERMINAL_STATUSES = {"Arrived", "Canceled", "Diverted", "CanceledUncertain"}
 INVALID_TOKEN_REASONS = {
     "BadDeviceToken",
     "DeviceTokenNotForTopic",
+    "ExpiredToken",
     "Unregistered",
 }
 TRANSIENT_APNS_STATUSES = {"429", "500", "503"}

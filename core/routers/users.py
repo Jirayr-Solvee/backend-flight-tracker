@@ -7,10 +7,11 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, s
 from pydantic import BaseModel, Field, field_validator
 from sqlmodel import Session, and_, select, update
 
+from ..background_tasks import create_webhook_for_flight
 from ..dependency import check_guest_auth_token, get_current_user
 from ..models import get_session
 from ..models.device import Device
-from ..models.flight import FlightRead
+from ..models.flight import Flight, FlightRead
 from ..models.live_activity import LiveActivityRegistration
 from ..models.user import User, UserFlightLink
 from ..services.apn.live_activity import LiveActivityService
@@ -251,6 +252,12 @@ def register_live_activity(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Tracked flight not found",
         )
+    flight = session.get(Flight, data.flight_id)
+    if flight is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Flight not found",
+        )
 
     try:
         registration = session.get(LiveActivityRegistration, activity_id)
@@ -301,6 +308,11 @@ def register_live_activity(
 
         session.add(registration)
         session.commit()
+        background_tasks.add_task(
+            create_webhook_for_flight,
+            flight.number,
+            data.flight_id,
+        )
         background_tasks.add_task(
             LiveActivityService.send_updates_for_flight, data.flight_id
         )

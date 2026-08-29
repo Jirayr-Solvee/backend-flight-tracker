@@ -49,6 +49,7 @@ from core.models.device import Device
 from core.models.flight import Airline, Airport, Arrival, Departure, Flight
 from core.models.live_activity import LiveActivityRegistration
 from core.models.user import User, UserFlightLink
+from core.background_tasks import create_webhook_for_flight
 from core.routers.users import (
     RegisterLiveActivityRequest,
     register_live_activity,
@@ -211,7 +212,15 @@ class LiveActivityRegistrationTests(unittest.TestCase):
                 session=session,
             )
             self.assertEqual(response, {"detail": "Live Activity registered"})
-            self.assertEqual(len(background_tasks.tasks), 1)
+            self.assertEqual(len(background_tasks.tasks), 2)
+            self.assertIs(
+                background_tasks.tasks[0].func,
+                create_webhook_for_flight,
+            )
+            self.assertEqual(
+                background_tasks.tasks[0].args,
+                (flight.number, flight.id),
+            )
 
             register_live_activity(
                 activity_id="activity-1",
@@ -358,6 +367,104 @@ class LiveActivityDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(registration.active)
             self.assertEqual(registration.last_apns_status, "200")
             self.assertIsNotNone(registration.last_apns_timestamp)
+
+    async def test_expired_activity_token_is_deactivated(self):
+        test_engine = create_engine("sqlite://")
+        SQLModel.metadata.create_all(test_engine)
+
+        with Session(test_engine) as session:
+            user = User(id="user-1")
+            device = Device(id="device-1", user_id=user.id)
+            flight = LiveActivityPayloadTests._flight(status="Arrived")
+            session.add(user)
+            session.add(device)
+            session.add(flight)
+            session.commit()
+            session.refresh(flight)
+            session.add(UserFlightLink(user_id=user.id, flight_id=flight.id))
+            session.add(
+                LiveActivityRegistration(
+                    activity_id="activity-expired",
+                    push_token="ab" * 32,
+                    flight_id=flight.id,
+                    device_id=device.id,
+                    apns_environment="production",
+                )
+            )
+            session.commit()
+            flight_id = flight.id
+
+        class ExpiredAPNsClient:
+            async def send_notification(self, request):
+                return NotificationResult(
+                    notification_id=request.notification_id,
+                    status="410",
+                    description="ExpiredToken",
+                )
+
+        with mock.patch(
+            "core.services.apn.live_activity.engine", test_engine
+        ), mock.patch(
+            "core.services.apn.live_activity.get_apns_client",
+            return_value=ExpiredAPNsClient(),
+        ):
+            await LiveActivityService.send_updates_for_flight(flight_id)
+
+        with Session(test_engine) as session:
+            registration = session.get(
+                LiveActivityRegistration,
+                "activity-expired",
+            )
+            self.assertFalse(registration.active)
+            self.assertEqual(registration.last_apns_status, "410")
+            self.assertEqual(registration.last_apns_reason, "ExpiredToken")
+
+
+class LiveActivityWebhookMonitoringTests(unittest.IsolatedAsyncioTestCase):
+    async def test_webhook_subscription_is_attached_to_requested_flight_id(self):
+        test_engine = create_engine("sqlite://")
+        SQLModel.metadata.create_all(test_engine)
+
+        with Session(test_engine) as session:
+            stale_flight = Flight(
+                date="2026-08-01",
+                number="AA100",
+                status="Arrived",
+            )
+            requested_flight = Flight(
+                date="2026-08-03",
+                number="AA100",
+                status="Expected",
+            )
+            monitored_flight = Flight(
+                date="2026-08-02",
+                number="AA100",
+                status="EnRoute",
+                subscription_id="subscription-1",
+                has_subscribed=True,
+            )
+            session.add(stale_flight)
+            session.add(requested_flight)
+            session.add(monitored_flight)
+            session.commit()
+            session.refresh(stale_flight)
+            session.refresh(requested_flight)
+            requested_id = requested_flight.id
+            stale_id = stale_flight.id
+
+        with mock.patch("core.background_tasks.engine", test_engine):
+            await create_webhook_for_flight("AA100", requested_id)
+
+        with Session(test_engine) as session:
+            requested_flight = session.get(Flight, requested_id)
+            stale_flight = session.get(Flight, stale_id)
+            self.assertEqual(
+                requested_flight.subscription_id,
+                "subscription-1",
+            )
+            self.assertTrue(requested_flight.has_subscribed)
+            self.assertIsNone(stale_flight.subscription_id)
+            self.assertFalse(stale_flight.has_subscribed)
 
 
 if __name__ == "__main__":

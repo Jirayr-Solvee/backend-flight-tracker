@@ -364,6 +364,11 @@ def assign_flight_to_a_user(
         )
 
         if user_flight_link:
+            background_tasks.add_task(
+                create_webhook_for_flight,
+                flight.number,
+                flight_id,
+            )
             return {"detail": "successful"}
 
         FlightPersistence.create_user_flight_link(
@@ -372,6 +377,11 @@ def assign_flight_to_a_user(
 
         user.has_searched = True
         session.commit()
+        background_tasks.add_task(
+            create_webhook_for_flight,
+            flight.number,
+            flight_id,
+        )
 
         return {"detail": "successful"}
     except HTTPException:
