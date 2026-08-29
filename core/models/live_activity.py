@@ -40,3 +40,22 @@ class LiveActivityPushToStartRegistration(SQLModel, table=True):
     last_start_at: int | None = None
     last_apns_status: str | None = None
     last_apns_reason: str | None = None
+
+
+class LiveActivityPushToStartDelivery(SQLModel, table=True):
+    """Delivery state for one push-to-start token and tracked flight."""
+
+    __tablename__ = "live_activity_push_to_start_delivery"
+
+    device_id: str = Field(foreign_key="device.id", primary_key=True)
+    flight_id: int = Field(foreign_key="flight.id", primary_key=True)
+    push_token_fingerprint: str = Field(index=True)
+    state: str = Field(default="pending", index=True)
+    attempt_count: int = Field(default=0)
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    updated_at: int = Field(default_factory=lambda: int(time.time()))
+    last_attempt_at: int | None = None
+    delivered_at: int | None = None
+    confirmed_at: int | None = None
+    last_apns_status: str | None = None
+    last_apns_reason: str | None = None

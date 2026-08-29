@@ -9,6 +9,7 @@ from .experiment import (
 )
 from .flight import Airline, Airport, Arrival, Departure, Flight
 from .live_activity import (
+    LiveActivityPushToStartDelivery,
     LiveActivityPushToStartRegistration,
     LiveActivityRegistration,
 )

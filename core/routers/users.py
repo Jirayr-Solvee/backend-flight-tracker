@@ -13,6 +13,7 @@ from ..models import get_session
 from ..models.device import Device
 from ..models.flight import Flight, FlightRead
 from ..models.live_activity import (
+    LiveActivityPushToStartDelivery,
     LiveActivityPushToStartRegistration,
     LiveActivityRegistration,
 )
@@ -241,7 +242,6 @@ class RegisterLiveActivityPushToStartRequest(BaseModel):
 @router.put("/me/live-activity-push-to-start", response_model=dict)
 def register_live_activity_push_to_start(
     data: RegisterLiveActivityPushToStartRequest,
-    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
@@ -287,9 +287,6 @@ def register_live_activity_push_to_start(
 
         session.add(registration)
         session.commit()
-        background_tasks.add_task(
-            LiveActivityService.start_due_activities, data.device_id
-        )
         logger.info(
             "Live Activity push-to-start token registered: device_id=%s environment=%s",
             data.device_id,
@@ -401,6 +398,20 @@ def register_live_activity(
                 registration.last_content_state_json = None
 
         session.add(registration)
+        push_start_delivery = session.get(
+            LiveActivityPushToStartDelivery,
+            (data.device_id, data.flight_id),
+        )
+        if push_start_delivery is not None:
+            push_start_delivery.state = "confirmed"
+            push_start_delivery.confirmed_at = now
+            push_start_delivery.updated_at = now
+            session.add(push_start_delivery)
+            logger.info(
+                "Live Activity push-to-start confirmed: device_id=%s flight_id=%s",
+                data.device_id,
+                data.flight_id,
+            )
         session.commit()
         background_tasks.add_task(
             create_webhook_for_flight,

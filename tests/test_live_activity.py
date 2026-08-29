@@ -48,6 +48,7 @@ for key, value in {
 from core.models.device import Device
 from core.models.flight import Airline, Airport, Arrival, Departure, Flight
 from core.models.live_activity import (
+    LiveActivityPushToStartDelivery,
     LiveActivityPushToStartRegistration,
     LiveActivityRegistration,
 )
@@ -221,6 +222,15 @@ class LiveActivityRegistrationTests(unittest.TestCase):
         with Session(self.engine) as session:
             user, device, flight = self._seed_registration_owner(session)
             background_tasks = BackgroundTasks()
+            session.add(
+                LiveActivityPushToStartDelivery(
+                    device_id=device.id,
+                    flight_id=flight.id,
+                    push_token_fingerprint="fingerprint",
+                    state="delivered",
+                )
+            )
+            session.commit()
 
             response = register_live_activity(
                 activity_id="activity-1",
@@ -265,6 +275,12 @@ class LiveActivityRegistrationTests(unittest.TestCase):
             self.assertEqual(registration.push_token, "cd" * 32)
             self.assertFalse(registration.uses_12_hour_time)
             self.assertTrue(registration.active)
+            push_start_delivery = session.get(
+                LiveActivityPushToStartDelivery,
+                (device.id, flight.id),
+            )
+            self.assertEqual(push_start_delivery.state, "confirmed")
+            self.assertIsNotNone(push_start_delivery.confirmed_at)
 
             unregister_live_activity(
                 activity_id="activity-1",
@@ -318,7 +334,6 @@ class LiveActivityRegistrationTests(unittest.TestCase):
     def test_push_to_start_registration_is_scoped_to_the_users_device(self):
         with Session(self.engine) as session:
             user, device, _ = self._seed_registration_owner(session)
-            background_tasks = BackgroundTasks()
 
             response = register_live_activity_push_to_start(
                 data=RegisterLiveActivityPushToStartRequest(
@@ -327,7 +342,6 @@ class LiveActivityRegistrationTests(unittest.TestCase):
                     apns_environment="sandbox",
                     uses_12_hour_time=True,
                 ),
-                background_tasks=background_tasks,
                 user=user,
                 session=session,
             )
@@ -335,11 +349,6 @@ class LiveActivityRegistrationTests(unittest.TestCase):
             self.assertEqual(
                 response,
                 {"detail": "Live Activity push-to-start token registered"},
-            )
-            self.assertEqual(len(background_tasks.tasks), 1)
-            self.assertIs(
-                background_tasks.tasks[0].func,
-                LiveActivityService.start_due_activities,
             )
             registration = session.get(
                 LiveActivityPushToStartRegistration, device.id
@@ -360,7 +369,6 @@ class LiveActivityRegistrationTests(unittest.TestCase):
                     apns_environment="sandbox",
                     uses_12_hour_time=True,
                 ),
-                background_tasks=BackgroundTasks(),
                 user=user,
                 session=session,
             )
@@ -436,6 +444,83 @@ class LiveActivityDeliveryTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(registration.last_started_flight_id, flight_id)
             self.assertEqual(registration.last_apns_status, "200")
+            delivery = session.get(
+                LiveActivityPushToStartDelivery,
+                ("device-start", flight_id),
+            )
+            self.assertEqual(delivery.state, "delivered")
+            self.assertEqual(delivery.attempt_count, 1)
+            self.assertIsNotNone(delivery.delivered_at)
+
+    async def test_overlapping_flights_are_deduplicated_per_device_and_flight(self):
+        test_engine = create_engine("sqlite://")
+        SQLModel.metadata.create_all(test_engine)
+
+        with Session(test_engine) as session:
+            user = User(id="user-overlap")
+            device = Device(id="device-overlap", user_id=user.id)
+            first = LiveActivityPayloadTests._flight(status="Expected")
+            second = LiveActivityPayloadTests._flight(status="Expected")
+            first.id = 42
+            second.id = 43
+            second.number = "AA101"
+            session.add(user)
+            session.add(device)
+            session.add(first)
+            session.add(second)
+            session.commit()
+            session.add(UserFlightLink(user_id=user.id, flight_id=first.id))
+            session.add(UserFlightLink(user_id=user.id, flight_id=second.id))
+            session.add(
+                LiveActivityPushToStartRegistration(
+                    device_id=device.id,
+                    push_token="ab" * 32,
+                    apns_environment="sandbox",
+                )
+            )
+            session.commit()
+
+        class FakeAPNsClient:
+            def __init__(self):
+                self.requests = []
+
+            async def send_notification(self, request):
+                self.requests.append(request)
+                return NotificationResult(
+                    notification_id=request.notification_id,
+                    status="200",
+                )
+
+        client = FakeAPNsClient()
+        now = datetime(2026, 8, 3, 13, 0, tzinfo=timezone.utc)
+        with mock.patch(
+            "core.services.apn.live_activity.engine", test_engine
+        ), mock.patch(
+            "core.services.apn.live_activity.get_apns_client",
+            return_value=client,
+        ):
+            await LiveActivityService.start_due_activities(
+                device_id="device-overlap",
+                now=now,
+            )
+            await LiveActivityService.start_due_activities(
+                device_id="device-overlap",
+                now=now,
+            )
+
+        self.assertEqual(len(client.requests), 2)
+        started_flight_ids = {
+            request.message["aps"]["attributes"]["flightId"]
+            for request in client.requests
+        }
+        self.assertEqual(started_flight_ids, {42, 43})
+
+        with Session(test_engine) as session:
+            deliveries = session.exec(
+                select(LiveActivityPushToStartDelivery)
+            ).all()
+            self.assertEqual(len(deliveries), 2)
+            self.assertEqual({item.state for item in deliveries}, {"delivered"})
 
     async def test_delivery_uses_liveactivity_topic_deduplicates_and_ends(self):
         test_engine = create_engine("sqlite://")

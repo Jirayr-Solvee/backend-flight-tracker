@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -14,6 +15,7 @@ from ...models import engine
 from ...models.device import Device
 from ...models.flight import Flight, FlightOriginAndDestinationInformation
 from ...models.live_activity import (
+    LiveActivityPushToStartDelivery,
     LiveActivityPushToStartRegistration,
     LiveActivityRegistration,
 )
@@ -33,6 +35,7 @@ INVALID_TOKEN_REASONS = {
 TRANSIENT_APNS_STATUSES = {"429", "500", "503"}
 PUSH_TO_START_WINDOW = timedelta(hours=4)
 PUSH_TO_START_ACTIVE_LOOKBACK = timedelta(hours=12)
+MAX_PUSH_TO_START_ACTIVITIES_PER_DEVICE = 3
 PUSH_TO_START_STATUSES = {
     "Expected",
     "EnRoute",
@@ -263,9 +266,9 @@ def make_push_to_start_payload(
     return {"aps": aps}
 
 
-def _push_to_start_candidate(
+def _push_to_start_candidates(
     flights: list[Flight], now: datetime
-) -> Flight | None:
+) -> list[Flight]:
     candidates: list[tuple[datetime, Flight]] = []
     for flight in flights:
         status = _status_value(flight)
@@ -284,9 +287,19 @@ def _push_to_start_candidate(
             continue
         candidates.append((departure, flight))
 
-    if not candidates:
-        return None
-    return min(candidates, key=lambda item: item[0])[1]
+    candidates.sort(key=lambda item: item[0])
+    unique: list[Flight] = []
+    seen_flight_ids: set[int] = set()
+    for _, flight in candidates:
+        if flight.id in seen_flight_ids:
+            continue
+        seen_flight_ids.add(flight.id)
+        unique.append(flight)
+    return unique
+
+
+def _push_token_fingerprint(push_token: str) -> str:
+    return hashlib.sha256(push_token.encode("ascii")).hexdigest()[:16]
 
 
 class LiveActivityService:
@@ -323,76 +336,147 @@ class LiveActivityService:
                         .where(UserFlightLink.user_id == device.user_id)
                     ).all()
                 )
-                flight = _push_to_start_candidate(flights, now)
-                if flight is None or registration.last_started_flight_id == flight.id:
-                    continue
+                candidates = _push_to_start_candidates(flights, now)
+                token_fingerprint = _push_token_fingerprint(registration.push_token)
+                started_or_pending_count = 0
 
-                payload = make_push_to_start_payload(
-                    flight,
-                    uses_12_hour_time=registration.uses_12_hour_time,
-                    now=now,
-                )
-                request = NotificationRequest(
-                    device_token=registration.push_token,
-                    message=payload,
-                    notification_id=str(uuid.uuid4()),
-                    time_to_live=3_600,
-                    priority=10,
-                    collapse_key=f"flight-start-{flight.id}",
-                    push_type=PushType.LIVEACTIVITY,
-                    apns_topic=f"{settings.BUNDLE_ID}.push-type.liveactivity",
-                )
-
-                result = None
-                try:
-                    for attempt in range(1, 4):
-                        result = await get_apns_client(
-                            use_sandbox=registration.apns_environment == "sandbox"
-                        ).send_notification(request)
-                        if (
-                            result.is_successful
-                            or str(result.status) not in TRANSIENT_APNS_STATUSES
-                        ):
-                            break
-                        if attempt < 3:
-                            await asyncio.sleep(float(attempt))
-                except Exception as error:
-                    registration.last_apns_status = "exception"
-                    registration.last_apns_reason = type(error).__name__
-                    registration.updated_at = int(time.time())
-                    session.add(registration)
-                    logger.exception(
-                        "Live Activity push-to-start delivery raised: device_id=%s flight_id=%s",
-                        registration.device_id,
-                        flight.id,
+                for flight in candidates:
+                    active_activity = session.exec(
+                        select(LiveActivityRegistration).where(
+                            LiveActivityRegistration.device_id == registration.device_id,
+                            LiveActivityRegistration.flight_id == flight.id,
+                            LiveActivityRegistration.active == True,  # noqa: E712
+                        )
+                    ).first()
+                    delivery = session.get(
+                        LiveActivityPushToStartDelivery,
+                        (registration.device_id, flight.id),
                     )
-                    continue
 
-                registration.updated_at = int(time.time())
-                if result is None:
-                    registration.last_apns_status = "no_response"
-                    registration.last_apns_reason = "No APNs result"
-                else:
-                    registration.last_apns_status = str(result.status)
-                    registration.last_apns_reason = str(result.description)
-                    if result.is_successful:
-                        registration.last_started_flight_id = flight.id
-                        registration.last_start_at = int(time.time())
-                        logger.info(
-                            "Live Activity push-to-start delivered: device_id=%s flight_id=%s apns_id=%s",
+                    if active_activity is not None:
+                        started_or_pending_count += 1
+                        if delivery is not None and delivery.state != "confirmed":
+                            delivery.state = "confirmed"
+                            delivery.confirmed_at = int(now.timestamp())
+                            delivery.updated_at = int(now.timestamp())
+                            session.add(delivery)
+                        continue
+
+                    if delivery is None:
+                        delivery = LiveActivityPushToStartDelivery(
+                            device_id=registration.device_id,
+                            flight_id=flight.id,
+                            push_token_fingerprint=token_fingerprint,
+                        )
+                    elif delivery.push_token_fingerprint != token_fingerprint:
+                        delivery.push_token_fingerprint = token_fingerprint
+                        delivery.state = "pending"
+                        delivery.attempt_count = 0
+                        delivery.last_attempt_at = None
+                        delivery.delivered_at = None
+                        delivery.confirmed_at = None
+                        delivery.last_apns_status = None
+                        delivery.last_apns_reason = None
+
+                    if delivery.state in {"delivered", "confirmed"}:
+                        started_or_pending_count += 1
+                        continue
+                    if delivery.state == "failed_permanent":
+                        continue
+                    if started_or_pending_count >= MAX_PUSH_TO_START_ACTIVITIES_PER_DEVICE:
+                        continue
+
+                    payload = make_push_to_start_payload(
+                        flight,
+                        uses_12_hour_time=registration.uses_12_hour_time,
+                        now=now,
+                    )
+                    request = NotificationRequest(
+                        device_token=registration.push_token,
+                        message=payload,
+                        notification_id=str(uuid.uuid4()),
+                        time_to_live=3_600,
+                        priority=10,
+                        collapse_key=f"flight-start-{flight.id}",
+                        push_type=PushType.LIVEACTIVITY,
+                        apns_topic=f"{settings.BUNDLE_ID}.push-type.liveactivity",
+                    )
+
+                    result = None
+                    try:
+                        for attempt in range(1, 4):
+                            delivery.attempt_count += 1
+                            delivery.last_attempt_at = int(time.time())
+                            result = await get_apns_client(
+                                use_sandbox=registration.apns_environment == "sandbox"
+                            ).send_notification(request)
+                            if (
+                                result.is_successful
+                                or str(result.status) not in TRANSIENT_APNS_STATUSES
+                            ):
+                                break
+                            if attempt < 3:
+                                await asyncio.sleep(float(attempt))
+                    except Exception as error:
+                        delivery.state = "failed_transient"
+                        delivery.last_apns_status = "exception"
+                        delivery.last_apns_reason = type(error).__name__
+                        delivery.updated_at = int(time.time())
+                        registration.last_apns_status = "exception"
+                        registration.last_apns_reason = type(error).__name__
+                        registration.updated_at = int(time.time())
+                        session.add(delivery)
+                        session.add(registration)
+                        logger.exception(
+                            "Live Activity push-to-start delivery raised: device_id=%s flight_id=%s",
                             registration.device_id,
                             flight.id,
-                            request.notification_id,
                         )
-                    elif str(result.description) in INVALID_TOKEN_REASONS:
-                        registration.active = False
-                        logger.warning(
-                            "Live Activity push-to-start token rejected: device_id=%s status=%s reason=%s",
-                            registration.device_id,
-                            result.status,
-                            result.description,
-                        )
-                session.add(registration)
+                        continue
+
+                    delivery.updated_at = int(time.time())
+                    registration.updated_at = delivery.updated_at
+                    if result is None:
+                        delivery.state = "failed_transient"
+                        delivery.last_apns_status = "no_response"
+                        delivery.last_apns_reason = "No APNs result"
+                    else:
+                        apns_status = str(result.status)
+                        apns_reason = str(result.description)
+                        delivery.last_apns_status = apns_status
+                        delivery.last_apns_reason = apns_reason
+                        registration.last_apns_status = apns_status
+                        registration.last_apns_reason = apns_reason
+                        if result.is_successful:
+                            delivery.state = "delivered"
+                            delivery.delivered_at = int(time.time())
+                            started_or_pending_count += 1
+                            registration.last_started_flight_id = flight.id
+                            registration.last_start_at = delivery.delivered_at
+                            logger.info(
+                                "Live Activity push-to-start delivered: device_id=%s flight_id=%s apns_id=%s",
+                                registration.device_id,
+                                flight.id,
+                                request.notification_id,
+                            )
+                        elif apns_reason in INVALID_TOKEN_REASONS:
+                            delivery.state = "failed_permanent"
+                            registration.active = False
+                            logger.warning(
+                                "Live Activity push-to-start token rejected: device_id=%s status=%s reason=%s",
+                                registration.device_id,
+                                result.status,
+                                result.description,
+                            )
+                        elif apns_status in TRANSIENT_APNS_STATUSES:
+                            delivery.state = "failed_transient"
+                        else:
+                            delivery.state = "failed_permanent"
+
+                    session.add(delivery)
+                    session.add(registration)
+                    if not registration.active:
+                        break
 
             session.commit()
 
