@@ -1440,6 +1440,7 @@ class FlightQueryHandler:
         departure_date: str,
         airport_iata: str,
         direction: AirportSearchDirection,
+        airline_iata: str | None = None,
         **kwargs,
     ):
         result = await FlightService.get_airport_flights(
@@ -1463,6 +1464,19 @@ class FlightQueryHandler:
 
         filtered_flights = []
         for flight in flights:
+            if airline_iata:
+                requested_airline = airline_iata.upper()
+                provider_airline = (
+                    flight.airline.iata.upper()
+                    if flight.airline and flight.airline.iata
+                    else ""
+                )
+                provider_number = re.sub(r"\s+", "", flight.number.upper())
+                if (
+                    provider_airline != requested_airline
+                    and not provider_number.startswith(requested_airline)
+                ):
+                    continue
             if (
                 flight.departure
                 and flight.departure.airport

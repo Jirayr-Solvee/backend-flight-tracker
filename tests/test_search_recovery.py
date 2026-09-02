@@ -209,6 +209,30 @@ class SearchRecoveryTests(unittest.TestCase):
         self.assertEqual(recovery.reason, "choose_airport_route")
         self.assertEqual(recovery.suggestions[0].query, "LCA to NUE Today")
 
+    def test_airline_to_airport_query_calls_provider_instead_of_country_recovery(self):
+        query = "Flair Canada A Cancun Mexico"
+
+        self.assertIsNone(GeminiService.preflight_recovery(query))
+
+        resolved = GeminiService()._deterministic_function_call(query)
+        self.assertIsNotNone(resolved)
+        self.assertEqual(
+            resolved.function_name,
+            "extract_flight_info_via_airport_single_derection",
+        )
+        self.assertEqual(resolved.args["airline_iata"], "F8")
+        self.assertEqual(resolved.args["airport_iata"], "CUN")
+        self.assertEqual(resolved.args["direction"], "Arrival")
+        self.assertEqual(GeminiService.query_type_for_call(resolved), "airline_airport")
+
+    def test_short_airport_alias_does_not_match_inside_airline_name(self):
+        route = GeminiService._country_and_airport_route(
+            "flair mexico",
+            "mexico",
+        )
+
+        self.assertIsNone(route)
+
     def test_unparsed_query_is_not_labelled_as_provider_no_match(self):
         recovery = GeminiService.recovery_for_empty_result("Rev", None)
 
@@ -665,6 +689,61 @@ class ProviderAndRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ranked), 1)
         self.assertEqual(ranked[0].number, "DL100")
 
+    @patch(
+        "core.services.flight.service.AirportFlightMapper.airport_flight_to_airport_flight_read"
+    )
+    @patch(
+        "core.services.flight.service.FlightService.get_airport_flights",
+        new_callable=AsyncMock,
+    )
+    async def test_airline_airport_search_filters_other_airlines(
+        self,
+        get_airport_flights: AsyncMock,
+        map_airport_flight: MagicMock,
+    ):
+        flair = MagicMock()
+        flair.airline.iata = "F8"
+        flair.number = "F8 1234"
+        flair.departure.airport.iata = "YYZ"
+        flair.arrival.airport.iata = "CUN"
+
+        air_canada = MagicMock()
+        air_canada.airline.iata = "AC"
+        air_canada.number = "AC 1810"
+        air_canada.departure.airport.iata = "YYZ"
+        air_canada.arrival.airport.iata = "CUN"
+
+        get_airport_flights.return_value = MagicMock(
+            departures=[],
+            arrivals=[flair, air_canada],
+        )
+        mapped = AirportFlightRead(
+            number="F81234",
+            status=FlightStatusEnum.EXPECTED,
+            date="2026-09-03",
+            airline=AirlineRead(name="Flair", iata="F8", icao="FLE"),
+            departure=self._airport_segment(
+                iata="YYZ",
+                scheduled="2026-09-03 12:00Z",
+            ),
+            arrival=self._airport_segment(
+                iata="CUN",
+                scheduled="2026-09-03 16:00Z",
+            ),
+        )
+        map_airport_flight.return_value = mapped
+
+        response = await FlightQueryHandler.extract_flight_info_via_airport_single_derection(
+            departure_date="2026-09-03",
+            airport_iata="CUN",
+            direction="Arrival",
+            airline_iata="F8",
+        )
+
+        self.assertEqual([flight.number for flight in response.airport_flights_result], ["F81234"])
+        map_airport_flight.assert_called_once()
+        self.assertIs(map_airport_flight.call_args.kwargs["flight"], flair)
+
     async def test_flight_provider_429_is_not_treated_as_no_match(self):
         client = AerodataboxClient()
         client.client.get = AsyncMock(return_value=MagicMock(status_code=429))
@@ -798,6 +877,48 @@ class ProviderAndRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requested_dates, ["2026-08-20", "2026-08-21"])
         self.assertEqual(response.flights_result[0].number, "GF155")
         self.assertEqual(resolved.args["departure_date"], "2026-08-21")
+
+    async def test_airline_airport_search_checks_three_upcoming_dates(self):
+        requested_dates = []
+
+        async def handler(*, departure_date: str, session, **kwargs):
+            requested_dates.append(departure_date)
+            if departure_date != "2026-09-05":
+                return QuerySearchResponse()
+            return QuerySearchResponse(
+                flights_result=[
+                    self._flight(
+                        identifier=9,
+                        number="F81234",
+                        status=FlightStatusEnum.EXPECTED,
+                        departure_time="2026-09-05 12:00Z",
+                    )
+                ]
+            )
+
+        resolved = ResolvedFunctionCall(
+            function_name="extract_flight_info_via_airport_single_derection",
+            args={
+                "airport_iata": "CUN",
+                "direction": "Arrival",
+                "departure_date": "2026-09-02",
+                "airline_iata": "F8",
+            },
+            handler=handler,
+        )
+
+        response = await _execute_search_with_date_fallback(
+            resolved_call=resolved,
+            query="Flair Canada A Cancun Mexico",
+            session=MagicMock(),
+            now=datetime(2026, 9, 2, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(
+            requested_dates,
+            ["2026-09-02", "2026-09-03", "2026-09-04", "2026-09-05"],
+        )
+        self.assertEqual(response.flights_result[0].number, "F81234")
 
 
 if __name__ == "__main__":

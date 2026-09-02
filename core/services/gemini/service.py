@@ -42,6 +42,7 @@ class GeminiService:
 
     _country_airports = {
         "bangladesh": ("DAC", "CGP", "ZYL"),
+        "canada": ("YYZ", "YVR", "YUL"),
         "cyprus": ("LCA", "PFO"),
         "mexico": ("MEX", "CUN", "GDL"),
         "turkey": ("IST", "SAW", "AYT"),
@@ -58,6 +59,9 @@ class GeminiService:
     _country_aliases = {
         "bangladesh": {
             "bangladesh", "বাংলাদেশ", "بنغلاديش", "bangladés",
+        },
+        "canada": {
+            "canada", "canadá", "canadà", "kanada", "كندا",
         },
         "cyprus": {
             "cyprus", "cipro", "chypre", "zypern", "kıbrıs", "قبرص",
@@ -353,6 +357,13 @@ class GeminiService:
         if cls._route_from_aliases(normalized.casefold()):
             return None
 
+        # Queries such as "Flair Canada a Cancun Mexico" contain broad country
+        # names, but the airline and directional airport make the requested
+        # search actionable. Let the deterministic parser call the provider
+        # instead of replacing it with generic country-route suggestions.
+        if cls._airline_airport_query(normalized.casefold()):
+            return None
+
         countries = cls._countries_in_query(normalized)
         if len(countries) >= 2:
             departure, arrival = countries[0], countries[1]
@@ -639,6 +650,12 @@ class GeminiService:
     def query_type_for_call(resolved_call: ResolvedFunctionCall | None) -> str:
         if not resolved_call:
             return "unknown"
+        if (
+            resolved_call.function_name
+            == "extract_flight_info_via_airport_single_derection"
+            and resolved_call.args.get("airline_iata")
+        ):
+            return "airline_airport"
         return {
             "extract_flight_info": "flight_number",
             "extract_flight_info_via_airport": "airport_route",
@@ -718,16 +735,19 @@ class GeminiService:
         normalized = cls._normalized_route_text(query.casefold())
         country_aliases = cls._country_aliases[country]
         country_positions = [
-            normalized.find(cls._fold_text(alias))
+            index
             for alias in country_aliases
-            if normalized.find(cls._fold_text(alias)) >= 0
+            if (index := cls._alias_index(normalized, cls._fold_text(alias))) >= 0
         ]
         if not country_positions:
             return None
         country_index = min(country_positions)
 
         for airport_alias, airport_iata in cls._airport_aliases_by_length():
-            airport_index = normalized.find(cls._fold_text(airport_alias))
+            airport_index = cls._alias_index(
+                normalized,
+                cls._fold_text(airport_alias),
+            )
             if airport_index < 0:
                 continue
             return country, airport_iata, country_index < airport_index
@@ -839,6 +859,19 @@ class GeminiService:
                     "departure_airport_iata": aliased_route[0],
                     "arrival_airport_iata": aliased_route[1],
                     "departure_date": self._date_from_query(lowered),
+                },
+            )
+
+        airline_airport = self._airline_airport_query(lowered)
+        if airline_airport:
+            airline_iata, airport_iata, direction = airline_airport
+            return self._resolved_function_call(
+                function_name="extract_flight_info_via_airport_single_derection",
+                args={
+                    "airport_iata": airport_iata,
+                    "direction": direction,
+                    "departure_date": self._date_from_query(lowered),
+                    "airline_iata": airline_iata,
                 },
             )
 
@@ -1118,6 +1151,48 @@ class GeminiService:
         return None
 
     @classmethod
+    def _airline_airport_query(
+        cls,
+        lowered_query: str,
+    ) -> tuple[str, str, str] | None:
+        normalized = cls._normalized_route_text(lowered_query).strip()
+
+        airline_iata = None
+        for airline_alias, candidate_iata in cls._airline_aliases_by_length():
+            if cls._alias_index(normalized, cls._fold_text(airline_alias)) >= 0:
+                airline_iata = candidate_iata
+                break
+        if not airline_iata:
+            return None
+
+        for airport_alias, airport_iata in cls._airport_aliases_by_length():
+            airport_index = cls._alias_index(
+                normalized,
+                cls._fold_text(airport_alias),
+            )
+            if airport_index < 0:
+                continue
+
+            before_airport = normalized[:airport_index].rstrip()
+            if re.search(
+                r"(?:\bto|\binto|\ba|\bà|\bpara|\bnach|\bvers)\s*$",
+                before_airport,
+            ):
+                return airline_iata, airport_iata, "Arrival"
+            if re.search(r"\bfrom\s*$", before_airport):
+                return airline_iata, airport_iata, "Departure"
+
+        return None
+
+    @staticmethod
+    def _alias_index(value: str, alias: str) -> int:
+        match = re.search(
+            rf"(?<!\w){re.escape(alias)}(?!\w)",
+            value,
+        )
+        return match.start() if match else -1
+
+    @classmethod
     def _single_location_candidate(cls, normalized_query: str) -> str:
         candidate = normalized_query.strip()
         removable_words = (
@@ -1178,14 +1253,15 @@ class GeminiService:
             if not unicodedata.combining(character)
         )
 
-    @staticmethod
+    @classmethod
     def _ordered_route_match(
+        cls,
         normalized_query: str,
         departure_name: str,
         arrival_name: str,
     ) -> bool:
-        departure_index = normalized_query.find(departure_name)
-        arrival_index = normalized_query.find(arrival_name)
+        departure_index = cls._alias_index(normalized_query, departure_name)
+        arrival_index = cls._alias_index(normalized_query, arrival_name)
         if departure_index < 0 or arrival_index < 0 or departure_index >= arrival_index:
             return False
 
@@ -1316,6 +1392,9 @@ class GeminiService:
             "cairo": "CAI",
             "القاهرة": "CAI",
             "cai": "CAI",
+            "cancun": "CUN",
+            "cancún": "CUN",
+            "cun": "CUN",
             "manila": "MNL",
             "مانيلا": "MNL",
             "mnl": "MNL",
@@ -1394,6 +1473,8 @@ class GeminiService:
             "flynass": "XY",
             "flyadeal": "F3",
             "frontier": "F9",
+            "flair": "F8",
+            "flair airlines": "F8",
             "indigo": "6E",
             "jet blue": "B6",
             "jetblue": "B6",

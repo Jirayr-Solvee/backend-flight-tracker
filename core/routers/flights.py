@@ -131,6 +131,14 @@ async def _execute_search_with_date_fallback_details(
         "extract_flight_info_via_airport": 2,
         "extract_flight_info_via_airport_single_derection": 1,
     }
+    if (
+        resolved_call.function_name
+        == "extract_flight_info_via_airport_single_derection"
+        and initial_args.get("airline_iata")
+    ):
+        # Airline + airport searches are narrower than a normal airport FIDS
+        # search, so check a few upcoming dates when the user omitted one.
+        max_days_by_function[resolved_call.function_name] = 3
     max_days = min(
         GeminiService.upcoming_search_days(query),
         max_days_by_function.get(resolved_call.function_name, 0),
