@@ -999,47 +999,64 @@ async def get_exact_flight(
     )
 
     try:
-        flights = await FlightService.get_flights(
-            session=session,
-            departure_date=new_departure_data,
-            flight_number=flight_number,
+        candidate_numbers = FlightService._flight_number_candidates(
             airline_iata=airline_iata,
+            flight_number=flight_number,
+        )
+        correct_scheduled_time_local = (
+            normalize_offset(scheduled_time_local)
+            if scheduled_time_local
+            else scheduled_time_local
         )
 
-        if not flights:
-            logger.warning(
-                f"Unable to fetch exact flight for departure_date={departure_date}, flight_number={flight_number}, airline_iata={airline_iata}, departure_airport_iata={departure_airport_iata}, scheduled_time_utc={scheduled_time_local} from user id={user}"
+        # Affected clients can send B6 + 6524 for B6524. Resolve the literal
+        # request first, then try the recovered candidate only when its airport
+        # and scheduled time match the user's selected flight.
+        for candidate_number in candidate_numbers:
+            flights = await FlightService.get_flights(
+                session=session,
+                departure_date=new_departure_data,
+                flight_number=candidate_number,
+                airline_iata=airline_iata,
             )
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="Exact flight not found"
-            )
 
-        for flight in flights:
-            dep = flight.departure
-            correct_scheduled_time_local = normalize_offset(scheduled_time_local) if scheduled_time_local else scheduled_time_local
-            if (
-                dep
-                and dep.airport
-                and dep.airport.iata == departure_airport_iata
-                and dep.scheduled_time_local == correct_scheduled_time_local
-            ):
-                existing_link = session.exec(select(UserFlightLink).where(
-                    UserFlightLink.user_id == user.id,
-                    UserFlightLink.flight_id == flight.id
-                )).first()
+            for flight in flights:
+                dep = flight.departure
+                if (
+                    dep
+                    and dep.airport
+                    and dep.airport.iata == departure_airport_iata
+                    and dep.scheduled_time_local == correct_scheduled_time_local
+                ):
+                    existing_link = session.exec(select(UserFlightLink).where(
+                        UserFlightLink.user_id == user.id,
+                        UserFlightLink.flight_id == flight.id
+                    )).first()
 
-                if not existing_link:
-                    FlightPersistence.link_flight_and_user(
-                        session=session, flight_id=flight.id, user_id=user.id  # type: ignore
-                    )
+                    if not existing_link:
+                        FlightPersistence.link_flight_and_user(
+                            session=session, flight_id=flight.id, user_id=user.id  # type: ignore
+                        )
 
-                user.has_searched = True
-                session.commit()
+                    user.has_searched = True
+                    session.commit()
 
-                return flight
-        airport_flight = await get_exact_flight_temp(flight_number=flight_number, departure_date=new_departure_data, departure_airport_iata=departure_airport_iata, airline_iata=airline_iata, local_departure_time=scheduled_time_local, session=session)
-        if airport_flight:
-            return airport_flight
+                    return flight
+
+        normalized_airline = airline_iata.strip().replace(" ", "").upper()
+        for candidate_number in candidate_numbers:
+            try:
+                return await get_exact_flight_temp(
+                    flight_number=f"{normalized_airline}{candidate_number}",
+                    departure_date=new_departure_data,
+                    departure_airport_iata=departure_airport_iata,
+                    airline_iata=normalized_airline,
+                    local_departure_time=scheduled_time_local,
+                    session=session,
+                )
+            except HTTPException as exc:
+                if exc.status_code != status.HTTP_404_NOT_FOUND:
+                    raise
 
         logger.warning(
             f"Unable to find exact flight for departure_date={departure_date}, flight_number={flight_number}, airline_iata={airline_iata}, departure_airport_iata={departure_airport_iata}, scheduled_time_local={scheduled_time_local} from user id={user} after filtering fetched flights"

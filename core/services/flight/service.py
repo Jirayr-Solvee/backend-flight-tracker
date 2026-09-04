@@ -925,38 +925,27 @@ class FlightService:
     ) -> Sequence[Flight]:
         """Get flights from DATABASE, else from Aerodatabox then save in DATABASE before returning"""
         normalized_airline = airline_iata.strip().replace(" ", "").upper()
+        normalized_number = flight_number.strip().replace(" ", "").upper()
+        full_number = f"{normalized_airline}{normalized_number}"
+
+        db_flights = FlightPersistence.get_flights(session, full_number, departure_date)
+        if db_flights:
+            return db_flights
+
         api_client = AerodataboxClient()
 
-        # Older clients split a designator at its first digit. For airlines
-        # whose IATA code contains a digit, B6524 could therefore arrive as
-        # airline_iata=B6 + flight_number=6524. Try the literal request first
-        # so a real B6 6524 still wins, then retry the safely recoverable form.
-        for candidate_number in FlightService._flight_number_candidates(
+        flights = await api_client.get_flight(
+            full_number=full_number, departure_date=departure_date
+        )
+        if not flights:
+            return []
+
+        return FlightPersistence.create_flights_from_aerodatabox_model(
+            flights=flights,
             airline_iata=normalized_airline,
-            flight_number=flight_number,
-        ):
-            full_number = f"{normalized_airline}{candidate_number}"
-
-            db_flights = FlightPersistence.get_flights(
-                session, full_number, departure_date
-            )
-            if db_flights:
-                return db_flights
-
-            flights = await api_client.get_flight(
-                full_number=full_number, departure_date=departure_date
-            )
-            if not flights:
-                continue
-
-            return FlightPersistence.create_flights_from_aerodatabox_model(
-                flights=flights,
-                airline_iata=normalized_airline,
-                departure_date=departure_date,
-                session=session,
-            )
-
-        return []
+            departure_date=departure_date,
+            session=session,
+        )
 
     @staticmethod
     def _flight_number_candidates(
