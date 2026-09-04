@@ -64,6 +64,36 @@ from core.services.gemini.service import GeminiService, ResolvedFunctionCall
 
 
 class SearchRecoveryTests(unittest.TestCase):
+    def test_flight_number_candidates_recover_digit_suffix_airline_codes(self):
+        self.assertEqual(
+            FlightService._flight_number_candidates(
+                airline_iata="B6", flight_number="6524"
+            ),
+            ("6524", "524"),
+        )
+        self.assertEqual(
+            FlightService._flight_number_candidates(
+                airline_iata="U2", flight_number="21234"
+            ),
+            ("21234", "1234"),
+        )
+
+    def test_flight_number_candidates_recover_complete_designator(self):
+        self.assertEqual(
+            FlightService._flight_number_candidates(
+                airline_iata="5J", flight_number="5J272"
+            ),
+            ("5J272", "272"),
+        )
+
+    def test_flight_number_candidates_preserve_normal_numbers(self):
+        self.assertEqual(
+            FlightService._flight_number_candidates(
+                airline_iata="BA", flight_number="456"
+            ),
+            ("456",),
+        )
+
     def test_normalization_removes_rtl_marks(self):
         self.assertEqual(
             GeminiService.normalize_query("\u200f  من   المكسيك إلى تركيا  "),

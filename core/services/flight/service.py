@@ -924,27 +924,64 @@ class FlightService:
         airline_iata: str,
     ) -> Sequence[Flight]:
         """Get flights from DATABASE, else from Aerodatabox then save in DATABASE before returning"""
-        full_number = f"{airline_iata.strip().upper()}{flight_number}"
-
-        db_flights = FlightPersistence.get_flights(session, full_number, departure_date)
-        if db_flights:
-            return db_flights
-
+        normalized_airline = airline_iata.strip().replace(" ", "").upper()
         api_client = AerodataboxClient()
 
-        flights = await api_client.get_flight(
-            full_number=full_number, departure_date=departure_date
-        )
-        if not flights:
-            return []
+        # Older clients split a designator at its first digit. For airlines
+        # whose IATA code contains a digit, B6524 could therefore arrive as
+        # airline_iata=B6 + flight_number=6524. Try the literal request first
+        # so a real B6 6524 still wins, then retry the safely recoverable form.
+        for candidate_number in FlightService._flight_number_candidates(
+            airline_iata=normalized_airline,
+            flight_number=flight_number,
+        ):
+            full_number = f"{normalized_airline}{candidate_number}"
 
-        new_flights = FlightPersistence.create_flights_from_aerodatabox_model(
-            flights=flights,
-            airline_iata=airline_iata,
-            departure_date=departure_date,
-            session=session,
-        )
-        return new_flights
+            db_flights = FlightPersistence.get_flights(
+                session, full_number, departure_date
+            )
+            if db_flights:
+                return db_flights
+
+            flights = await api_client.get_flight(
+                full_number=full_number, departure_date=departure_date
+            )
+            if not flights:
+                continue
+
+            return FlightPersistence.create_flights_from_aerodatabox_model(
+                flights=flights,
+                airline_iata=normalized_airline,
+                departure_date=departure_date,
+                session=session,
+            )
+
+        return []
+
+    @staticmethod
+    def _flight_number_candidates(
+        *, airline_iata: str, flight_number: str
+    ) -> tuple[str, ...]:
+        airline = airline_iata.strip().replace(" ", "").upper()
+        supplied = flight_number.strip().replace(" ", "").upper()
+        candidates = [supplied]
+
+        # A client may send the complete designator in the flight-number field.
+        if airline and supplied.startswith(airline) and len(supplied) > len(airline):
+            candidates.append(supplied[len(airline):])
+
+        # Affected app builds retained the numeric character from codes such as
+        # B6, W6 and U2 when they extracted the number suffix.
+        if (
+            len(airline) == 2
+            and airline[0].isalpha()
+            and airline[1].isdigit()
+            and supplied.startswith(airline[1])
+            and len(supplied) > 1
+        ):
+            candidates.append(supplied[1:])
+
+        return tuple(dict.fromkeys(candidate for candidate in candidates if candidate))
 
     @staticmethod
     async def get_airport_flights(
