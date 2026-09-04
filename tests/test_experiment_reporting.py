@@ -47,6 +47,7 @@ from appstoreserverlibrary.models.OfferDiscountType import OfferDiscountType
 from fastapi import HTTPException
 from sqlmodel import Session, SQLModel, create_engine, select
 
+from core.config import settings
 from core.models.experiment import (
     ExperimentConversion,
     ExperimentExposure,
@@ -56,9 +57,11 @@ from core.models.transaction import Transaction
 from core.models.user import User
 from core.routers.subscriptions import (
     CreateTransactionRequest,
+    ExperimentAssignmentRequest,
     ExperimentContext,
     ExperimentGoalSelectionRequest,
     create_or_update_transaction,
+    get_experiment_assignment,
     get_experiment_goal_summary,
     get_experiment_summary,
     report_experiment_exposure,
@@ -169,6 +172,68 @@ class ExperimentReportingTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_remote_assignment_is_deterministic_for_new_installation(self):
+        request = ExperimentAssignmentRequest(
+            experiment_id="paywall_flight_detail_2026_09",
+            installation_id="11111111-2222-4333-8444-555555555555",
+            current_variant=None,
+            app_version="3.6",
+            build_number="111",
+            analytics_environment="production",
+        )
+
+        with (
+            patch.object(settings, "FLIGHT_DETAIL_PAYWALL_EXPERIMENT_MODE", "split"),
+            patch.object(settings, "FLIGHT_DETAIL_PAYWALL_TREATMENT_PERCENT", 50),
+        ):
+            first = get_experiment_assignment(request, self.user)
+            second = get_experiment_assignment(request, self.user)
+
+        self.assertEqual(first.variant, second.variant)
+        self.assertTrue(first.experiment_enabled)
+        self.assertEqual(first.assignment_source, "deterministic_split")
+
+    def test_remote_split_preserves_existing_assignment(self):
+        request = ExperimentAssignmentRequest(
+            experiment_id="paywall_flight_detail_2026_09",
+            installation_id="11111111-2222-4333-8444-555555555555",
+            current_variant="treatment_flight_detail_card",
+            app_version="3.6",
+            build_number="111",
+            analytics_environment="production",
+        )
+
+        with patch.object(
+            settings,
+            "FLIGHT_DETAIL_PAYWALL_EXPERIMENT_MODE",
+            "split",
+        ):
+            assignment = get_experiment_assignment(request, self.user)
+
+        self.assertEqual(assignment.variant, "treatment_flight_detail_card")
+        self.assertEqual(assignment.assignment_source, "existing_assignment")
+
+    def test_remote_kill_switch_disables_treatment(self):
+        request = ExperimentAssignmentRequest(
+            experiment_id="paywall_flight_detail_2026_09",
+            installation_id="11111111-2222-4333-8444-555555555555",
+            current_variant="treatment_flight_detail_card",
+            app_version="3.6",
+            build_number="111",
+            analytics_environment="production",
+        )
+
+        with patch.object(
+            settings,
+            "FLIGHT_DETAIL_PAYWALL_EXPERIMENT_MODE",
+            "off",
+        ):
+            assignment = get_experiment_assignment(request, self.user)
+
+        self.assertEqual(assignment.variant, "control_current_paywall")
+        self.assertFalse(assignment.experiment_enabled)
+        self.assertEqual(assignment.assignment_source, "disabled")
 
     def test_legacy_transaction_request_remains_supported(self):
         request = CreateTransactionRequest(jws_payload="legacy-jws")

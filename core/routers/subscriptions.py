@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field as PydanticField, model_validator
 from sqlmodel import select
 
+from ..config import settings
 from ..dependency import check_lambda_auth_token, get_current_user
 from ..models import Session, get_session
 from ..models.activation_recovery import PurchaseActivationRecovery
@@ -92,6 +93,36 @@ class ExperimentGoalSelectionRequest(BaseModel):
         return self
 
 
+FlightDetailPaywallVariant = Literal[
+    "control_current_paywall",
+    "treatment_flight_detail_card",
+]
+
+
+class ExperimentAssignmentRequest(BaseModel):
+    experiment_id: Literal["paywall_flight_detail_2026_09"]
+    installation_id: UUID
+    current_variant: FlightDetailPaywallVariant | None = None
+    app_version: str = PydanticField(min_length=1, max_length=40)
+    build_number: str = PydanticField(min_length=1, max_length=40)
+    analytics_environment: Literal["production", "development"]
+
+
+class ExperimentAssignmentResponse(BaseModel):
+    experiment_id: str
+    variant: FlightDetailPaywallVariant
+    experiment_enabled: bool
+    assignment_source: Literal[
+        "deterministic_split",
+        "existing_assignment",
+        "forced_control",
+        "forced_treatment",
+        "disabled",
+    ]
+    config_version: str
+    cache_ttl_seconds: int
+
+
 class CreateTransactionRequest(BaseModel):
     jws_payload: str
     experiment: ExperimentContext | None = None
@@ -128,6 +159,15 @@ def _enum_value(value) -> str:
 
 def _canonical_exposure_id(context: ExperimentContext) -> str:
     return f"{context.experiment_id}:{context.installation_id}"
+
+
+def _stable_experiment_bucket(value: str) -> int:
+    """Return a deterministic 0-99 bucket using the app's FNV-1a hash."""
+    hash_value = 14_695_981_039_346_656_037
+    for byte in value.encode("utf-8"):
+        hash_value ^= byte
+        hash_value = (hash_value * 1_099_511_628_211) & 0xFFFFFFFFFFFFFFFF
+    return hash_value % 100
 
 
 def _trial_duration_days(offer_period: str | None) -> int | None:
@@ -267,6 +307,60 @@ def report_experiment_exposure(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
         )
+
+
+@router.post("/experiments/assignment")
+def get_experiment_assignment(
+    data: ExperimentAssignmentRequest,
+    _user: User = Depends(get_current_user),
+) -> ExperimentAssignmentResponse:
+    mode = settings.FLIGHT_DETAIL_PAYWALL_EXPERIMENT_MODE
+    treatment_percent = min(
+        100,
+        max(0, settings.FLIGHT_DETAIL_PAYWALL_TREATMENT_PERCENT),
+    )
+
+    if mode == "off":
+        variant: FlightDetailPaywallVariant = "control_current_paywall"
+        enabled = False
+        source = "disabled"
+    elif mode == "control":
+        variant = "control_current_paywall"
+        enabled = True
+        source = "forced_control"
+    elif mode == "treatment":
+        variant = "treatment_flight_detail_card"
+        enabled = True
+        source = "forced_treatment"
+    elif data.current_variant is not None:
+        # Preserve assignments made by earlier app builds while the experiment
+        # remains in split mode. A force/off mode intentionally overrides them.
+        variant = data.current_variant
+        enabled = True
+        source = "existing_assignment"
+    else:
+        bucket = _stable_experiment_bucket(
+            f"{data.experiment_id}:{data.installation_id}"
+        )
+        variant = (
+            "treatment_flight_detail_card"
+            if bucket < treatment_percent
+            else "control_current_paywall"
+        )
+        enabled = True
+        source = "deterministic_split"
+
+    return ExperimentAssignmentResponse(
+        experiment_id=data.experiment_id,
+        variant=variant,
+        experiment_enabled=enabled,
+        assignment_source=source,
+        config_version=settings.FLIGHT_DETAIL_PAYWALL_CONFIG_VERSION,
+        cache_ttl_seconds=max(
+            0,
+            settings.FLIGHT_DETAIL_PAYWALL_CACHE_TTL_SECONDS,
+        ),
+    )
 
 
 @router.post("/experiments/goals")

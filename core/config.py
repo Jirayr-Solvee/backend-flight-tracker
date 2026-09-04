@@ -1,4 +1,5 @@
 from enum import Enum
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -76,6 +77,15 @@ class Settings(BaseSettings):
     APPLE_ADS_ORG_ID: int | None = None
     APPLE_ADS_API_BASE_URL: str = "https://api.searchads.apple.com/api/v5"
     APPLE_ADS_ATTRIBUTION_URL: str = "https://api-adservices.apple.com/api/v1/"
+
+    # Remote assignment for the flight-detail paywall experiment. Changing the
+    # mode or rollout only requires a backend restart; no App Store release.
+    FLIGHT_DETAIL_PAYWALL_EXPERIMENT_MODE: Literal[
+        "split", "control", "treatment", "off"
+    ] = "split"
+    FLIGHT_DETAIL_PAYWALL_TREATMENT_PERCENT: int = 50
+    FLIGHT_DETAIL_PAYWALL_CONFIG_VERSION: str = "1"
+    FLIGHT_DETAIL_PAYWALL_CACHE_TTL_SECONDS: int = 60
 
 
 settings = Settings()  # type: ignore
