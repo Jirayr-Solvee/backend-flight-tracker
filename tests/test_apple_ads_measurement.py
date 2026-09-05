@@ -258,6 +258,31 @@ class AppleAdsMeasurementTests(unittest.TestCase):
         self.assertEqual(event.price_milliunits, 19_990)
         self.assertFalse(event.starts_trial)
 
+    def test_partial_refund_millipercent_boundaries_in_ads_report(self):
+        self.session.add(AppleAdsAttribution(
+            id=self.device.id, user_id=self.user.id, attributed=True, org_id=10,
+            campaign_id=20, analytics_environment="production",
+            app_version="3.7", build_number="117",
+            first_reported_at_ms=utc_ms(2026, 8, 1),
+        ))
+        paid = AppStoreRevenueEvent(
+            id="partial-paid", original_transaction_id="original-1", user_id=self.user.id,
+            product_id="yearly", purchase_date_ms=utc_ms(2026, 8, 2),
+            purchase_environment="Production", price_milliunits=40_000, currency="USD",
+            revoked_date_ms=utc_ms(2026, 8, 3),
+        )
+        for percentage, net in ((50_000, 20), (0, 40), (100_000, 0), (None, 0)):
+            with self.subTest(percentage=percentage):
+                paid.revocation_percentage = percentage
+                self.session.add(paid)
+                self.session.commit()
+                row = build_measurement_report(
+                    session=self.session, start_date=date(2026, 8, 1),
+                    end_date=date(2026, 8, 1), dimension="campaign",
+                )["rows"][0]
+                self.assertEqual(row["gross_revenue"], {"USD": 40})
+                self.assertEqual(row["net_revenue"], {"USD": net})
+
     def test_report_joins_spend_install_trial_and_paid_revenue(self):
         attribution = AppleAdsAttribution(
             id=self.device.id,

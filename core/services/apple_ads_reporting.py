@@ -10,6 +10,7 @@ from ..models.apple_ads import (
     AppleAdsSpendDaily,
     AppStoreRevenueEvent,
 )
+from .revenue_measurement import refunded_milliunits
 
 
 Dimension = Literal["campaign", "ad_group", "keyword"]
@@ -249,10 +250,7 @@ def build_measurement_report(
         currency = event.currency.upper()
         gross = max(0, event.price_milliunits)
         if event.revoked_date_ms:
-            retained_percent = max(
-                0, 100 - int(event.revocation_percentage or 100)
-            )
-            net = gross * retained_percent // 100
+            net = gross - refunded_milliunits(gross, event.revocation_percentage)
             group["refunded_transaction_count"] += 1
         else:
             net = gross

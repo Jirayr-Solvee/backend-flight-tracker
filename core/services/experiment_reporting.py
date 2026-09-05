@@ -8,6 +8,7 @@ from ..models.apple_ads import AppleAdsAttribution, AppStoreRevenueEvent
 from ..models.experiment import (
     ExperimentConversion, ExperimentEnrollment, ExperimentExposure, current_time_ms,
 )
+from .revenue_measurement import refunded_milliunits
 
 
 def experiment_summary(
@@ -136,8 +137,9 @@ def experiment_summary(
                 seen_revenue.add(event.id)
                 monetary[event.currency]["gross_milliunits"] += event.price_milliunits
                 if event.revoked_date_ms is not None and event.revoked_date_ms <= now_ms:
-                    fraction = min(100, max(0, event.revocation_percentage)) / 100 if event.revocation_percentage is not None else 1
-                    monetary[event.currency]["refund_milliunits"] += round(event.price_milliunits * fraction)
+                    monetary[event.currency]["refund_milliunits"] += refunded_milliunits(
+                        event.price_milliunits, event.revocation_percentage,
+                    )
 
         ratio = lambda value, denominator=n: round(value / denominator, 4) if denominator else None
         actual_paywall_ids = {item.installation_id for item in exposures

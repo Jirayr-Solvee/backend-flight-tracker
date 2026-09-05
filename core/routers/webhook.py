@@ -18,9 +18,8 @@ from ..services.apn.live_activity import LiveActivityService
 from ..services.apn.utils import (extract_all_notifications_for_flight,
                                   increase_notifications_of_users)
 from ..services.app_store.service import AppStoreService
-from ..services.revenue_measurement import upsert_verified_revenue_event
+from ..services.revenue_measurement import refresh_current_entitlement, upsert_verified_transaction, upsert_verified_revenue_event
 from ..services.subscription_lifecycle import upsert_subscription_lifecycle_event
-from ..utils import calculate_premium_valid_until
 
 router = APIRouter()
 
@@ -274,40 +273,9 @@ def create_or_update_transaction(
             and decoded_jws.transactionId
             and db_subscription
         ):
-            db_transaction = session.get(Transaction, str(decoded_jws.transactionId))
-            is_new_transaction = db_transaction is None
-            if db_transaction is None:
-                db_transaction = Transaction(
-                    id=str(decoded_jws.transactionId),
-                    subscription_id=db_subscription.id,
-                )
-            should_update_transaction = (
-                is_new_transaction
-                or not db_transaction.signed_date
-                or not decoded_jws.signedDate
-                or db_transaction.signed_date < decoded_jws.signedDate
+            db_transaction, should_update_transaction = upsert_verified_transaction(
+                session=session, decoded_jws=decoded_jws,
             )
-
-            if should_update_transaction:
-                db_transaction.product_id = decoded_jws.productId
-                db_transaction.purchase_date = decoded_jws.purchaseDate
-                db_transaction.original_purchase_date = (
-                    decoded_jws.originalPurchaseDate
-                )
-                db_transaction.signed_date = decoded_jws.signedDate
-                db_transaction.expires_date = decoded_jws.expiresDate
-                db_transaction.transaction_reason = decoded_jws.transactionReason
-                db_transaction.price = decoded_jws.price
-                db_transaction.currency = decoded_jws.currency
-                db_transaction.is_upgraded = decoded_jws.isUpgraded
-                db_transaction.environment = decoded_jws.environment
-                db_transaction.revoked_date = decoded_jws.revocationDate
-                db_transaction.app_account_token = (
-                    str(decoded_jws.appAccountToken)
-                    if decoded_jws.appAccountToken
-                    else None
-                )
-                session.add(db_transaction)
 
             if measurement_user_id and (
                 should_update_transaction
@@ -332,7 +300,6 @@ def create_or_update_transaction(
                 or getattr(notification, "rawSubtype", None)
             )
             should_update_premium = should_update_transaction
-            premium_until = None
             if notification_type in {
                 "REFUND",
                 "REVOKE",
@@ -343,24 +310,12 @@ def create_or_update_transaction(
                 and notification_subtype != "GRACE_PERIOD"
             ):
                 should_update_premium = True
-            elif (
-                notification_type == "DID_FAIL_TO_RENEW"
-                and notification_subtype == "GRACE_PERIOD"
-                and decoded_renewal_info
-                and decoded_renewal_info.gracePeriodExpiresDate
-            ):
+            elif notification_type == "DID_FAIL_TO_RENEW" and notification_subtype == "GRACE_PERIOD":
                 should_update_premium = True
-                premium_until = calculate_premium_valid_until(
-                    decoded_renewal_info.gracePeriodExpiresDate
-                )
-            elif not decoded_jws.revocationDate:
-                premium_until = calculate_premium_valid_until(
-                    decoded_jws.expiresDate
-                )
 
             if should_update_premium:
                 for user in db_subscription.users:
-                    user.premium_valid_until = premium_until
+                    refresh_current_entitlement(session=session, user=user)
 
         session.commit()
         return {"detail": "ok"}

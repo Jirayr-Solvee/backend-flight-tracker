@@ -1,3 +1,5 @@
+import base64
+import json
 import logging
 
 from appstoreserverlibrary.models.Environment import Environment
@@ -30,6 +32,28 @@ def get_apple_environments() -> list[Environment]:
 
 
 class AppStoreService:
+    @staticmethod
+    def _preserve_verified_revocation_percentage(payload, signed_jws: str):
+        """Bridge an additive Apple field omitted by the pinned SDK's model.
+
+        Call only after the SDK verifies this exact JWS's signature, bundle and
+        environment. Never use this parser as verification or retain raw JWS.
+        """
+        if getattr(payload, "revocationPercentage", None) is not None:
+            return payload
+        try:
+            encoded = signed_jws.split(".")[1]
+            raw = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+            value = raw.get("revocationPercentage")
+            if (str(raw.get("transactionId")) == str(payload.transactionId)
+                    and type(value) is int and 0 <= value <= 100_000):
+                payload.revocationPercentage = value
+        except (ValueError, IndexError, AttributeError, TypeError):
+            # Missing optional financial metadata never reverses a successful
+            # verification. No payload/exception text may enter application logs.
+            logger.warning("Verified transaction optional refund metadata unavailable")
+        return payload
+
     @staticmethod
     def _get_root_certs() -> list[bytes]:
         with open(settings.APPLE_ROOT_CERT_PATH, "rb") as f:
@@ -67,6 +91,7 @@ class AppStoreService:
                 payload = verifier.verify_and_decode_signed_transaction(
                     signed_transaction=signed_jws
                 )
+                payload = AppStoreService._preserve_verified_revocation_percentage(payload, signed_jws)
 
                 if environment != environments[0]:
                     logger.info(

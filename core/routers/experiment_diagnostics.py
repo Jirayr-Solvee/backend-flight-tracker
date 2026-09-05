@@ -32,6 +32,11 @@ EventName = Literal[
     "flight_notification_scheduling", "live_activity_started", "live_activity_start_failed",
     "live_activity_push_to_start_registration",
     "live_activity_update_registration",
+    "flight_add_blocked", "flight_add_failed", "transaction_registration_outcome",
+    "paywall_alternative_plans_revealed", "paywall_products_loaded",
+    "af_search", "search_completed", "search_failed", "no_search_results",
+    "search_recovery_shown", "search_recovery_suggestion_selected",
+    "onboarding_started", "onboarding_step_viewed", "onboarding_completed", "activation_experiment_action",
 ]
 
 
@@ -62,6 +67,28 @@ class DiagnosticProperties(BaseModel):
     notification_type: Token | None = None
     status: Token | None = None
     activity_kind: Token | None = None
+    search_journey_id: Annotated[UUID, Field(strict=False)] | None = None
+    search_attempt_number: Annotated[int, Field(ge=1, le=1000)] | None = None
+    session_id: Annotated[UUID, Field(strict=False)] | None = None
+    visible_plan_count: Annotated[int, Field(ge=0, le=20)] | None = None
+    available_plan_count: Annotated[int, Field(ge=0, le=20)] | None = None
+    mode: Token | None = None
+    query_type: Token | None = None
+    failure_reason: Token | None = None
+    provider_outcome: Token | None = None
+    provider_latency_bucket: Token | None = None
+    suggestion_kind: Token | None = None
+    action: Token | None = None
+    step_key: Token | None = None
+    has_results: bool | None = None
+    normalization_applied: bool | None = None
+    flight_count: Annotated[int, Field(ge=0, le=100000)] | None = None
+    airport_flight_count: Annotated[int, Field(ge=0, le=100000)] | None = None
+    provider_result_count: Annotated[int, Field(ge=0, le=100000)] | None = None
+    filtered_result_count: Annotated[int, Field(ge=0, le=100000)] | None = None
+    suggestion_count: Annotated[int, Field(ge=0, le=1000)] | None = None
+    step: Annotated[int, Field(ge=0, le=100)] | None = None
+    total_steps: Annotated[int, Field(ge=0, le=100)] | None = None
 
 
 class DiagnosticEvent(BaseModel):
@@ -91,6 +118,7 @@ class DiagnosticEvent(BaseModel):
         if self.event_name in (
             "paywall_viewed", "paywall_dismissed", "subscription_product_selected",
             "af_initiated_checkout", "checkout_attempt_completed",
+            "paywall_alternative_plans_revealed", "paywall_products_loaded",
         ) and self.paywall_presentation_id is None:
             raise ValueError("Paywall presentation ID is required")
         if self.event_name in ("af_initiated_checkout", "checkout_attempt_completed"):
@@ -120,7 +148,7 @@ def _row(event: DiagnosticEvent, user: User) -> ExperimentDiagnosticEvent:
         experiment_id=event.experiment.experiment_id if event.experiment else None,
         variant=event.experiment.variant if event.experiment else None,
         measurement_revision=event.experiment.measurement_revision if event.experiment else None,
-        properties_json=json.dumps(event.properties.model_dump(exclude_none=True), sort_keys=True, separators=(",", ":")),
+        properties_json=json.dumps(event.properties.model_dump(mode="json", exclude_none=True), sort_keys=True, separators=(",", ":")),
     )
 
 
@@ -213,6 +241,7 @@ def get_diagnostic_report(
     rows = sorted(rows[:limit], key=lambda item: (item.occurred_at_ms, item.id))
     attempts = defaultdict(list)
     presentations = defaultdict(list)
+    journeys = defaultdict(list)
     events = []
     for row in rows:
         properties = json.loads(row.properties_json)
@@ -220,6 +249,8 @@ def get_diagnostic_report(
             attempts[row.checkout_attempt_id].append(row)
         if row.paywall_presentation_id:
             presentations[row.paywall_presentation_id].append(row)
+        if properties.get("search_journey_id"):
+            journeys[properties["search_journey_id"]].append(row)
         transaction = session.get(Transaction, properties.get("transaction_id")) if properties.get("transaction_id") else None
         owned_transaction = bool(transaction and (
             transaction.app_account_token == row.user_id
@@ -240,6 +271,16 @@ def get_diagnostic_report(
         "count": len(events), "truncated": truncated,
         "proof_scope": "Client diagnostic delivery only. Verified revenue comes from Apple JWS; sequence gaps can also reflect delayed delivery or report filters.",
         "event_counts": dict(Counter(row.event_name for row in rows)),
+        "flight_journeys": [{
+            "search_journey_id": key,
+            "selected_flight_ids": sorted({json.loads(row.properties_json)["flight_id"] for row in group
+                if row.event_name == "flight_selected" and json.loads(row.properties_json).get("flight_id")}),
+            "added_flight_ids": sorted({json.loads(row.properties_json)["flight_id"] for row in group
+                if row.event_name == "flight_added" and json.loads(row.properties_json).get("flight_id")}),
+            "viewed_flight_ids": sorted({json.loads(row.properties_json)["flight_id"] for row in group
+                if row.event_name == "screen_flight_detail_viewed" and json.loads(row.properties_json).get("flight_id")}),
+            "failure_events": sum(row.event_name in ("flight_add_failed", "flight_add_blocked") for row in group),
+        } for key, group in journeys.items()],
         "checkout_attempts": [{
             "checkout_attempt_id": key,
             "initiated_count": sum(row.event_name == "af_initiated_checkout" for row in group),

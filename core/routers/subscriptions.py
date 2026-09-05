@@ -25,7 +25,7 @@ from ..models.subscription_lifecycle import AppStoreSubscriptionLifecycleEvent
 from ..models.transaction import Transaction
 from ..models.user import User, UserSubscriptionLink
 from ..services.app_store.service import AppStoreService
-from ..services.revenue_measurement import upsert_verified_revenue_event
+from ..services.revenue_measurement import refresh_current_entitlement, upsert_verified_transaction, upsert_verified_revenue_event
 from ..services.experiment_reporting import experiment_summary
 from ..services.subscription_lifecycle import lifecycle_metrics
 from ..utils import calculate_premium_valid_until
@@ -273,28 +273,31 @@ def _record_experiment_conversion(
 
     exposure_id = _canonical_exposure_id(context)
     exposure = session.get(ExperimentExposure, exposure_id)
+    enrollment = session.get(ExperimentEnrollment, f"{exposure_id}:v2")
+    cohort = enrollment or exposure
     discount_type = _enum_value(decoded_jws.offerDiscountType)
     conversion = ExperimentConversion(
         id=transaction_id,
         original_transaction_id=str(decoded_jws.originalTransactionId),
-        experiment_id=exposure.experiment_id if exposure else context.experiment_id,
-        variant=exposure.variant if exposure else context.variant,
-        eligible=exposure.eligible if exposure else context.eligible,
+        experiment_id=cohort.experiment_id if cohort else context.experiment_id,
+        variant=cohort.variant if cohort else context.variant,
+        eligible=cohort.eligible if cohort else context.eligible,
         installation_id=(
-            exposure.installation_id if exposure else str(context.installation_id)
+            cohort.installation_id if cohort else str(context.installation_id)
         ),
         exposure_id=exposure_id,
-        app_version=exposure.app_version if exposure else context.app_version,
-        build_number=exposure.build_number if exposure else context.build_number,
+        app_version=cohort.app_version if cohort else context.app_version,
+        build_number=cohort.build_number if cohort else context.build_number,
         conversion_app_version=context.app_version,
         conversion_build_number=context.build_number,
         analytics_environment=(
-            exposure.analytics_environment
-            if exposure
+            cohort.analytics_environment
+            if cohort
             else context.analytics_environment
         ),
         user_id=user.id,
-        exposed_at_ms=exposure.exposed_at_ms if exposure else context.exposed_at_ms,
+        exposed_at_ms=(enrollment.enrolled_at_ms if enrollment else
+                       (exposure.exposed_at_ms if exposure else context.exposed_at_ms)),
         product_id=str(decoded_jws.productId),
         purchase_environment=_enum_value(decoded_jws.environment),
         starts_trial=discount_type == "FREE_TRIAL",
@@ -960,41 +963,20 @@ def create_or_update_transaction(
             session.add(db_subscription)
             session.flush()
 
-        # 2. get transaction if not found create one
-        db_transaction = session.get(Transaction, decoded_jws.transactionId)
-        if not db_transaction:
-            db_transaction = Transaction(
-                id=decoded_jws.transactionId, subscription_id=db_subscription.id
-            )
-
-        # 3. update transaction fields
-        db_transaction.product_id = decoded_jws.productId
-        db_transaction.purchase_date = decoded_jws.purchaseDate
-        db_transaction.original_purchase_date = decoded_jws.originalPurchaseDate
-        db_transaction.signed_date = decoded_jws.signedDate
-        db_transaction.expires_date = decoded_jws.expiresDate
-        db_transaction.transaction_reason = decoded_jws.transactionReason
-        db_transaction.price = decoded_jws.price
-        db_transaction.currency = decoded_jws.currency
-        db_transaction.is_upgraded = decoded_jws.isUpgraded
-        db_transaction.environment = decoded_jws.environment
-        db_transaction.revoked_date = decoded_jws.revocationDate
-        db_transaction.app_account_token = (
-            str(decoded_jws.appAccountToken)
-            if getattr(decoded_jws, "appAccountToken", None)
-            else user.id
+        db_transaction, _ = upsert_verified_transaction(
+            session=session, decoded_jws=decoded_jws, fallback_user_id=user.id,
         )
 
         # now we need to link it to the actual user it self
         if db_subscription not in user.subscriptions:
             user.subscriptions.append(db_subscription)
 
-        premium_until = calculate_premium_valid_until(decoded_jws.expiresDate)
-
-        user.premium_valid_until = premium_until
-
-        session.add(db_transaction)
+        # Repeated verified registrations also refresh the bounded backend
+        # entitlement cache, including a restore to a newly linked guest. Use
+        # persisted current facts, never the possibly stale incoming snapshot.
+        # Preserve an independently granted billing grace window.
         session.flush()
+        refresh_current_entitlement(user=user, session=session)
 
         upsert_verified_revenue_event(
             session=session,
@@ -1002,22 +984,9 @@ def create_or_update_transaction(
             user_id=user.id,
         )
 
-        if data.experiment:
-            _upsert_experiment_exposure(
-                context=data.experiment,
-                user=user,
-                session=session,
-                source="purchase_registration",
-            )
-            _record_experiment_conversion(
-                context=data.experiment,
-                decoded_jws=decoded_jws,
-                user=user,
-                session=session,
-            )
-
+        # Purchase success has its own commit boundary. Experiment conflicts or
+        # transient metadata failures must never erase verified Apple facts.
         session.commit()
-        return {"detail": "successfull"}
 
     except HTTPException:
         raise
@@ -1028,3 +997,25 @@ def create_or_update_transaction(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
         )
+
+    if data.experiment:
+        try:
+            _upsert_experiment_exposure(
+                context=data.experiment, user=user, session=session,
+                source="purchase_registration",
+            )
+            _record_experiment_conversion(
+                context=data.experiment, decoded_jws=decoded_jws,
+                user=user, session=session,
+            )
+            session.commit()
+        except HTTPException as error:
+            session.rollback()
+            return {"detail": "successfull", "experiment_tracking_status": (
+                "conflict" if error.status_code == 409 else "pending"
+            )}
+        except Exception:
+            session.rollback()
+            logger.exception("Verified purchase metadata retry needed user_id=%s", user.id)
+            return {"detail": "successfull", "experiment_tracking_status": "pending"}
+    return {"detail": "successfull"}

@@ -48,8 +48,12 @@ from core.models.experiment import ExperimentConversion, ExperimentExposure
 from core.models.subscription import Subscription
 from core.models.subscription_lifecycle import AppStoreSubscriptionLifecycleEvent
 from core.models.transaction import Transaction
+from core.models.apple_ads import AppStoreRevenueEvent
 from core.models.user import User
-from core.routers.subscriptions import get_experiment_lifecycle_summary
+from core.routers.subscriptions import (
+    get_experiment_lifecycle_summary, CreateTransactionRequest,
+    create_or_update_transaction as register_transaction,
+)
 from core.routers.webhook import (
     CreateOrUpdateTransactionRequest,
     create_or_update_transaction,
@@ -318,6 +322,8 @@ class SubscriptionLifecycleTests(unittest.TestCase):
         self.assertIsNone(user.premium_valid_until)
         event = self.session.get(AppStoreSubscriptionLifecycleEvent, "refund-1")
         self.assertEqual(event.event_kind, "refund")
+        self.assertEqual(self.session.get(Transaction, "transaction-1").revoked_date, 6_000)
+        self.assertEqual(self.session.get(AppStoreRevenueEvent, "transaction-1").revoked_date_ms, 6_000)
 
     def test_renewal_info_only_notification_is_still_captured(self):
         self.session.add(User(id="user-1"))
@@ -355,6 +361,96 @@ class SubscriptionLifecycleTests(unittest.TestCase):
         self.assertEqual(event.event_kind, "auto_renew_disabled")
         self.assertEqual(event.original_transaction_id, "original-1")
         self.assertEqual(event.auto_renew_status, 0)
+
+    def register(self, transaction):
+        with patch("core.routers.subscriptions.AppStoreService.process_transaction", return_value=transaction):
+            return register_transaction(CreateTransactionRequest(jws_payload="verified-fixture"),
+                                        self.session.get(User, "user-1"), self.session)
+
+    def notify(self, notification, transaction, renewal):
+        with (
+            patch("core.routers.webhook.AppStoreService.process_notification", return_value=notification),
+            patch("core.routers.webhook.AppStoreService.process_transaction", return_value=transaction),
+            patch("core.routers.webhook.AppStoreService.process_renewal_info", return_value=renewal),
+        ):
+            return create_or_update_transaction(
+                CreateOrUpdateTransactionRequest(signedPayload="verified-fixture"), self.session)
+
+    def test_resigned_expired_transaction_preserves_independent_grace_then_expiration(self):
+        user = User(id="user-1")
+        self.session.add(user)
+        self.session.commit()
+        transaction = self.transaction(signed_date=2_000)
+        transaction.expiresDate = 1_000
+        self.register(transaction)
+        self.notify(self.notification(uuid="grace", notification_type="DID_FAIL_TO_RENEW",
+                                      subtype="GRACE_PERIOD", status=4), transaction,
+                    self.renewal_info(billing_retry=True, grace_period_expires_date=10_000_000_000_000))
+        self.session.refresh(user)
+        self.assertIsNotNone(user.premium_valid_until)
+        transaction.signedDate = 5_000
+        self.register(transaction)
+        self.session.refresh(user)
+        self.assertIsNotNone(user.premium_valid_until)
+
+        information = self.notification(uuid="consumption-request", notification_type="CONSUMPTION_REQUEST", status=4)
+        information.signedDate = 5_500
+        information.data.signedRenewalInfo = None
+        self.notify(information, transaction, None)
+        self.register(transaction)
+        self.session.refresh(user)
+        self.assertIsNotNone(user.premium_valid_until)
+
+        expired = self.notification(uuid="grace-expired", notification_type="GRACE_PERIOD_EXPIRED", status=2)
+        expired.signedDate = 6_000
+        self.notify(expired, transaction, self.renewal_info(billing_retry=True))
+        transaction.signedDate = 7_000
+        self.register(transaction)
+        self.session.refresh(user)
+        self.assertIsNone(user.premium_valid_until)
+
+    def test_newer_refund_of_historical_transaction_does_not_hide_current_grace(self):
+        user = User(id="user-1")
+        self.session.add(user)
+        self.session.commit()
+        first = self.transaction(transaction_id="T1", signed_date=2_000)
+        first.expiresDate = 2_000
+        self.register(first)
+        current = self.transaction(transaction_id="T2", signed_date=3_000)
+        current.purchaseDate = 2_000
+        current.expiresDate = 3_000
+        self.register(current)
+        self.notify(self.notification(uuid="current-grace", notification_type="DID_FAIL_TO_RENEW",
+                                      subtype="GRACE_PERIOD", status=4), current,
+                    self.renewal_info(billing_retry=True, grace_period_expires_date=10_000_000_000_000))
+        self.session.refresh(user)
+        self.assertIsNotNone(user.premium_valid_until)
+
+        refund = self.notification(uuid="historical-refund", notification_type="REFUND", status=4)
+        refund.signedDate = 6_000
+        refund.data.signedRenewalInfo = None
+        first.signedDate = 6_000
+        first.revocationDate = 5_000
+        self.notify(refund, first, None)
+        self.session.refresh(user)
+        self.assertIsNotNone(user.premium_valid_until)
+        self.assertEqual(self.session.get(Transaction, "T1").revoked_date, 5_000)
+        self.assertIsNone(self.session.get(Transaction, "T2").revoked_date)
+
+    def test_old_renewal_info_only_state_cannot_expire_later_renewal(self):
+        user = User(id="user-1")
+        self.session.add(user)
+        self.session.commit()
+        transaction = self.transaction()
+        transaction.purchaseDate = 5_000
+        transaction.signedDate = 6_000
+        self.register(transaction)
+        expired = self.notification(uuid="historical-renewal-only", notification_type="EXPIRED", status=2)
+        expired.data.signedTransactionInfo = None
+        self.notify(expired, None, self.renewal_info())
+        self.register(transaction)
+        self.session.refresh(user)
+        self.assertIsNotNone(user.premium_valid_until)
 
     def test_experiment_lifecycle_summary_counts_events_and_subscriptions(self):
         exposure = ExperimentExposure(

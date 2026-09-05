@@ -106,3 +106,17 @@ StoreKit facts, are still needed before claiming full live tracking verification
 
 Deployment creates two new tables through existing SQLModel startup initialization;
 it does not alter the old exposure/conversion tables or rewrite historical records.
+
+## Verified purchase registration outcome
+
+`POST /subscriptions/` commits verified financial facts independently from optional
+experiment metadata. Existing successful responses remain `{ "detail": "successfull" }`.
+If metadata cannot be stored, the HTTP 200 response additionally contains
+`experiment_tracking_status: "pending"` for retryable storage failure or
+`"conflict"` for inconsistent immutable assignment. The app keeps payment success,
+retries only pending original metadata, and records bounded
+`transaction_registration_outcome` diagnostics. Do not display these metadata
+statuses as failed Apple payments or emit another purchase on retry.
+
+See `3.7-tracking-backend-audit-2026-09-05.md` for the source/HTTP/database coverage
+matrix, added discovery correlation fields, and outstanding live verification.
