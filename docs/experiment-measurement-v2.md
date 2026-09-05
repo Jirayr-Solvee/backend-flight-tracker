@@ -80,6 +80,23 @@ events per request, with authenticated user ownership. Each event contains:
 - `properties`, a strict typed allowlist. Query text, freeform error text, URLs,
   emails, receipts and tokens are not accepted fields.
 
+Schema 16 clients may include `properties.flight_identity`: a lowercase 64-character
+SHA-256 hex digest computed **once at selection** from a complete known-flight tuple
+`UPPERCASE_NUMBER_WITHOUT_SPACES|YYYY-MM-DD|DEPARTURE_IATA|ARRIVAL_IATA`. The date is the
+selected flight's date; airport codes are uppercase three-letter IATA codes. Never
+hash the user's search query, and omit identity when the known tuple is incomplete.
+Carry the frozen digest through paywall, checkout, recovery, add, and actual detail
+events rather than recomputing it after provider resolution.
+
+The protected report keeps original `selected_flight_ids` separate from
+`selected_flight_identities` and `correlated_selected_flight_ids`. A provider result
+can legitimately have no backend ID until it is saved. `flight_identity_links` joins
+later client-reported backend IDs, presentations and attempts within one installation;
+it is correlation evidence, not independent proof of backend assignment. Report
+filters or delayed delivery can leave a link incomplete. `displayed_product_id`
+describes the selected/actually displayed plan (including weekly); `assigned_product_id`
+remains the assigned experiment offer and must not replace the selected plan.
+
 Paywall views/default selections require presentation IDs. Checkout start and
 `checkout_attempt_completed` require both presentation and attempt IDs; the latter
 has exactly one outcome: `verified`, `cancelled`, `pending`, `unverified`, `error`.

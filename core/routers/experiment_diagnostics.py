@@ -21,6 +21,7 @@ from .subscriptions import ExperimentContext
 router = APIRouter()
 Token = Annotated[str, Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_.:-]+$")]
 ProductID = Annotated[str, Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_.-]+$")]
+FlightIdentity = Annotated[str, Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")]
 EventName = Literal[
     "paywall_viewed", "paywall_dismissed", "flight_detail_paywall_experiment_exposed",
     "flight_detail_paywall_experiment_enrolled",
@@ -61,6 +62,7 @@ class DiagnosticProperties(BaseModel):
     transaction_id: Token | None = None
     original_transaction_id: Token | None = None
     flight_id: Annotated[int, Field(ge=1)] | None = None
+    flight_identity: FlightIdentity | None = None
     trial_duration_days: Annotated[int, Field(ge=0, le=365)] | None = None
     event_schema_version: Annotated[int, Field(ge=1, le=1000)] | None = None
     attempt_count: Annotated[int, Field(ge=0, le=1000)] | None = None
@@ -242,15 +244,20 @@ def get_diagnostic_report(
     attempts = defaultdict(list)
     presentations = defaultdict(list)
     journeys = defaultdict(list)
+    identities = defaultdict(list)
+    properties_by_id = {}
     events = []
     for row in rows:
         properties = json.loads(row.properties_json)
+        properties_by_id[row.id] = properties
         if row.checkout_attempt_id:
             attempts[row.checkout_attempt_id].append(row)
         if row.paywall_presentation_id:
             presentations[row.paywall_presentation_id].append(row)
         if properties.get("search_journey_id"):
-            journeys[properties["search_journey_id"]].append(row)
+            journeys[(row.installation_id, properties["search_journey_id"])].append(row)
+        if properties.get("flight_identity"):
+            identities[(row.installation_id, properties["flight_identity"])].append(row)
         transaction = session.get(Transaction, properties.get("transaction_id")) if properties.get("transaction_id") else None
         owned_transaction = bool(transaction and (
             transaction.app_account_token == row.user_id
@@ -269,24 +276,45 @@ def get_diagnostic_report(
     return {
         "analytics_environment": analytics_environment,
         "count": len(events), "truncated": truncated,
-        "proof_scope": "Client diagnostic delivery only. Verified revenue comes from Apple JWS; sequence gaps can also reflect delayed delivery or report filters.",
+        "proof_scope": "Client diagnostic delivery only. Flight identity links correlate client-reported facts, not verified flight assignment. Verified revenue comes from Apple JWS; sequence gaps can also reflect delayed delivery or report filters.",
         "event_counts": dict(Counter(row.event_name for row in rows)),
         "flight_journeys": [{
-            "search_journey_id": key,
+            "installation_id": key[0],
+            "search_journey_id": key[1],
             "selected_flight_ids": sorted({json.loads(row.properties_json)["flight_id"] for row in group
                 if row.event_name == "flight_selected" and json.loads(row.properties_json).get("flight_id")}),
             "added_flight_ids": sorted({json.loads(row.properties_json)["flight_id"] for row in group
                 if row.event_name == "flight_added" and json.loads(row.properties_json).get("flight_id")}),
             "viewed_flight_ids": sorted({json.loads(row.properties_json)["flight_id"] for row in group
                 if row.event_name == "screen_flight_detail_viewed" and json.loads(row.properties_json).get("flight_id")}),
+            "selected_flight_identities": sorted({properties_by_id[row.id]["flight_identity"] for row in group
+                if row.event_name == "flight_selected" and properties_by_id[row.id].get("flight_identity")}),
+            # Provider airport results need not have a backend ID at selection.
+            # Keep reported IDs above distinct from later client identity joins.
+            "correlated_selected_flight_ids": sorted({properties_by_id[linked.id]["flight_id"]
+                for row in group if row.event_name == "flight_selected" and properties_by_id[row.id].get("flight_identity")
+                for linked in identities[(key[0], properties_by_id[row.id]["flight_identity"])]
+                if properties_by_id[linked.id].get("flight_id")}),
             "failure_events": sum(row.event_name in ("flight_add_failed", "flight_add_blocked") for row in group),
         } for key, group in journeys.items()],
+        "flight_identity_links": [{
+            "installation_id": key[0], "flight_identity": key[1],
+            "backend_flight_ids": sorted({properties_by_id[row.id]["flight_id"] for row in group
+                if properties_by_id[row.id].get("flight_id")}),
+            "event_counts": dict(Counter(row.event_name for row in group)),
+            "paywall_presentation_ids": sorted({row.paywall_presentation_id for row in group if row.paywall_presentation_id}),
+            "checkout_attempt_ids": sorted({row.checkout_attempt_id for row in group if row.checkout_attempt_id}),
+        } for key, group in sorted(identities.items())],
         "checkout_attempts": [{
             "checkout_attempt_id": key,
             "initiated_count": sum(row.event_name == "af_initiated_checkout" for row in group),
             "terminal_count": sum(row.event_name == "checkout_attempt_completed" for row in group),
             "outcomes": [json.loads(row.properties_json).get("outcome") for row in group
                          if row.event_name == "checkout_attempt_completed"],
+            "reported_product_ids": sorted({properties_by_id[row.id]["product_id"] for row in group
+                if properties_by_id[row.id].get("product_id")}),
+            "reported_displayed_product_ids": sorted({properties_by_id[row.id]["displayed_product_id"] for row in group
+                if properties_by_id[row.id].get("displayed_product_id")}),
         } for key, group in attempts.items()],
         "paywall_presentations": [{
             "paywall_presentation_id": key,
@@ -296,6 +324,8 @@ def get_diagnostic_report(
             "reported_product_ids": sorted({product for row in group
                 for product in [json.loads(row.properties_json).get("product_id")]
                 if product}),
+            "reported_displayed_product_ids": sorted({properties_by_id[row.id]["displayed_product_id"] for row in group
+                if properties_by_id[row.id].get("displayed_product_id")}),
             "reported_offer_eligibility": sorted({value for row in group
                 for value in [json.loads(row.properties_json).get("offer_eligibility")]
                 if value}),

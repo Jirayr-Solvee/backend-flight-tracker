@@ -388,6 +388,7 @@ class DiagnosticTests(unittest.TestCase):
         client = TestClient(app)
         event = self.event("paywall_alternative_plans_revealed", properties={
             "session_id": str(uuid4()), "visible_plan_count": 2,
+            "flight_identity": "d" * 64,
         })
         token = create_jwt(sub=self.user.id)
         response = client.post("/subscriptions/experiments/events",
@@ -401,6 +402,7 @@ class DiagnosticTests(unittest.TestCase):
             headers={"Authorization": f"Bearer {settings.LAMBDA_FUNCTION_AUTH_TOKEN}"})
         self.assertEqual(report.status_code, 200)
         self.assertEqual(report.json()["count"], 1)
+        self.assertEqual(report.json()["flight_identity_links"][0]["flight_identity"], "d" * 64)
 
     def test_database_rejects_second_terminal_even_if_both_requests_pass_preflight(self):
         attempt = uuid4()
@@ -428,6 +430,56 @@ class DiagnosticTests(unittest.TestCase):
         report = get_diagnostic_report(analytics_environment="development", limit=100, session=self.session)
         self.assertEqual({event["properties"]["search_journey_id"] for event in report["events"]}, {journey})
         self.assertEqual(report["event_counts"]["flight_add_failed"], 1)
+
+    def test_airport_selection_identity_joins_later_flight_id_and_checkout(self):
+        identity, journey = "a" * 64, str(uuid4())
+        installation, presentation, attempt = uuid4(), uuid4(), uuid4()
+        context = {"flight_identity": identity, "search_journey_id": journey, "search_attempt_number": 1}
+        selected = self.event("flight_selected", installation_id=installation, paywall_presentation_id=None,
+                              properties=context)
+        viewed = self.event("paywall_viewed", installation_id=installation, paywall_presentation_id=presentation,
+                            properties={**context, "displayed_product_id": "weekly"})
+        checkout = self.event("af_initiated_checkout", installation_id=installation,
+                              paywall_presentation_id=presentation, checkout_attempt_id=attempt,
+                              properties={**context, "product_id": "weekly", "displayed_product_id": "weekly"})
+        # Even a later event without a journey can be correlated by the frozen
+        # identity, scoped to this installation, without inventing a selected ID.
+        added = self.event("flight_added", installation_id=installation, paywall_presentation_id=None,
+                           properties={"flight_identity": identity, "flight_id": 42})
+        detail = self.event("screen_flight_detail_viewed", installation_id=installation,
+                            paywall_presentation_id=None, properties={**context, "flight_id": 42})
+        self.send(selected, viewed, checkout, added, detail)
+        report = get_diagnostic_report(analytics_environment="development", limit=100, session=self.session)
+        summary = report["flight_journeys"][0]
+        self.assertEqual(summary["selected_flight_ids"], [])
+        self.assertEqual(summary["selected_flight_identities"], [identity])
+        self.assertEqual(summary["correlated_selected_flight_ids"], [42])
+        self.assertEqual(summary["viewed_flight_ids"], [42])
+        link = report["flight_identity_links"][0]
+        self.assertEqual(link["backend_flight_ids"], [42])
+        self.assertEqual(link["paywall_presentation_ids"], [str(presentation)])
+        self.assertEqual(link["checkout_attempt_ids"], [str(attempt)])
+        self.assertEqual(link["event_counts"]["flight_selected"], 1)
+        self.assertEqual(report["checkout_attempts"][0]["reported_displayed_product_ids"], ["weekly"])
+
+    def test_flight_identity_join_never_crosses_installations_or_different_flights(self):
+        identity, journey = "b" * 64, str(uuid4())
+        selected = self.event("flight_selected", properties={"flight_identity": identity, "search_journey_id": journey})
+        other_install = self.event("flight_added", properties={"flight_identity": identity,
+            "flight_id": 111, "search_journey_id": journey})
+        other_flight = self.event("flight_added", installation_id=selected.installation_id,
+            properties={"flight_identity": "c" * 64, "flight_id": 222, "search_journey_id": journey})
+        self.send(selected, other_install, other_flight)
+        report = get_diagnostic_report(analytics_environment="development", limit=100, session=self.session)
+        self.assertEqual(len(report["flight_journeys"]), 2)
+        own = next(row for row in report["flight_journeys"] if row["installation_id"] == str(selected.installation_id))
+        self.assertEqual(own["correlated_selected_flight_ids"], [])
+        self.assertEqual(len(report["flight_identity_links"]), 3)
+
+    def test_flight_identity_rejects_raw_text_and_noncanonical_hashes(self):
+        for identity in ("LAX to JFK", "A" * 64, "a" * 63, "a" * 65, "a" * 64 + "\n", 42):
+            with self.subTest(identity=identity), self.assertRaises(ValidationError):
+                self.event("flight_selected", properties={"flight_identity": identity})
 
 
 if __name__ == "__main__":
