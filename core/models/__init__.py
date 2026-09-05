@@ -7,6 +7,8 @@ from .experiment import (
     ExperimentConversion,
     ExperimentExposure,
     ExperimentGoalSelection,
+    ExperimentEnrollment,
+    ExperimentDiagnosticEvent,
 )
 from .flight import Airline, Airport, Arrival, Departure, Flight
 from .live_activity import (

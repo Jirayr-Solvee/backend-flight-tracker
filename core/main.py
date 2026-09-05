@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from .routers import experiment_diagnostics
 
 # from . import lifespan
 from .routers import (apple_ads, flags, flights, incoming_email, legal,
@@ -6,6 +7,7 @@ from .routers import (apple_ads, flags, flights, incoming_email, legal,
 
 # app = FastAPI(lifespan=lifespan)
 app = FastAPI()
+app.include_router(experiment_diagnostics.router, prefix="/subscriptions", tags=["Experiment diagnostics"])
 
 app.include_router(flights.router, prefix="/flights", tags=["Flights"])
 app.include_router(users.router, prefix="/users", tags=["Users"])

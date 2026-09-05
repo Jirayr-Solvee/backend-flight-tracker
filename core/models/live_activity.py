@@ -18,6 +18,9 @@ class LiveActivityRegistration(SQLModel, table=True):
     created_at: int = Field(default_factory=lambda: int(time.time()))
     updated_at: int = Field(default_factory=lambda: int(time.time()))
     last_delivery_at: int | None = None
+    # Latest timestamp reserved before a network send, including failed sends.
+    # last_content_state_json is known current acknowledged content, or None
+    # while an overlapping/in-flight/failed send makes device state uncertain.
     last_apns_timestamp: int | None = None
     last_apns_status: str | None = None
     last_apns_reason: str | None = None

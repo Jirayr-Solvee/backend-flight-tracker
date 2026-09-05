@@ -160,7 +160,10 @@ class ExperimentReportingTests(unittest.TestCase):
             session=self.session,
         )
         self.assertEqual(
-            summary["arms"],
+            [{key: arm[key] for key in (
+                "variant", "exposed_installations", "verified_trial_installations",
+                "verified_purchase_installations", "trial_conversion_rate", "purchase_conversion_rate",
+            )} for arm in summary["arms"]],
             [
                 {
                     "variant": "treatment_simplified",
@@ -319,8 +322,7 @@ class ExperimentReportingTests(unittest.TestCase):
             app_version="3.4",
             session=self.session,
         )
-        self.assertEqual(summary["arms"][0]["exposed_installations"], 0)
-        self.assertEqual(summary["arms"][0]["verified_trial_installations"], 0)
+        self.assertEqual(summary["arms"], [])
 
     def test_final_goal_selection_is_upserted_and_aggregated(self):
         context = self.context()

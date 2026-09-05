@@ -6,6 +6,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field as PydanticField, model_validator
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 from ..config import settings
@@ -16,6 +17,7 @@ from ..models.experiment import (
     ExperimentConversion,
     ExperimentExposure,
     ExperimentGoalSelection,
+    ExperimentEnrollment,
     current_time_ms,
 )
 from ..models.subscription import Subscription
@@ -24,6 +26,7 @@ from ..models.transaction import Transaction
 from ..models.user import User, UserSubscriptionLink
 from ..services.app_store.service import AppStoreService
 from ..services.revenue_measurement import upsert_verified_revenue_event
+from ..services.experiment_reporting import experiment_summary
 from ..services.subscription_lifecycle import lifecycle_metrics
 from ..utils import calculate_premium_valid_until
 
@@ -58,8 +61,9 @@ class ExperimentContext(BaseModel):
     exposure_id: str = PydanticField(min_length=1, max_length=140)
     app_version: str = PydanticField(min_length=1, max_length=40)
     build_number: str = PydanticField(min_length=1, max_length=40)
-    analytics_environment: Literal["production", "development"]
+    analytics_environment: Literal["production", "development", "testflight"]
     exposed_at_ms: int | None = PydanticField(default=None, ge=0)
+    measurement_revision: Literal[1, 2] | None = None
 
     @model_validator(mode="after")
     def validate_exposure_id(self):
@@ -105,7 +109,9 @@ class ExperimentAssignmentRequest(BaseModel):
     current_variant: FlightDetailPaywallVariant | None = None
     app_version: str = PydanticField(min_length=1, max_length=40)
     build_number: str = PydanticField(min_length=1, max_length=40)
-    analytics_environment: Literal["production", "development"]
+    analytics_environment: Literal["production", "development", "testflight"]
+    assignment_locked: bool = False
+    measurement_revision: Literal[1, 2] | None = None
 
 
 class ExperimentAssignmentResponse(BaseModel):
@@ -121,6 +127,20 @@ class ExperimentAssignmentResponse(BaseModel):
     ]
     config_version: str
     cache_ttl_seconds: int
+    effective_variant: FlightDetailPaywallVariant
+
+
+class ExperimentEnrollmentRequest(BaseModel):
+    experiment: ExperimentContext
+    measurement_revision: Literal[2]
+    enrolled_at_ms: int = PydanticField(ge=0)
+    effective_variant: FlightDetailPaywallVariant | None = None
+    assignment_source: str | None = PydanticField(
+        default=None, max_length=80, pattern=r"^[a-z0-9_]+$"
+    )
+    config_version: str | None = PydanticField(
+        default=None, max_length=80, pattern=r"^[A-Za-z0-9._-]+$"
+    )
 
 
 class CreateTransactionRequest(BaseModel):
@@ -189,12 +209,19 @@ def _upsert_experiment_exposure(
         return None
 
     exposure_id = _canonical_exposure_id(context)
+    enrollment = session.get(ExperimentEnrollment, f"{exposure_id}:v2")
+    if enrollment and (
+        enrollment.variant != context.variant
+        or enrollment.analytics_environment != context.analytics_environment
+    ):
+        raise HTTPException(status_code=409, detail="Experiment assignment conflict")
     existing = session.get(ExperimentExposure, exposure_id)
     if existing:
         if (
             existing.experiment_id != context.experiment_id
             or existing.variant != context.variant
             or existing.installation_id != str(context.installation_id)
+            or existing.analytics_environment != context.analytics_environment
         ):
             logger.warning(
                 "Rejected experiment exposure mutation exposure_id=%s user_id=%s",
@@ -350,6 +377,11 @@ def get_experiment_assignment(
         enabled = True
         source = "deterministic_split"
 
+    effective_variant = variant
+    # Once measured, variant is history. Force/off modes change delivery only.
+    if data.assignment_locked and data.current_variant is not None:
+        variant = data.current_variant
+
     return ExperimentAssignmentResponse(
         experiment_id=data.experiment_id,
         variant=variant,
@@ -360,7 +392,69 @@ def get_experiment_assignment(
             0,
             settings.FLIGHT_DETAIL_PAYWALL_CACHE_TTL_SECONDS,
         ),
+        effective_variant=effective_variant,
     )
+
+
+@router.post("/experiments/enrollment")
+def report_experiment_enrollment(
+    data: ExperimentEnrollmentRequest,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    context = data.experiment
+    if (
+        context.experiment_id != "paywall_flight_detail_2026_09"
+        or context.variant not in (
+            "control_current_paywall", "treatment_flight_detail_card"
+        )
+        or not context.eligible
+        or context.measurement_revision not in (None, 2)
+    ):
+        raise HTTPException(status_code=422, detail="Invalid eligible enrollment")
+    exposure_id = _canonical_exposure_id(context)
+    enrollment_id = f"{exposure_id}:v2"
+    existing = session.get(ExperimentEnrollment, enrollment_id)
+    if existing:
+        if (
+            existing.variant != context.variant
+            or existing.analytics_environment != context.analytics_environment
+        ):
+            raise HTTPException(status_code=409, detail="Experiment assignment conflict")
+        return {"detail": "success", "measurement_revision": 2}
+
+    # Delivery can be out of order: only a strictly earlier legacy exposure
+    # proves this installation belonged to v1. A same/later paywall event can
+    # legitimately arrive before its durable enrollment request.
+    exposure = session.get(ExperimentExposure, exposure_id)
+    if exposure and exposure.exposed_at_ms < data.enrolled_at_ms:
+        raise HTTPException(status_code=409, detail="Installation already measured in revision 1")
+    session.add(ExperimentEnrollment(
+        id=enrollment_id,
+        experiment_id=context.experiment_id,
+        measurement_revision=2,
+        variant=context.variant,
+        effective_variant=data.effective_variant or context.variant,
+        eligible=True,
+        installation_id=str(context.installation_id),
+        exposure_id=exposure_id,
+        app_version=context.app_version,
+        build_number=context.build_number,
+        analytics_environment=context.analytics_environment,
+        user_id=user.id,
+        enrolled_at_ms=data.enrolled_at_ms,
+        assignment_source=data.assignment_source,
+        config_version=data.config_version,
+    ))
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        existing = session.get(ExperimentEnrollment, enrollment_id)
+        if (existing is None or existing.variant != context.variant
+                or existing.analytics_environment != context.analytics_environment):
+            raise HTTPException(status_code=409, detail="Experiment assignment conflict")
+    return {"detail": "success", "measurement_revision": 2}
 
 
 @router.post("/experiments/goals")
@@ -695,77 +789,22 @@ def get_experiment_summary(
     experiment_id: str,
     app_version: str | None = Query(default=None, max_length=40),
     session: Session = Depends(get_session),
+    measurement_revision: Literal[1, 2] | None = None,
+    since_ms: int | None = None,
+    until_ms: int | None = None,
+    product_id: str | None = None,
+    acquisition_source: Literal["apple_ads", "unknown"] | None = None,
+    horizon_days: Literal[14, 30] = 14,
 ):
-    exposure_statement = select(ExperimentExposure).where(
-        ExperimentExposure.experiment_id == experiment_id,
-        ExperimentExposure.eligible == True,  # noqa: E712
-        ExperimentExposure.analytics_environment == "production",
+    if since_ms is not None and until_ms is not None and until_ms <= since_ms:
+        raise HTTPException(status_code=422, detail="until_ms must be after since_ms")
+    revision = measurement_revision or (2 if experiment_id == "paywall_flight_detail_2026_09" else 1)
+    return experiment_summary(
+        session=session, experiment_id=experiment_id, app_version=app_version,
+        measurement_revision=revision, since_ms=since_ms, until_ms=until_ms,
+        product_id=product_id, acquisition_source=acquisition_source,
+        horizon_days=horizon_days,
     )
-    conversion_statement = select(ExperimentConversion).where(
-        ExperimentConversion.experiment_id == experiment_id,
-        ExperimentConversion.eligible == True,  # noqa: E712
-        ExperimentConversion.analytics_environment == "production",
-        ExperimentConversion.purchase_environment == "Production",
-    )
-    if app_version:
-        exposure_statement = exposure_statement.where(
-            ExperimentExposure.app_version == app_version
-        )
-        conversion_statement = conversion_statement.where(
-            ExperimentConversion.app_version == app_version
-        )
-
-    exposures = session.exec(exposure_statement).all()
-    conversions = session.exec(conversion_statement).all()
-    variants = sorted({item.variant for item in [*exposures, *conversions]})
-    arms = []
-    for variant in variants:
-        exposed_installations = {
-            exposure.installation_id
-            for exposure in exposures
-            if exposure.variant == variant
-        }
-        arm_conversions = [
-            conversion
-            for conversion in conversions
-            if conversion.variant == variant
-            and conversion.installation_id in exposed_installations
-        ]
-        trial_installations = {
-            conversion.installation_id
-            for conversion in arm_conversions
-            if conversion.starts_trial
-        }
-        purchase_installations = {
-            conversion.installation_id for conversion in arm_conversions
-        }
-        exposure_count = len(exposed_installations)
-        trial_count = len(trial_installations)
-        purchase_count = len(purchase_installations)
-        arms.append(
-            {
-                "variant": variant,
-                "exposed_installations": exposure_count,
-                "verified_trial_installations": trial_count,
-                "verified_purchase_installations": purchase_count,
-                "trial_conversion_rate": (
-                    round(trial_count / exposure_count, 4) if exposure_count else None
-                ),
-                "purchase_conversion_rate": (
-                    round(purchase_count / exposure_count, 4)
-                    if exposure_count
-                    else None
-                ),
-            }
-        )
-
-    return {
-        "experiment_id": experiment_id,
-        "app_version": app_version,
-        "analytics_environment": "production",
-        "purchase_environment": "Production",
-        "arms": arms,
-    }
 
 
 LIFECYCLE_METRIC_NAMES = (
@@ -790,7 +829,9 @@ def get_experiment_lifecycle_summary(
     experiment_id: str,
     app_version: str | None = Query(default=None, max_length=40),
     session: Session = Depends(get_session),
+    measurement_revision: Literal[1, 2] | None = None,
 ):
+    revision = measurement_revision or (2 if experiment_id == "paywall_flight_detail_2026_09" else 1)
     exposure_statement = select(ExperimentExposure).where(
         ExperimentExposure.experiment_id == experiment_id,
         ExperimentExposure.eligible == True,  # noqa: E712
@@ -810,6 +851,16 @@ def get_experiment_lifecycle_summary(
             ExperimentConversion.app_version == app_version
         )
     exposures = session.exec(exposure_statement).all()
+    enrollments = session.exec(select(ExperimentEnrollment).where(
+        ExperimentEnrollment.experiment_id == experiment_id,
+        ExperimentEnrollment.eligible == True,  # noqa: E712
+        ExperimentEnrollment.analytics_environment == "production",
+    )).all()
+    enrolled_installations = {item.installation_id for item in enrollments}
+    if revision == 2:
+        exposures = [item for item in enrollments if not app_version or item.app_version == app_version]
+    else:
+        exposures = [item for item in exposures if item.installation_id not in enrolled_installations]
     conversions = session.exec(conversion_statement).all()
     exposure_variants = {
         exposure.installation_id: exposure.variant for exposure in exposures
@@ -876,6 +927,8 @@ def get_experiment_lifecycle_summary(
         "experiment_id": experiment_id,
         "app_version": app_version,
         "purchase_environment": "Production",
+        "measurement_revision": revision,
+        "denominator": "selected_flight_enrollment" if revision == 2 else "legacy_paywall_exposure",
         "arms": arms,
     }
 

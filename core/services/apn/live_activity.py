@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from aioapns import NotificationRequest, PushType
+from sqlalchemy import case, func, update
 from sqlmodel import Session, select
 
 from ...config import settings
@@ -147,10 +148,13 @@ def _status_label(status: str) -> str:
     }.get(status, "Unknown")
 
 
-def _gate_label(flight: Flight, status: str) -> str | None:
+def _operational_detail(flight: Flight, status: str) -> tuple[str | None, str | None]:
     if status in {
         "Unknown",
         "Expected",
+        "CheckIn",
+        "Boarding",
+        "GateClosed",
         "Delayed",
         "Canceled",
         "Diverted",
@@ -161,8 +165,18 @@ def _gate_label(flight: Flight, status: str) -> str | None:
         detail = flight.arrival
 
     if detail is None:
-        return None
-    return detail.gate or detail.terminal or detail.checkin_desk or detail.baggage_belt
+        return None, None
+    for kind, value in (
+        ("gate", detail.gate), ("terminal", detail.terminal),
+        ("check_in", detail.checkin_desk), ("baggage", detail.baggage_belt),
+    ):
+        if value and value.strip() and value.strip().casefold() not in {"--", "—", "unknown", "none", "null", "n/a"}:
+            return kind, value.strip()
+    return None, None
+
+
+def _gate_label(flight: Flight, status: str) -> str | None:
+    return _operational_detail(flight, status)[1]
 
 
 def make_content_state(
@@ -178,6 +192,7 @@ def make_content_state(
     # fallback stable prevents identical webhook snapshots from consuming the
     # ActivityKit push budget just because wall-clock time advanced.
     fallback_progress = 1.0 if status == "Arrived" else 0.0
+    operational_kind, operational_value = _operational_detail(flight, status)
 
     return {
         "flightId": flight.id,
@@ -197,7 +212,8 @@ def make_content_state(
         "departureTimeLabel": _time_label(flight.departure, uses_12_hour_time),
         "arrivalTimeLabel": _time_label(flight.arrival, uses_12_hour_time),
         "statusLabel": _status_label(status),
-        "gateLabel": _gate_label(flight, status),
+        "gateLabel": operational_value,
+        "operationalDetailKind": operational_kind,
         "progress": fallback_progress,
         "departureDate": _activitykit_date(departure_date),
         "arrivalDate": _activitykit_date(arrival_date),
@@ -300,6 +316,36 @@ def _push_to_start_candidates(
 
 def _push_token_fingerprint(push_token: str) -> str:
     return hashlib.sha256(push_token.encode("ascii")).hexdigest()[:16]
+
+
+def _reserve_apns_timestamp(registration: LiveActivityRegistration) -> int | None:
+    """Reserve ordering across API/fetcher processes without holding a network lock.
+
+    This is the latest reserved timestamp. Invalidate the deduplication snapshot
+    until the newest send succeeds: an older in-flight update may reach the device
+    even when its completion loses our CAS race against a newer failed send.
+    """
+    now = int(time.time())
+    previous = func.coalesce(LiveActivityRegistration.last_apns_timestamp, 0)
+    with Session(engine) as reservation_session:
+        timestamp = reservation_session.exec(
+            update(LiveActivityRegistration)
+            .where(
+                LiveActivityRegistration.activity_id == registration.activity_id,
+                LiveActivityRegistration.active == True,  # noqa: E712
+                LiveActivityRegistration.push_token == registration.push_token,
+                LiveActivityRegistration.flight_id == registration.flight_id,
+                LiveActivityRegistration.apns_environment == registration.apns_environment,
+                LiveActivityRegistration.uses_12_hour_time == registration.uses_12_hour_time,
+            )
+            .values(
+                last_apns_timestamp=case((previous >= now, previous + 1), else_=now),
+                last_content_state_json=None,
+            )
+            .returning(LiveActivityRegistration.last_apns_timestamp)
+        ).scalar_one_or_none()
+        reservation_session.commit()
+        return timestamp
 
 
 class LiveActivityService:
@@ -513,24 +559,25 @@ class LiveActivityService:
                 ]
             ] = []
             for registration in registrations:
-                # ActivityKit discards updates whose timestamps are older than
-                # the last accepted update. Multiple webhook snapshots can be
-                # processed within one wall-clock second, so make this value
-                # monotonically increasing per activity.
-                payload_timestamp = max(
-                    int(time.time()),
-                    (registration.last_apns_timestamp or 0) + 1,
-                )
                 payload, event, content_state_json = make_live_activity_payload(
                     flight,
                     uses_12_hour_time=registration.uses_12_hour_time,
-                    now=datetime.fromtimestamp(payload_timestamp, tz=timezone.utc),
                 )
                 if (
                     event == "update"
                     and registration.last_content_state_json == content_state_json
                 ):
                     continue
+
+                # Reserving only after deduplication preserves the existing
+                # success-based suppression, while SQLite serializes timestamp
+                # allocation across the API and fetcher workers.
+                payload_timestamp = _reserve_apns_timestamp(registration)
+                if payload_timestamp is None:
+                    continue
+                payload["aps"]["timestamp"] = payload_timestamp
+                if event == "end":
+                    payload["aps"]["dismissal-date"] = payload_timestamp + 14_400
 
                 use_sandbox = registration.apns_environment == "sandbox"
                 request = NotificationRequest(
@@ -594,53 +641,51 @@ class LiveActivityService:
                     _,
                     payload_timestamp,
                 ) = delivery
-                registration.last_delivery_at = delivered_at
-                registration.updated_at = delivered_at
+                completion: dict[str, Any] = {
+                    "last_delivery_at": delivered_at,
+                    "updated_at": delivered_at,
+                }
 
                 if isinstance(result, BaseException):
-                    registration.last_apns_status = "exception"
-                    registration.last_apns_reason = type(result).__name__
+                    completion["last_apns_status"] = "exception"
+                    completion["last_apns_reason"] = type(result).__name__
                     logger.error(
                         "Live Activity APNs delivery raised: activity_id=%s flight_id=%s event=%s",
                         registration.activity_id,
                         flight_id,
                         event,
                     )
-                    session.add(registration)
-                    continue
-
-                if result is None:
-                    registration.last_apns_status = "no_response"
-                    registration.last_apns_reason = "No APNs result"
-                    session.add(registration)
-                    continue
-
-                registration.last_apns_status = str(result.status)
-                registration.last_apns_reason = str(result.description)
-                if result.is_successful:
-                    registration.last_apns_timestamp = payload_timestamp
-                    registration.last_content_state_json = content_state_json
-                    if event == "end":
-                        registration.active = False
-                    logger.info(
-                        "Live Activity APNs delivered: activity_id=%s flight_id=%s event=%s apns_id=%s",
-                        registration.activity_id,
-                        flight_id,
-                        event,
-                        request.notification_id,
-                    )
+                elif result is None:
+                    completion["last_apns_status"] = "no_response"
+                    completion["last_apns_reason"] = "No APNs result"
                 else:
-                    if str(result.description) in INVALID_TOKEN_REASONS:
-                        registration.active = False
-                    logger.warning(
-                        "Live Activity APNs rejected: activity_id=%s flight_id=%s event=%s status=%s reason=%s apns_id=%s",
-                        registration.activity_id,
-                        flight_id,
-                        event,
-                        result.status,
-                        result.description,
-                        request.notification_id,
-                    )
-                session.add(registration)
+                    completion["last_apns_status"] = str(result.status)
+                    completion["last_apns_reason"] = str(result.description)
+                    if result.is_successful:
+                        completion["last_content_state_json"] = content_state_json
+                        if event == "end":
+                            completion["active"] = False
+                        logger.info(
+                            "Live Activity APNs delivered: activity_id=%s flight_id=%s event=%s apns_id=%s",
+                            registration.activity_id, flight_id, event, request.notification_id,
+                        )
+                    else:
+                        if str(result.description) in INVALID_TOKEN_REASONS:
+                            completion["active"] = False
+                        logger.warning(
+                            "Live Activity APNs rejected: activity_id=%s flight_id=%s event=%s status=%s reason=%s apns_id=%s",
+                            registration.activity_id, flight_id, event,
+                            result.status, result.description, request.notification_id,
+                        )
+                # An older response must not rewind successful content or
+                # deactivate a rotated token after a newer request has started.
+                session.exec(update(LiveActivityRegistration).where(
+                    LiveActivityRegistration.activity_id == registration.activity_id,
+                    LiveActivityRegistration.push_token == registration.push_token,
+                    LiveActivityRegistration.flight_id == flight_id,
+                    LiveActivityRegistration.last_apns_timestamp == payload_timestamp,
+                    LiveActivityRegistration.apns_environment == registration.apns_environment,
+                    LiveActivityRegistration.uses_12_hour_time == registration.uses_12_hour_time,
+                ).values(**completion).execution_options(synchronize_session=False))
 
             session.commit()

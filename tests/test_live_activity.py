@@ -1,4 +1,7 @@
 import os
+import asyncio
+import json
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -139,6 +142,7 @@ class LiveActivityPayloadTests(unittest.TestCase):
                 "arrivalTimeLabel",
                 "statusLabel",
                 "gateLabel",
+                "operationalDetailKind",
                 "progress",
                 "departureDate",
                 "arrivalDate",
@@ -153,6 +157,7 @@ class LiveActivityPayloadTests(unittest.TestCase):
         self.assertEqual(state["arrivalTimeLabel"], "17:55")
         self.assertEqual(state["statusLabel"], "En Route")
         self.assertEqual(state["gateLabel"], "B14")
+        self.assertEqual(state["operationalDetailKind"], "gate")
         self.assertTrue(state["isDelayed"])
 
         # Swift's default Codable Date strategy uses seconds since 2001,
@@ -194,6 +199,36 @@ class LiveActivityPayloadTests(unittest.TestCase):
             aps["alert"]["title-loc-key"],
             "Live tracking started for %@",
         )
+
+    def test_predeparture_stages_show_departure_gate(self):
+        for status in ("Expected", "CheckIn", "Boarding", "GateClosed", "Delayed"):
+            with self.subTest(status=status):
+                state = make_live_activity_payload(self._flight(status))[0]["aps"]["content-state"]
+                self.assertEqual(state["gateLabel"], "31B")
+                self.assertEqual(state["operationalDetailKind"], "gate")
+        for status in ("EnRoute", "Departed", "Approaching", "Arrived"):
+            with self.subTest(status=status):
+                state = make_live_activity_payload(self._flight(status))[0]["aps"]["content-state"]
+                self.assertEqual(state["gateLabel"], "B14")
+
+    def test_operational_fallback_reports_actual_kind_and_skips_placeholders(self):
+        flight = self._flight("Boarding")
+        flight.departure.gate = " Unknown "
+        flight.departure.terminal = " 2 "
+        flight.departure.checkin_desk = "17-22"
+        flight.departure.baggage_belt = "4"
+        state = make_live_activity_payload(flight)[0]["aps"]["content-state"]
+        self.assertEqual((state["operationalDetailKind"], state["gateLabel"]), ("terminal", "2"))
+        flight.departure.terminal = "—"
+        state = make_live_activity_payload(flight)[0]["aps"]["content-state"]
+        self.assertEqual((state["operationalDetailKind"], state["gateLabel"]), ("check_in", "17-22"))
+        flight.departure.checkin_desk = "none"
+        state = make_live_activity_payload(flight)[0]["aps"]["content-state"]
+        self.assertEqual((state["operationalDetailKind"], state["gateLabel"]), ("baggage", "4"))
+        flight.departure.baggage_belt = "n/a"
+        state = make_live_activity_payload(flight)[0]["aps"]["content-state"]
+        self.assertIsNone(state["operationalDetailKind"])
+        self.assertIsNone(state["gateLabel"])
 
 
 class LiveActivityRegistrationTests(unittest.TestCase):
@@ -379,6 +414,144 @@ class LiveActivityRegistrationTests(unittest.TestCase):
 
 
 class LiveActivityDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _seed_activity(test_engine):
+        SQLModel.metadata.create_all(test_engine)
+        with Session(test_engine) as session:
+            user = User(id="concurrency-user")
+            device = Device(id="concurrency-device", user_id=user.id)
+            flight = LiveActivityPayloadTests._flight("Boarding")
+            session.add_all([user, device, flight])
+            session.commit()
+            session.add(LiveActivityRegistration(
+                activity_id="concurrency-activity", push_token="ab" * 32,
+                flight_id=flight.id, device_id=device.id,
+            ))
+            session.commit()
+            return flight.id
+
+    async def test_overlapping_workers_reserve_unique_timestamps_and_old_completion_cannot_rewind(self):
+        with tempfile.TemporaryDirectory(prefix="sofly-live-activity-test-") as directory:
+            test_engine = create_engine(f"sqlite:///{directory}/events.sqlite")
+            flight_id = self._seed_activity(test_engine)
+            first_in_flight, release_first = asyncio.Event(), asyncio.Event()
+
+            class OverlappingAPNsClient:
+                def __init__(self):
+                    self.requests = []
+
+                async def send_notification(self, request):
+                    self.requests.append(request)
+                    if len(self.requests) == 1:
+                        first_in_flight.set()
+                        await release_first.wait()
+                    return NotificationResult(notification_id=request.notification_id, status="200")
+
+            client = OverlappingAPNsClient()
+            with mock.patch("core.services.apn.live_activity.engine", test_engine), \
+                    mock.patch("core.services.apn.live_activity.get_apns_client", return_value=client), \
+                    mock.patch("core.services.apn.live_activity.time.time", return_value=1_788_000_000):
+                first = asyncio.create_task(LiveActivityService.send_updates_for_flight(flight_id))
+                await asyncio.wait_for(first_in_flight.wait(), timeout=2)
+                with Session(test_engine) as session:
+                    flight = session.get(Flight, flight_id)
+                    flight.departure.gate = "99"
+                    session.add(flight.departure)
+                    session.commit()
+                await LiveActivityService.send_updates_for_flight(flight_id)
+                release_first.set()
+                await first
+                await LiveActivityService.send_updates_for_flight(flight_id)
+
+            self.assertEqual(len(client.requests), 2)
+            timestamps = [request.message["aps"]["timestamp"] for request in client.requests]
+            self.assertEqual(timestamps, [1_788_000_000, 1_788_000_001])
+            with Session(test_engine) as session:
+                row = session.get(LiveActivityRegistration, "concurrency-activity")
+                self.assertEqual(row.last_apns_timestamp, timestamps[1])
+                self.assertEqual(json.loads(row.last_content_state_json)["gateLabel"], "99")
+            test_engine.dispose()
+
+    async def test_failed_reserved_update_is_retried_without_suppressing_unchanged_content(self):
+        test_engine = create_engine("sqlite://")
+        flight_id = self._seed_activity(test_engine)
+
+        class TransientAPNsClient:
+            def __init__(self):
+                self.requests = []
+
+            async def send_notification(self, request):
+                self.requests.append(request)
+                return NotificationResult(notification_id=request.notification_id,
+                    status="503" if len(self.requests) <= 3 else "200")
+
+        client = TransientAPNsClient()
+        with mock.patch("core.services.apn.live_activity.engine", test_engine), \
+                mock.patch("core.services.apn.live_activity.get_apns_client", return_value=client), \
+                mock.patch("core.services.apn.live_activity.time.time", return_value=1_788_000_000), \
+                mock.patch("core.services.apn.live_activity.asyncio.sleep", new_callable=mock.AsyncMock):
+            await LiveActivityService.send_updates_for_flight(flight_id)
+            with Session(test_engine) as session:
+                row = session.get(LiveActivityRegistration, "concurrency-activity")
+                self.assertIsNone(row.last_content_state_json)
+                self.assertTrue(row.active)
+            await LiveActivityService.send_updates_for_flight(flight_id)
+            await LiveActivityService.send_updates_for_flight(flight_id)
+        self.assertEqual(len(client.requests), 4)
+        self.assertEqual([request.message["aps"]["timestamp"] for request in client.requests],
+                         [1_788_000_000, 1_788_000_000, 1_788_000_000, 1_788_000_001])
+        test_engine.dispose()
+
+    async def test_newer_failure_and_older_success_cannot_suppress_correction_to_previous_value(self):
+        with tempfile.TemporaryDirectory(prefix="sofly-live-activity-test-") as directory:
+            test_engine = create_engine(f"sqlite:///{directory}/events.sqlite")
+            flight_id = self._seed_activity(test_engine)
+            older_in_flight, release_older = asyncio.Event(), asyncio.Event()
+
+            def set_gate(value):
+                with Session(test_engine) as session:
+                    flight = session.get(Flight, flight_id)
+                    flight.departure.gate = value
+                    session.add(flight.departure)
+                    session.commit()
+
+            class ReorderedAPNsClient:
+                def __init__(self):
+                    self.gates = []
+
+                async def send_notification(self, request):
+                    gate = request.message["aps"]["content-state"]["gateLabel"]
+                    self.gates.append(gate)
+                    if gate == "B":
+                        older_in_flight.set()
+                        await release_older.wait()
+                    return NotificationResult(notification_id=request.notification_id,
+                        status="503" if gate == "C" else "200")
+
+            client = ReorderedAPNsClient()
+            with mock.patch("core.services.apn.live_activity.engine", test_engine), \
+                    mock.patch("core.services.apn.live_activity.get_apns_client", return_value=client), \
+                    mock.patch("core.services.apn.live_activity.asyncio.sleep", new_callable=mock.AsyncMock):
+                set_gate("A")
+                await LiveActivityService.send_updates_for_flight(flight_id)
+                set_gate("B")
+                older = asyncio.create_task(LiveActivityService.send_updates_for_flight(flight_id))
+                await asyncio.wait_for(older_in_flight.wait(), timeout=2)
+                set_gate("C")
+                await LiveActivityService.send_updates_for_flight(flight_id)
+                release_older.set()
+                await older
+                with Session(test_engine) as session:
+                    row = session.get(LiveActivityRegistration, "concurrency-activity")
+                    self.assertIsNone(row.last_content_state_json)
+                set_gate("A")
+                await LiveActivityService.send_updates_for_flight(flight_id)
+            self.assertEqual(client.gates, ["A", "B", "C", "C", "C", "A"])
+            with Session(test_engine) as session:
+                row = session.get(LiveActivityRegistration, "concurrency-activity")
+                self.assertEqual(json.loads(row.last_content_state_json)["gateLabel"], "A")
+            test_engine.dispose()
+
     async def test_due_flight_is_started_once_with_push_to_start_token(self):
         test_engine = create_engine("sqlite://")
         SQLModel.metadata.create_all(test_engine)
