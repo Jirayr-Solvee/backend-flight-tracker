@@ -64,11 +64,18 @@ cd /home/ubuntu/backend-flight-tracker
 git status --short
 git pull --ff-only origin main
 /home/ubuntu/backend-flight-tracker/venv/bin/python3 -m compileall core
-sudo systemctl restart flight-tracker.service
-sleep 3
-systemctl is-active flight-tracker.service
+sudo systemctl restart flight-fetcher.service && \
+  /home/ubuntu/backend-flight-tracker/venv/bin/python3 scripts/check_service_readiness.py --service fetcher && \
+  sudo systemctl restart flight-tracker.service && \
+  /home/ubuntu/backend-flight-tracker/venv/bin/python3 scripts/check_service_readiness.py && \
+  systemctl is-active flight-fetcher.service flight-tracker.service
 sudo journalctl -u flight-tracker.service --since "2 minutes ago" --no-pager | tail -n 80
 ```
+
+- Restart the services sequentially, not simultaneously. Each readiness gate has a 45-second total deadline and a 3-second per-request timeout. It requires two consecutive HTTP 200 OpenAPI responses with the expected service-specific route, without authentication or provider calls.
+- A systemd unit can be `active` while a Gunicorn worker is stalled before startup. Never call deployment healthy based only on `systemctl is-active`, an open TCP port, or one successful request to the other service.
+- If either gate fails, stop the deployment sequence and inspect both service journals/processes. The checker does not automatically restart or roll back services. Do not continue to the next restart or report success.
+- This proves application HTTP readiness, not third-party provider health, database behavior, or every API worker. Follow it with the scoped authenticated smoke check relevant to the change; do not print credentials, raw query text, or response bodies.
 
 ### Test Global Flights
 
