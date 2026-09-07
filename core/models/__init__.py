@@ -7,6 +7,8 @@ from .experiment import (
     ExperimentConversion,
     ExperimentExposure,
     ExperimentGoalSelection,
+    ExperimentGoalConfirmation,
+    ExperimentGoalConfirmationReceipt,
     ExperimentEnrollment,
     ExperimentDiagnosticEvent,
 )

@@ -21,6 +21,7 @@ from ..models.flight import (
     SearchFailureReportRequest,
     SearchQueryRequest,
     SearchRecoveryRead,
+    SearchSuggestionRead,
 )
 from ..models.live_activity import LiveActivityRegistration
 from ..models.user import User, UserFlightLink
@@ -103,6 +104,7 @@ class SearchExecutionResult:
     provider_result_count: int
     filtered_result_count: int
     only_landed_results: bool
+    exclusion_reasons: frozenset[str] = frozenset()
 
 
 async def _execute_search_with_date_fallback_details(
@@ -119,6 +121,7 @@ async def _execute_search_with_date_fallback_details(
         session=session,
     )
     provider_result_count = _search_result_count(initial_response)
+    exclusion_reasons = FlightQueryHandler.search_exclusion_reasons(initial_response, now=now)
     only_landed_results = FlightQueryHandler.search_response_is_landed_only(
         initial_response
     )
@@ -149,6 +152,7 @@ async def _execute_search_with_date_fallback_details(
             provider_result_count=provider_result_count,
             filtered_result_count=filtered_result_count,
             only_landed_results=False,
+            exclusion_reasons=frozenset(exclusion_reasons),
         )
     if max_days <= 0:
         return SearchExecutionResult(
@@ -156,6 +160,7 @@ async def _execute_search_with_date_fallback_details(
             provider_result_count=provider_result_count,
             filtered_result_count=filtered_result_count,
             only_landed_results=only_landed_results,
+            exclusion_reasons=frozenset(exclusion_reasons),
         )
 
     try:
@@ -166,6 +171,7 @@ async def _execute_search_with_date_fallback_details(
             provider_result_count=provider_result_count,
             filtered_result_count=filtered_result_count,
             only_landed_results=only_landed_results,
+            exclusion_reasons=frozenset(exclusion_reasons),
         )
 
     for offset in range(1, max_days + 1):
@@ -182,6 +188,7 @@ async def _execute_search_with_date_fallback_details(
             session=session,
         )
         candidate_provider_count = _search_result_count(candidate_response)
+        exclusion_reasons.update(FlightQueryHandler.search_exclusion_reasons(candidate_response, now=now))
         previous_provider_count = provider_result_count
         provider_result_count += candidate_provider_count
         if candidate_provider_count:
@@ -206,6 +213,7 @@ async def _execute_search_with_date_fallback_details(
                 provider_result_count=provider_result_count,
                 filtered_result_count=filtered_result_count,
                 only_landed_results=False,
+                exclusion_reasons=frozenset(exclusion_reasons),
             )
 
     return SearchExecutionResult(
@@ -213,6 +221,7 @@ async def _execute_search_with_date_fallback_details(
         provider_result_count=provider_result_count,
         filtered_result_count=filtered_result_count,
         only_landed_results=only_landed_results and provider_result_count > 0,
+        exclusion_reasons=frozenset(exclusion_reasons),
     )
 
 
@@ -688,7 +697,16 @@ async def search_flights_from_text(
                         else "results_filtered_out"
                     ),
                     detected_query_type=query_type,
-                    suggestions=[],
+                    recovery_query=normalized_term,
+                    exclusion_reason=(next(iter(execution.exclusion_reasons))
+                                      if len(execution.exclusion_reasons) == 1
+                                      else ("mixed" if execution.exclusion_reasons else None)),
+                    suggestions=[
+                        # Released clients auto-submit every nonempty query,
+                        # regardless of kind. Keep edit actions empty for them.
+                        SearchSuggestionRead(label="Change date", query="", kind="change_date"),
+                        SearchSuggestionRead(label="Search by route or airport", query="", kind="search_route"),
+                    ],
                 )
             else:
                 flights.recovery = ai_service.recovery_for_empty_result(

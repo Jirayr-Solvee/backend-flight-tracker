@@ -1254,16 +1254,25 @@ class FlightQueryHandler:
         *,
         now: datetime | None = None,
     ) -> bool:
+        return cls.search_exclusion_reason(flight, now=now) is None
+
+    @classmethod
+    def search_exclusion_reason(cls, flight, *, now: datetime | None = None) -> str | None:
+        """Explain the existing eligibility policy without broadening it."""
         effective_now = now or datetime.now(timezone.utc)
         status_value = cls._search_status_value(flight.status)
         if status_value not in cls.TRACKABLE_SEARCH_STATUSES:
-            return False
+            if status_value == FlightStatusEnum.ARRIVED.value:
+                return "past"
+            if "cancel" in status_value.casefold():
+                return "cancelled"
+            return "unknown_status"
 
         arrival = getattr(flight, "arrival", None)
         departure = getattr(flight, "departure", None)
         actual_arrival = cls._search_segment_time(arrival, "runway_time_utc")
         if actual_arrival and actual_arrival <= effective_now:
-            return False
+            return "past"
 
         expected_arrival = actual_arrival or cls._first_search_segment_time(
             arrival,
@@ -1272,7 +1281,7 @@ class FlightQueryHandler:
             "scheduled_time_utc",
         )
         if expected_arrival:
-            return expected_arrival > effective_now
+            return None if expected_arrival > effective_now else "past"
 
         effective_departure = cls._first_search_segment_time(
             departure,
@@ -1282,12 +1291,17 @@ class FlightQueryHandler:
             "scheduled_time_utc",
         )
         if effective_departure:
-            return (
+            return None if (
                 effective_departure > effective_now
                 or status_value in cls.ACTIVE_SEARCH_STATUSES
-            )
+            ) else "past"
 
-        return status_value in cls.ACTIVE_SEARCH_STATUSES
+        return None if status_value in cls.ACTIVE_SEARCH_STATUSES else "missing_timing"
+
+    @classmethod
+    def search_exclusion_reasons(cls, response, *, now=None) -> set[str]:
+        return {reason for flight in [*response.flights_result, *response.airport_flights_result]
+                if (reason := cls.search_exclusion_reason(flight, now=now)) is not None}
 
     @staticmethod
     def _search_status_value(status_value: Any) -> str:

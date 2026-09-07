@@ -27,6 +27,7 @@ from ..models.user import User, UserSubscriptionLink
 from ..services.app_store.service import AppStoreService
 from ..services.revenue_measurement import refresh_current_entitlement, upsert_verified_transaction, upsert_verified_revenue_event
 from ..services.experiment_reporting import experiment_summary
+from ..services.goal_confirmation import apply_goal_confirmation
 from ..services.subscription_lifecycle import lifecycle_metrics
 from ..utils import calculate_premium_valid_until
 
@@ -88,9 +89,15 @@ class ExperimentGoalSelectionRequest(BaseModel):
         max_length=4,
     )
     selected_at_ms: int = PydanticField(ge=0)
+    confirmation_revision: int | None = PydanticField(
+        default=None, ge=1, le=9_223_372_036_854_775_807, strict=True,
+    )
+    confirmation_id: UUID | None = None
 
     @model_validator(mode="after")
     def validate_goal_keys(self):
+        if (self.confirmation_revision is None) != (self.confirmation_id is None):
+            raise ValueError("confirmation_revision and confirmation_id must be supplied together")
         if len(set(self.selected_goal_keys)) != len(self.selected_goal_keys):
             raise ValueError("selected_goal_keys must be unique")
         self.selected_goal_keys = sorted(self.selected_goal_keys)
@@ -481,6 +488,10 @@ def report_experiment_goal_selection(
     exposure_id = _canonical_exposure_id(context)
     canonical_keys = ",".join(data.selected_goal_keys)
     try:
+        # The ordering ledger's first INSERT acquires SQLite's write lock before
+        # any exposure/selection reads; its conditional UPSERT is the only
+        # acceptance decision across independent workers.
+        result = apply_goal_confirmation(session=session, data=data, user=user)
         _upsert_experiment_exposure(
             context=context,
             user=user,
@@ -493,16 +504,18 @@ def report_experiment_goal_selection(
                 existing.experiment_id != context.experiment_id
                 or existing.variant != context.variant
                 or existing.installation_id != str(context.installation_id)
+                or existing.analytics_environment != context.analytics_environment
             ):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Experiment assignment conflict",
                 )
-            existing.selected_goal_keys = canonical_keys
-            existing.selected_at_ms = data.selected_at_ms
-            existing.last_reported_at_ms = current_time_ms()
-            session.add(existing)
-        else:
+            if result["status"] == "accepted":
+                existing.selected_goal_keys = canonical_keys
+                existing.selected_at_ms = data.selected_at_ms
+                existing.last_reported_at_ms = current_time_ms()
+                session.add(existing)
+        elif result["status"] == "accepted":
             session.add(
                 ExperimentGoalSelection(
                     id=exposure_id,
@@ -520,7 +533,8 @@ def report_experiment_goal_selection(
                 )
             )
         session.commit()
-        return {"detail": "success"}
+        return ({"detail": "success", **result} if data.confirmation_id is not None
+                else {"detail": "success"})
     except HTTPException:
         session.rollback()
         raise
@@ -792,13 +806,23 @@ def get_experiment_summary(
     experiment_id: str,
     app_version: str | None = Query(default=None, max_length=40),
     session: Session = Depends(get_session),
-    measurement_revision: Literal[1, 2] | None = None,
+    measurement_revision: int | None = None,
     since_ms: int | None = None,
     until_ms: int | None = None,
     product_id: str | None = None,
     acquisition_source: Literal["apple_ads", "unknown"] | None = None,
-    horizon_days: Literal[14, 30] = 14,
+    horizon_days: int = 14,
+    build_number: str | None = None,
+    reporting_window: Literal["full_release", "monitoring_window", "custom"] = "custom",
 ):
+    if measurement_revision not in (None, 1, 2):
+        raise HTTPException(status_code=422, detail="measurement_revision must be 1 or 2")
+    if horizon_days not in (14, 30):
+        raise HTTPException(status_code=422, detail="horizon_days must be 14 or 30")
+    if reporting_window != "custom" and (since_ms is None or app_version is None):
+        raise HTTPException(status_code=422, detail="Labeled windows require app_version and since_ms")
+    if build_number is not None and len(build_number) > 40:
+        raise HTTPException(status_code=422, detail="build_number is too long")
     if since_ms is not None and until_ms is not None and until_ms <= since_ms:
         raise HTTPException(status_code=422, detail="until_ms must be after since_ms")
     revision = measurement_revision or (2 if experiment_id == "paywall_flight_detail_2026_09" else 1)
@@ -807,6 +831,7 @@ def get_experiment_summary(
         measurement_revision=revision, since_ms=since_ms, until_ms=until_ms,
         product_id=product_id, acquisition_source=acquisition_source,
         horizon_days=horizon_days,
+        build_number=build_number, reporting_window=reporting_window,
     )
 
 
@@ -832,8 +857,10 @@ def get_experiment_lifecycle_summary(
     experiment_id: str,
     app_version: str | None = Query(default=None, max_length=40),
     session: Session = Depends(get_session),
-    measurement_revision: Literal[1, 2] | None = None,
+    measurement_revision: int | None = None,
 ):
+    if measurement_revision not in (None, 1, 2):
+        raise HTTPException(status_code=422, detail="measurement_revision must be 1 or 2")
     revision = measurement_revision or (2 if experiment_id == "paywall_flight_detail_2026_09" else 1)
     exposure_statement = select(ExperimentExposure).where(
         ExperimentExposure.experiment_id == experiment_id,

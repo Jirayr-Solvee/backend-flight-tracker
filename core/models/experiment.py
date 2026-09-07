@@ -72,6 +72,28 @@ class ExperimentGoalSelection(SQLModel, table=True):
     last_reported_at_ms: int = Field(default_factory=current_time_ms)
 
 
+class ExperimentGoalConfirmation(SQLModel, table=True):
+    """Additive ordering ledger; no rewrite of historical goal/exposure rows."""
+
+    id: str = Field(primary_key=True)
+    confirmation_revision: int = 0
+    confirmation_id: str | None = None
+    selected_at_ms: int = 0
+    payload_sha256: str = ""
+    capture_payload_json: str = "{}"
+
+
+class ExperimentGoalConfirmationReceipt(SQLModel, table=True):
+    """Immutable accepted identities; historical receipts retain no full payload."""
+
+    id: str = Field(primary_key=True)
+    exposure_id: str
+    confirmation_id: str
+    confirmation_revision: int
+    user_id: str
+    payload_sha256: str
+
+
 class ExperimentEnrollment(SQLModel, table=True):
     """Assignment before either paywall path begins; not an actual UI exposure."""
 

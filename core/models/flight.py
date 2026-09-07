@@ -1,6 +1,6 @@
 import json
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 from pydantic import field_validator
 from sqlmodel import Field, Relationship, SQLModel
@@ -251,6 +251,11 @@ class SearchRecoveryRead(SQLModel):
     reason: str
     detected_query_type: str
     normalized_query: str | None = None
+    # UI-only correction context. Never copy into analytics or ordinary logs.
+    flight_number: str | None = None
+    departure_date: str | None = None
+    recovery_query: str | None = None
+    exclusion_reason: Literal["cancelled", "unknown_status", "missing_timing", "past", "mixed"] | None = None
     suggestions: list[SearchSuggestionRead] = Field(default_factory=list)
 
 

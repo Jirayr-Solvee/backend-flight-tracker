@@ -326,12 +326,17 @@ class GeminiService:
                 reason="missing_airline",
                 detected_query_type="flight_number",
                 normalized_query=number_without_airline,
+                flight_number=number_without_airline,
+                recovery_query=normalized,
+                departure_date=(cls._date_from_query(normalized.casefold())
+                                if cls.query_has_explicit_date(normalized) else None),
                 suggestions=[
                     SearchSuggestionRead(
-                        label="Search by flight number",
+                        label="Add airline",
                         query="",
-                        kind="search_help",
+                        kind="add_airline",
                     ),
+                    SearchSuggestionRead(label="Search by route or airport", query="", kind="search_route"),
                 ],
             )
 

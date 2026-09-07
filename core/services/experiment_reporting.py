@@ -16,6 +16,7 @@ def experiment_summary(
     measurement_revision: int, since_ms: int | None, until_ms: int | None,
     product_id: str | None, acquisition_source: str | None,
     horizon_days: int, as_of_ms: int | None = None,
+    build_number: str | None = None, reporting_window: str = "custom",
 ) -> dict:
     now_ms = as_of_ms if as_of_ms is not None else current_time_ms()
     exposures = session.exec(select(ExperimentExposure).where(
@@ -48,6 +49,7 @@ def experiment_summary(
 
     cohort = [item for item in cohort if (
         (app_version is None or item.app_version == app_version)
+        and (build_number is None or item.build_number == build_number)
         and (since_ms is None or cohort_time(item) >= since_ms)
         and (until_ms is None or cohort_time(item) < until_ms)
         and cohort_time(item) <= now_ms
@@ -181,6 +183,11 @@ def experiment_summary(
         })
     return {
         "experiment_id": experiment_id, "app_version": app_version,
+        "build_number": build_number, "reporting_window": reporting_window,
+        "cohort_versions": [{"app_version": version, "build_number": build,
+                             "eligible_installations": len({item.installation_id for item in cohort
+                                                           if item.app_version == version and item.build_number == build})}
+                            for version, build in sorted({(item.app_version, item.build_number) for item in cohort})],
         "analytics_environment": "production", "purchase_environment": "Production",
         "measurement_revision": measurement_revision,
         "denominator": "selected_flight_enrollment" if measurement_revision == 2 else "legacy_paywall_exposure",
@@ -188,6 +195,8 @@ def experiment_summary(
         "product_id": product_id, "acquisition_source": acquisition_source,
         "maturity_horizon_days": horizon_days,
         "definitions": {
+            "reporting_window": "Caller-declared label; inclusive since_ms and exclusive until_ms define the exact cohort. Full release and narrower monitoring windows must not be treated as interchangeable.",
+            "cohort_version": "Version/build at original enrollment (revision 2) or exposure (revision 1), never the version reporting a later transaction.",
             "purchase_conversion_rate": "Deprecated alias of verified_transaction_conversion_rate; includes free trials and is not paid conversion.",
             "verified_purchase_installations": "Deprecated alias of verified_transaction_installations; includes free trials.",
             "exposed_installations": "Compatibility alias of eligible_installations; use denominator to identify cohort stage.",
