@@ -52,7 +52,7 @@ from core.routers.flights import (
     search_flights_from_text_post,
 )
 from core.models.flight import SearchFailureReportRequest, SearchQueryRequest
-from core.services.search_failure import RETENTION_MS, SearchFailureService
+from core.services.search_failure import RETENTION_MS, SAMPLE_RETENTION_MS, SearchFailureService
 
 
 class SearchFailureReportingTests(unittest.TestCase):
@@ -72,10 +72,11 @@ class SearchFailureReportingTests(unittest.TestCase):
         self.session.close()
         self.engine.dispose()
 
-    def test_query_is_redacted_encrypted_and_expires_after_seven_days(self):
+    def test_query_is_redacted_encrypted_and_expires_within_seven_days(self):
         query = "EK 822 17 Aug contact me@example.com +1 415 555 1212"
         sample = SearchFailureService.record(
             session=self.session,
+            allow_new_capture=True,
             user_id=self.user.id,
             query=query,
             source="backend",
@@ -94,20 +95,25 @@ class SearchFailureReportingTests(unittest.TestCase):
 
         self.assertNotIn("EK 822", sample.query_ciphertext)
         self.assertEqual(
-            SearchFailureService.decrypt_query(sample.query_ciphertext),
+            SearchFailureService.decrypt_query(
+                sample.query_ciphertext, created_at_ms=sample.created_at_ms,
+                expires_at_ms=sample.expires_at_ms,
+            ),
             "EK 822 17 Aug contact [email] [phone]",
         )
         self.assertEqual(sample.airline_iata, "EK")
         self.assertEqual(sample.flight_number, "822")
         self.assertEqual(sample.departure_date, "2026-08-17")
         self.assertLessEqual(
-            abs((sample.expires_at_ms - sample.created_at_ms) - RETENTION_MS),
+            abs((sample.expires_at_ms - sample.created_at_ms) - SAMPLE_RETENTION_MS),
             100,
         )
+        self.assertLess(sample.expires_at_ms - sample.created_at_ms, RETENTION_MS)
 
     def test_app_report_enriches_backend_sample_instead_of_duplicating_it(self):
         sample = SearchFailureService.record(
             session=self.session,
+            allow_new_capture=True,
             user_id=self.user.id,
             query="DL915 tomorrow",
             source="backend",
@@ -144,11 +150,12 @@ class SearchFailureReportingTests(unittest.TestCase):
         self.assertEqual(rows[0].source, "backend_and_app")
         self.assertEqual(rows[0].failure_reason, "landed_only")
         self.assertEqual(rows[0].filtered_result_count, 2)
-        self.assertEqual(rows[0].app_version, "3.4")
+        self.assertIsNone(rows[0].app_version, "Later reports cannot invent unknown capture-time metadata")
 
     def test_generic_app_reason_does_not_replace_precise_backend_reason(self):
         sample = SearchFailureService.record(
             session=self.session,
+            allow_new_capture=True,
             user_id=self.user.id,
             query="Rev",
             source="backend",
@@ -242,6 +249,7 @@ class SearchFailureReportingTests(unittest.TestCase):
     def test_report_hides_query_by_default_and_can_return_redacted_sample(self):
         SearchFailureService.record(
             session=self.session,
+            allow_new_capture=True,
             user_id=self.user.id,
             query="V7 2115 17 August",
             source="backend",
@@ -276,6 +284,7 @@ class SearchFailureReportingTests(unittest.TestCase):
     def test_expired_samples_are_deleted(self):
         sample = SearchFailureService.record(
             session=self.session,
+            allow_new_capture=True,
             user_id=self.user.id,
             query="old query",
             source="backend",

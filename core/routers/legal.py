@@ -39,7 +39,7 @@ PRIVACY_POLICY_HTML = """<!doctype html>
 <body>
   <main>
     <h1>Sofly Privacy Policy</h1>
-    <p>Effective date: June 23, 2026</p>
+    <p>Effective date: September 8, 2026</p>
 
     <p>
       Sofly: Track Flight Status helps people search, save, and track flight
@@ -49,10 +49,58 @@ PRIVACY_POLICY_HTML = """<!doctype html>
 
     <h2>Information we process</h2>
     <p>
-      Sofly may process account details you provide, Apple sign-in identifiers,
-      saved flight data, device identifiers for notifications, app diagnostics,
-      subscription status from Apple, and advertising attribution information
-      from partners such as AppsFlyer and Meta.
+      If you use Sign in with Apple, we store your Apple sign-in identifier and
+      the name and email address provided during sign-in, when available. We
+      associate these details with your Sofly account to identify your account
+      and provide account-based features.
+    </p>
+    <p>
+      We also process flight searches, saved flights, preferences you confirm
+      in the app, account and installation identifiers, notification tokens,
+      app interactions, crash and performance diagnostics, and subscription
+      status and transaction information from Apple. We use analytics and
+      advertising attribution information from partners such as AppsFlyer and
+      Meta to understand app usage and measure campaign performance.
+    </p>
+
+    <h2>Forwarded booking emails</h2>
+    <p>
+      If you forward a booking email to Sofly, the original message is stored
+      in Amazon Web Services (AWS) S3 cloud storage. This includes the email
+      headers, such as sender, recipients and subject, the message contents,
+      and any attachments. We match the sender's email address to your Sofly
+      account. For a matching account, we send text extracted from the message
+      and supported PDF attachments to Google's Gemini AI service to identify
+      flight details. Flights found through this process may be saved to your
+      account.
+    </p>
+    <p>
+      Forwarded messages are not automatically deleted after processing and
+      currently have no automatic expiry, including when a flight cannot be
+      imported or the sender does not match an account. The seven-day limit
+      for failed-search diagnostic samples described below does not apply to
+      forwarded emails or their attachments. You can request deletion using
+      the contact details below. Only forward information you want Sofly to
+      process for this feature.
+    </p>
+
+    <h2>Failed-search diagnostics</h2>
+    <p>
+      To investigate unsuccessful searches, we may retain a sample of the
+      search text in a dedicated diagnostic store. Detected email addresses,
+      phone numbers and web URLs are redacted before the sample is encrypted.
+      Redaction does not make a sample anonymous: it may still contain flight
+      or itinerary information. The diagnostic record also includes a
+      pseudonymous account identifier, search-attempt identifiers, failure
+      details, and app version and environment information.
+    </p>
+    <p>
+      Access to these samples is restricted to an authenticated diagnostic
+      report. Samples expire no later than seven days after their original
+      capture; a retry does not restart this period. Expired samples are
+      excluded from reports and removed by an independent cleanup process.
+      This limit applies to failed-search diagnostic samples, not to saved
+      flights, account records, purchases or forwarded booking emails.
     </p>
 
     <h2>How we use information</h2>
@@ -65,14 +113,19 @@ PRIVACY_POLICY_HTML = """<!doctype html>
     <h2>Sharing</h2>
     <p>
       Sofly does not sell personal information. We share information only with
-      service providers needed to run the app, including hosting, analytics,
-      attribution, notification, and payment providers, or when required by law.
+      service providers needed to run the app, including AWS for hosting and
+      email storage, Google Gemini for interpreting flight searches and
+      forwarded booking text, flight-data providers for finding and updating
+      flights, Apple for sign-in, notifications and purchases, and analytics
+      and attribution providers such as AppsFlyer and Meta. We may also
+      disclose information when required by law.
     </p>
 
     <h2>Data deletion</h2>
     <p>
       You can request deletion of your Sofly account and associated personal
-      data by contacting <a href="mailto:info@sofly.to">info@sofly.to</a>.
+      data, including forwarded booking emails, by contacting
+      <a href="mailto:info@sofly.to">info@sofly.to</a>.
       We may retain limited records when required for security, legal,
       accounting, or fraud-prevention reasons.
     </p>

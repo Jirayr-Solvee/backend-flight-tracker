@@ -39,3 +39,17 @@ class SearchFailureSample(SQLModel, table=True):
     created_at_ms: int = Field(default_factory=current_time_ms, index=True)
     last_reported_at_ms: int = Field(default_factory=current_time_ms)
     expires_at_ms: int = Field(index=True)
+
+
+class SearchFailureCleanupStatus(SQLModel, table=True):
+    """One aggregate operational row; no query, digest, sample, or user identity."""
+
+    id: int = Field(default=1, primary_key=True)
+    outcome: str = "never_run"
+    last_started_at_ms: int | None = None
+    last_finished_at_ms: int | None = None
+    last_success_at_ms: int | None = None
+    last_deleted_count: int = 0
+    last_clamped_count: int = 0
+    expired_remaining: int | None = None
+    oldest_expired_at_ms: int | None = None

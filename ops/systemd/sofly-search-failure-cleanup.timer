@@ -1,0 +1,12 @@
+[Unit]
+Description=Expire Sofly failed-search samples independently of request traffic
+
+[Timer]
+OnCalendar=*-*-* *:*:00 UTC
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=sofly-search-failure-cleanup.service
+
+[Install]
+WantedBy=timers.target

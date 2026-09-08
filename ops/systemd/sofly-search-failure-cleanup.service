@@ -1,0 +1,17 @@
+[Unit]
+Description=Bounded cleanup of expired Sofly search diagnostics
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/backend-flight-tracker
+ExecStart=/usr/bin/env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 /home/ubuntu/backend-flight-tracker/venv/bin/python3 /home/ubuntu/backend-flight-tracker/scripts/cleanup_search_failures.py --database /home/ubuntu/backend-flight-tracker/database.db --apply --batch-size 500 --max-batches 40 --deadline-seconds 20
+TimeoutStartSec=30s
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/backend-flight-tracker

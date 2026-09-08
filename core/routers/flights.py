@@ -30,6 +30,7 @@ from ..services.flight import FlightPersistence, FlightQueryHandler, FlightServi
 from ..services.flight.api_client import AerodataboxUnavailableError
 from ..services.gemini.service import GeminiService, ResolvedFunctionCall
 from ..services.search_failure import RETENTION_DAYS, SearchFailureService
+from ..search_failure_retention_policy import effective_expiry_ms, sample_is_live
 from ..utils import user_has_active_subscription, normalize_offset
 
 router = APIRouter()
@@ -57,6 +58,17 @@ def _log_search_provider(
         latency_ms,
         result_count,
     )
+
+
+def _rollback_search_diagnostic(session: Session) -> None:
+    try:
+        session.rollback()
+    except Exception:
+        logger.error("search_diagnostic_rollback_failed", exc_info=False, stack_info=False)
+        try:
+            session.invalidate()
+        except Exception:
+            logger.error("search_diagnostic_invalidation_failed", exc_info=False, stack_info=False)
 
 
 def _record_backend_search_failure(
@@ -90,8 +102,9 @@ def _record_backend_search_failure(
         app_version=app_version,
         build_number=build_number,
         analytics_environment=analytics_environment,
+        allow_new_capture=True,
     )
-    diagnostics.failure_sample_id = sample.id
+    diagnostics.failure_sample_id = sample.id if sample is not None else None
 
 
 def _search_result_count(response: QuerySearchResponse) -> int:
@@ -775,12 +788,8 @@ async def search_flights_from_text(
             return response
         raise
     except Exception:
-        session.rollback()
-        logger.exception(
-            "Error searching for flight query_type=%s user_id=%s",
-            ai_service.query_type_for_call(resolved_call),
-            user.id,
-        )
+        _rollback_search_diagnostic(session)
+        logger.error("flight_search_failed", exc_info=False, stack_info=False)
         try:
             diagnostics = SearchDiagnosticsRead(
                 query_type=ai_service.query_type_for_call(resolved_call),
@@ -801,8 +810,8 @@ async def search_flights_from_text(
             )
             session.commit()
         except Exception:
-            session.rollback()
-            logger.exception("Unable to persist failed-search diagnostic")
+            _rollback_search_diagnostic(session)
+            logger.error("search_diagnostic_persistence_failed", exc_info=False, stack_info=False)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
@@ -857,23 +866,29 @@ def report_app_search_failure(
             build_number=payload.build_number,
             analytics_environment=payload.analytics_environment,
             sample_id=payload.failure_sample_id,
+            # `source` is client-controlled. Only an actual backend search may
+            # create a raw sample; late/no-ID reports are acknowledged no-ops.
+            allow_new_capture=False,
         )
+        # Commit expires ORM state. The independent sweep may delete this row
+        # immediately afterwards, so acknowledgement must use capture-time
+        # scalar values rather than reloading the now-expired ORM object.
+        sample_recorded = sample is not None
+        acknowledged_id = sample.id if sample is not None else payload.failure_sample_id
         session.commit()
         return {
             "detail": "success",
-            "failure_sample_id": sample.id,
+            "failure_sample_id": acknowledged_id,
+            "sample_recorded": sample_recorded,
             "retention_days": RETENTION_DAYS,
         }
     except Exception:
-        session.rollback()
-        logger.exception(
-            "Unable to persist app failed-search diagnostic user_id=%s",
-            user.id,
-        )
+        _rollback_search_diagnostic(session)
+        logger.error("app_search_diagnostic_persistence_failed", exc_info=False, stack_info=False)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
-        )
+        ) from None
 
 
 @router.get(
@@ -888,13 +903,13 @@ def get_search_failure_report(
     session: Session = Depends(get_session),
 ):
     now_ms = int(time.time() * 1_000)
-    SearchFailureService.purge_expired(session, now_ms=now_ms)
+    cleanup = SearchFailureService.cleanup_status(session, now_ms=now_ms)
     all_samples = SearchFailureService.recent(
         session,
         since_ms=now_ms - days * 24 * 60 * 60 * 1_000,
         limit=5_000,
+        now_ms=now_ms,
     )
-    session.commit()
 
     if analytics_environment:
         all_samples = [
@@ -903,40 +918,22 @@ def get_search_failure_report(
             if sample.analytics_environment == analytics_environment
         ]
 
-    grouped: dict[tuple[str, str, str, str], dict] = {}
-    recurring_queries: dict[str, int] = {}
-    for sample in all_samples:
-        key = (
-            sample.failure_reason,
-            sample.query_type,
-            sample.source,
-            sample.analytics_environment,
-        )
-        group = grouped.setdefault(
-            key,
-            {
-                "failure_reason": sample.failure_reason,
-                "query_type": sample.query_type,
-                "source": sample.source,
-                "analytics_environment": sample.analytics_environment,
-                "count": 0,
-                "provider_result_count": 0,
-                "filtered_result_count": 0,
-            },
-        )
-        group["count"] += 1
-        group["provider_result_count"] += sample.provider_result_count
-        group["filtered_result_count"] += sample.filtered_result_count
-        recurring_queries[sample.query_digest] = (
-            recurring_queries.get(sample.query_digest, 0) + 1
-        )
-
     recent_samples = []
-    for sample in all_samples[:limit]:
+    for sample in all_samples:
+        if len(recent_samples) >= limit:
+            break
+        if not sample_is_live(
+            created_at_ms=sample.created_at_ms,
+            expires_at_ms=sample.expires_at_ms,
+            now_ms=int(time.time() * 1_000),
+        ):
+            continue
         item = {
             "id": sample.id,
             "created_at_ms": sample.created_at_ms,
-            "expires_at_ms": sample.expires_at_ms,
+            "expires_at_ms": effective_expiry_ms(
+                created_at_ms=sample.created_at_ms, expires_at_ms=sample.expires_at_ms
+            ),
             "source": sample.source,
             "query_type": sample.query_type,
             "failure_reason": sample.failure_reason,
@@ -950,7 +947,6 @@ def get_search_failure_report(
             "app_version": sample.app_version,
             "build_number": sample.build_number,
             "analytics_environment": sample.analytics_environment,
-            "repeat_count": recurring_queries[sample.query_digest],
             "structured_query": {
                 "airline_iata": sample.airline_iata,
                 "flight_number": sample.flight_number,
@@ -963,15 +959,56 @@ def get_search_failure_report(
         }
         if include_samples:
             item["redacted_query"] = SearchFailureService.decrypt_query(
-                sample.query_ciphertext
+                sample.query_ciphertext,
+                created_at_ms=sample.created_at_ms,
+                expires_at_ms=sample.expires_at_ms,
             )
+        if not sample_is_live(
+            created_at_ms=sample.created_at_ms,
+            expires_at_ms=sample.expires_at_ms,
+            now_ms=int(time.time() * 1_000),
+        ):
+            continue
         recent_samples.append(item)
+
+    # Recheck after all processing, not only in the initial SELECT. A sample
+    # expiring between selection and decryption contributes neither plaintext,
+    # metadata, nor a count to this response. No cleanup transaction is needed.
+    final_now_ms = int(time.time() * 1_000)
+    all_samples = [sample for sample in all_samples if sample_is_live(
+        created_at_ms=sample.created_at_ms, expires_at_ms=sample.expires_at_ms,
+        now_ms=final_now_ms,
+    )]
+    live_ids = {sample.id for sample in all_samples}
+    recent_samples = [item for item in recent_samples if item["id"] in live_ids]
+    grouped: dict[tuple[str, str, str, str], dict] = {}
+    recurring_queries: dict[str, int] = {}
+    sample_digests = {}
+    for sample in all_samples:
+        key = (sample.failure_reason, sample.query_type, sample.source, sample.analytics_environment)
+        group = grouped.setdefault(key, {
+            "failure_reason": sample.failure_reason,
+            "query_type": sample.query_type,
+            "source": sample.source,
+            "analytics_environment": sample.analytics_environment,
+            "count": 0,
+            "provider_result_count": 0,
+            "filtered_result_count": 0,
+        })
+        group["count"] += 1
+        group["provider_result_count"] += sample.provider_result_count
+        group["filtered_result_count"] += sample.filtered_result_count
+        recurring_queries[sample.query_digest] = recurring_queries.get(sample.query_digest, 0) + 1
+        sample_digests[sample.id] = sample.query_digest
+    for item in recent_samples:
+        item["repeat_count"] = recurring_queries[sample_digests[item["id"]]]
 
     return {
         "retention_days": RETENTION_DAYS,
         "window_days": days,
         "analytics_environment": analytics_environment,
         "sample_count": len(all_samples),
+        "cleanup": cleanup,
         "groups": sorted(
             grouped.values(),
             key=lambda item: (-item["count"], item["failure_reason"]),

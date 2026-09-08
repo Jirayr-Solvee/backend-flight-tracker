@@ -7,15 +7,24 @@ from typing import Any
 from uuid import uuid4
 
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy import delete
+from sqlalchemy import delete, or_, text, update
 from sqlmodel import Session, select
 
 from ..config import settings
-from ..models.search_failure import SearchFailureSample
+from ..models.search_failure import SearchFailureCleanupStatus, SearchFailureSample
+from ..search_failure_retention_policy import (
+    CLEANUP_STATUS_STALE_MS,
+    CLEANUP_OUTCOMES,
+    DEFAULT_BATCH_SIZE,
+    MAX_BATCH_SIZE,
+    RETENTION_DAYS,
+    RETENTION_MS,
+    SAMPLE_RETENTION_MS,
+    effective_expiry_ms,
+    sample_is_live,
+)
 
 
-RETENTION_DAYS = 7
-RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1_000
 MAX_QUERY_LENGTH = 2_000
 
 
@@ -59,9 +68,30 @@ class SearchFailureService:
         return cls._fernet().encrypt(redacted.encode("utf-8")).decode("ascii")
 
     @classmethod
-    def decrypt_query(cls, ciphertext: str) -> str | None:
+    def decrypt_query(
+        cls,
+        ciphertext: str,
+        *,
+        created_at_ms: int,
+        expires_at_ms: int,
+        now_ms: int | None = None,
+    ) -> str | None:
+        # The caller must supply the original capture boundary. Even a report
+        # that selected this row just before expiry must not decrypt it later.
+        cutoff = now_ms if now_ms is not None else int(time() * 1_000)
+        if not sample_is_live(
+            created_at_ms=created_at_ms, expires_at_ms=expires_at_ms, now_ms=cutoff
+        ):
+            return None
         try:
-            return cls._fernet().decrypt(ciphertext.encode("ascii")).decode("utf-8")
+            redacted = cls._fernet().decrypt(ciphertext.encode("ascii")).decode("utf-8")
+            if not sample_is_live(
+                created_at_ms=created_at_ms,
+                expires_at_ms=expires_at_ms,
+                now_ms=now_ms if now_ms is not None else int(time() * 1_000),
+            ):
+                return None
+            return redacted
         except (InvalidToken, UnicodeDecodeError, ValueError):
             return None
 
@@ -83,12 +113,34 @@ class SearchFailureService:
         return cls._keyed_digest(normalized, purpose="query")
 
     @classmethod
-    def purge_expired(cls, session: Session, *, now_ms: int | None = None) -> int:
+    def purge_expired(
+        cls,
+        session: Session,
+        *,
+        now_ms: int | None = None,
+        limit: int = DEFAULT_BATCH_SIZE,
+    ) -> int:
+        if not 1 <= limit <= MAX_BATCH_SIZE:
+            raise ValueError("invalid_search_cleanup_batch_size")
         cutoff = now_ms if now_ms is not None else int(time() * 1_000)
-        result = session.exec(
-            delete(SearchFailureSample).where(
-                SearchFailureSample.expires_at_ms <= cutoff
+        # The production store is SQLite. Overwrite deleted cells instead of
+        # leaving their contents in its reusable database pages. The independent
+        # cleanup command also checkpoints WAL when that journal mode is used.
+        session.exec(text("PRAGMA secure_delete=ON"))
+        expired_ids = (
+            select(SearchFailureSample.id)
+            .where(
+                or_(
+                    SearchFailureSample.expires_at_ms <= cutoff,
+                    SearchFailureSample.created_at_ms <= cutoff - SAMPLE_RETENTION_MS,
+                )
             )
+            .order_by(SearchFailureSample.expires_at_ms, SearchFailureSample.id)
+            .limit(limit)
+        )
+        result = session.exec(
+            delete(SearchFailureSample).where(SearchFailureSample.id.in_(expired_ids))
+            .execution_options(synchronize_session=False)
         )
         return int(result.rowcount or 0)  # type: ignore[attr-defined]
 
@@ -127,27 +179,75 @@ class SearchFailureService:
         analytics_environment: str = "unknown",
         structured_args: dict[str, Any] | None = None,
         sample_id: str | None = None,
-    ) -> SearchFailureSample:
-        now_ms = int(time() * 1_000)
-        cls.purge_expired(session, now_ms=now_ms)
+        allow_new_capture: bool = False,
+    ) -> SearchFailureSample | None:
+        # Only the actual backend search handler opts into a fresh capture.
+        # An app payload's free-form `source` is never authority to create one.
+        # Legacy no-ID reports cannot prove freshness after deletion, so their
+        # best-effort HTTP acknowledgement must not retain the query again.
+        if sample_id is None and not allow_new_capture:
+            return None
         expected_user_hash = cls.user_hash(user_id)
 
-        existing = session.get(SearchFailureSample, sample_id) if sample_id else None
-        if existing and existing.user_hash == expected_user_hash:
-            existing.source = (
-                "backend_and_app" if existing.source != source else existing.source
+        if sample_id is not None:
+            # A write statement acquires SQLite's writer lock before the read,
+            # serializing independent API workers and the cleanup process. A
+            # fresh clock AFTER lock acquisition is essential at the deadline.
+            session.exec(
+                update(SearchFailureSample)
+                .where(
+                    SearchFailureSample.id == sample_id,
+                    SearchFailureSample.user_hash == expected_user_hash,
+                )
+                .values(last_reported_at_ms=SearchFailureSample.last_reported_at_ms)
+                .execution_options(synchronize_session=False)
             )
-            existing.query_type = query_type or existing.query_type
+            now_ms = int(time() * 1_000)
+            existing = session.exec(
+                select(SearchFailureSample)
+                .where(
+                    SearchFailureSample.id == sample_id,
+                    SearchFailureSample.user_hash == expected_user_hash,
+                )
+                .execution_options(populate_existing=True)
+            ).first()
+            if existing is None:
+                return None
+            expiry_ms = effective_expiry_ms(
+                created_at_ms=existing.created_at_ms, expires_at_ms=existing.expires_at_ms
+            )
+            if not sample_is_live(
+                created_at_ms=existing.created_at_ms,
+                expires_at_ms=existing.expires_at_ms,
+                now_ms=now_ms,
+            ):
+                # Never turn a supplied expired, missing, or foreign ID into a
+                # new sample. Independent cleanup owns physical row removal.
+                return None
+            if existing.query_digest != cls.query_digest(query):
+                return None
+            if (
+                existing.search_journey_id is not None
+                and search_journey_id is not None
+                and existing.search_journey_id != search_journey_id
+            ) or (
+                existing.search_attempt_number is not None
+                and search_attempt_number is not None
+                and existing.search_attempt_number != search_attempt_number
+            ):
+                return None
+
+            if not allow_new_capture or existing.source != source:
+                existing.source = "backend_and_app"
             if not (
-                failure_reason == "provider_no_match"
+                failure_reason in {"provider_no_match", "unknown"}
                 and existing.failure_reason not in {"provider_no_match", "unknown"}
             ):
                 # Older clients collapse unfamiliar recovery reasons into the
                 # generic provider_no_match value. Keep a more precise backend
                 # classification, while still allowing client-only outcomes
                 # such as landed_only to replace a generic backend reason.
-                existing.failure_reason = failure_reason or existing.failure_reason
-            existing.provider_outcome = provider_outcome or existing.provider_outcome
+                existing.failure_reason = (failure_reason or existing.failure_reason)[:100]
             existing.normalization_applied = (
                 existing.normalization_applied or normalization_applied
             )
@@ -159,33 +259,26 @@ class SearchFailureService:
                 existing.filtered_result_count,
                 max(0, filtered_result_count),
             )
-            existing.provider_latency_ms = (
-                provider_latency_ms
-                if provider_latency_ms is not None
-                else existing.provider_latency_ms
-            )
-            existing.search_journey_id = search_journey_id or existing.search_journey_id
-            existing.search_attempt_number = (
-                search_attempt_number
-                if search_attempt_number is not None
-                else existing.search_attempt_number
-            )
-            existing.app_version = app_version or existing.app_version
-            existing.build_number = build_number or existing.build_number
-            if analytics_environment != "unknown":
-                existing.analytics_environment = analytics_environment
-            existing.last_reported_at_ms = now_ms
-            existing.expires_at_ms = max(existing.expires_at_ms, now_ms + RETENTION_MS)
+            # App/build/environment and provider facts describe the backend
+            # capture, even when originally unknown. A later app report cannot
+            # establish those historical values. Journey/attempt are separate
+            # one-time correlation bindings, not replacement capture metadata.
+            existing.search_journey_id = existing.search_journey_id or search_journey_id
+            if existing.search_attempt_number is None:
+                existing.search_attempt_number = search_attempt_number
+            existing.last_reported_at_ms = max(existing.last_reported_at_ms, now_ms)
+            existing.expires_at_ms = expiry_ms
             session.add(existing)
             return existing
 
+        now_ms = int(time() * 1_000)
         structured = cls.structured_values(structured_args)
         sample = SearchFailureSample(
             id=str(uuid4()),
             user_hash=expected_user_hash,
             query_ciphertext=cls._encrypt_query(query),
             query_digest=cls.query_digest(query),
-            source=source,
+            source="backend",
             query_type=(query_type or "unknown")[:80],
             failure_reason=(failure_reason or "unknown")[:100],
             provider_outcome=(provider_outcome or "unknown")[:100],
@@ -202,7 +295,9 @@ class SearchFailureService:
             app_version=app_version,
             build_number=build_number,
             analytics_environment=analytics_environment[:20],
-            expires_at_ms=now_ms + RETENTION_MS,
+            created_at_ms=now_ms,
+            last_reported_at_ms=now_ms,
+            expires_at_ms=now_ms + SAMPLE_RETENTION_MS,
             **structured,
         )
         session.add(sample)
@@ -214,11 +309,40 @@ class SearchFailureService:
         *,
         since_ms: int,
         limit: int,
+        now_ms: int | None = None,
     ) -> list[SearchFailureSample]:
+        cutoff = now_ms if now_ms is not None else int(time() * 1_000)
         statement = (
             select(SearchFailureSample)
-            .where(SearchFailureSample.created_at_ms >= since_ms)
+            .where(
+                SearchFailureSample.created_at_ms >= since_ms,
+                SearchFailureSample.created_at_ms <= cutoff,
+                SearchFailureSample.created_at_ms > cutoff - SAMPLE_RETENTION_MS,
+                SearchFailureSample.expires_at_ms > cutoff,
+            )
             .order_by(SearchFailureSample.created_at_ms.desc())  # type: ignore[attr-defined]
             .limit(limit)
         )
         return list(session.exec(statement).all())
+
+    @staticmethod
+    def cleanup_status(session: Session, *, now_ms: int | None = None) -> dict[str, Any]:
+        cutoff = now_ms if now_ms is not None else int(time() * 1_000)
+        stored = session.get(SearchFailureCleanupStatus, 1)
+        last_success = stored.last_success_at_ms if stored else None
+        outcome = stored.outcome if stored else "never_run"
+        return {
+            "outcome": outcome if outcome in CLEANUP_OUTCOMES else "invalid_status",
+            "last_started_at_ms": stored.last_started_at_ms if stored else None,
+            "last_finished_at_ms": stored.last_finished_at_ms if stored else None,
+            "last_success_at_ms": last_success,
+            "last_deleted_count": stored.last_deleted_count if stored else 0,
+            "last_clamped_count": stored.last_clamped_count if stored else 0,
+            "expired_remaining": stored.expired_remaining if stored else None,
+            "oldest_expired_at_ms": stored.oldest_expired_at_ms if stored else None,
+            "stale": (
+                last_success is None
+                or last_success > cutoff
+                or cutoff - last_success > CLEANUP_STATUS_STALE_MS
+            ),
+        }
