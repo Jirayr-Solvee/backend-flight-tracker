@@ -7,6 +7,7 @@ from sqlmodel import Session
 from .config import settings
 from .models import get_session
 from .models.user import User
+from .security_logging import CredentialOperation, rollback_and_log_failure
 from .utils import decode_jwt
 import logging
 
@@ -40,7 +41,7 @@ def get_current_user(
         uid = decoded_token.get("sub")
 
         if not uid:
-            logger.warning(f"Invalid JWT without a uid, decoded token={decoded_token}")
+            logger.warning("authentication_rejected reason=missing_subject")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Authorization required",
@@ -50,7 +51,7 @@ def get_current_user(
         user = session.get(User, uid)
 
         if not user:
-            logger.warning(f"Unable to find user with id={uid}, decoded token={decoded_token}")
+            logger.warning("authentication_rejected reason=unknown_user")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Authorization required",
@@ -58,11 +59,11 @@ def get_current_user(
     
         return user
     except Exception:
-        session.rollback()
+        rollback_and_log_failure(session, logger, CredentialOperation.AUTHENTICATE)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authorization required",
-        )
+        ) from None
 
 
 def check_lambda_auth_token(

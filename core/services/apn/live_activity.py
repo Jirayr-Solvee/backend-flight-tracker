@@ -473,10 +473,12 @@ class LiveActivityService:
                         registration.updated_at = int(time.time())
                         session.add(delivery)
                         session.add(registration)
-                        logger.exception(
-                            "Live Activity push-to-start delivery raised: device_id=%s flight_id=%s",
-                            registration.device_id,
-                            flight.id,
+                        # Provider exceptions/chains may embed the device token
+                        # or a signed credential. Keep only a fixed diagnostic.
+                        logger.error(
+                            "live_activity_push_to_start_failed reason=delivery_exception",
+                            exc_info=False,
+                            stack_info=False,
                         )
                         continue
 

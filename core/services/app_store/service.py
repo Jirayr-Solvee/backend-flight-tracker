@@ -80,7 +80,6 @@ class AppStoreService:
     def process_transaction(signed_jws: str):
         root_certs = AppStoreService._get_root_certs()
         environments = get_apple_environments()
-        errors: list[Exception] = []
 
         for environment in environments:
             try:
@@ -100,21 +99,18 @@ class AppStoreService:
                     )
 
                 return payload
-            except Exception as exc:
-                errors.append(exc)
+            except Exception:
+                continue
 
         attempted = [
             AppStoreService._environment_name(environment)
             for environment in environments
         ]
         logger.error(
-            "process_transaction failed to decode signed_jws after attempted_environments=%s",
+            "app_store_verification_failed operation=transaction attempted_environments=%s",
             attempted,
-            exc_info=(
-                (type(errors[-1]), errors[-1], errors[-1].__traceback__)
-                if errors
-                else None
-            ),
+            exc_info=False,
+            stack_info=False,
         )
         return None
 
@@ -122,7 +118,6 @@ class AppStoreService:
     def process_notification(signed_payload: str):
         root_certs = AppStoreService._get_root_certs()
         environments = get_apple_environments()
-        errors: list[Exception] = []
 
         for environment in environments:
             try:
@@ -141,21 +136,18 @@ class AppStoreService:
                     )
 
                 return result
-            except Exception as exc:
-                errors.append(exc)
+            except Exception:
+                continue
 
         attempted = [
             AppStoreService._environment_name(environment)
             for environment in environments
         ]
         logger.error(
-            "process_notification failed to decode signed payload after attempted_environments=%s",
+            "app_store_verification_failed operation=notification attempted_environments=%s",
             attempted,
-            exc_info=(
-                (type(errors[-1]), errors[-1], errors[-1].__traceback__)
-                if errors
-                else None
-            ),
+            exc_info=False,
+            stack_info=False,
         )
         return None
 
@@ -163,7 +155,6 @@ class AppStoreService:
     def process_renewal_info(signed_renewal_info: str):
         root_certs = AppStoreService._get_root_certs()
         environments = get_apple_environments()
-        errors: list[Exception] = []
 
         for environment in environments:
             try:
@@ -182,20 +173,17 @@ class AppStoreService:
                     )
 
                 return payload
-            except Exception as exc:
-                errors.append(exc)
+            except Exception:
+                continue
 
         attempted = [
             AppStoreService._environment_name(environment)
             for environment in environments
         ]
         logger.error(
-            "process_renewal_info failed to decode signed payload after attempted_environments=%s",
+            "app_store_verification_failed operation=renewal_info attempted_environments=%s",
             attempted,
-            exc_info=(
-                (type(errors[-1]), errors[-1], errors[-1].__traceback__)
-                if errors
-                else None
-            ),
+            exc_info=False,
+            stack_info=False,
         )
         return None

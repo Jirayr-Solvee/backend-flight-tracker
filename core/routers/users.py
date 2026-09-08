@@ -18,10 +18,13 @@ from ..models.live_activity import (
     LiveActivityRegistration,
 )
 from ..models.user import User, UserFlightLink
+from ..security_logging import (
+    CredentialOperation, CredentialSafeRoute, rollback_and_log_failure,
+)
 from ..services.apn.live_activity import LiveActivityService
 from ..utils import create_jwt, verify_apple_identity_token
 
-router = APIRouter()
+router = APIRouter(route_class=CredentialSafeRoute)
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +35,7 @@ def get_user_flights(user: User = Depends(get_current_user)):
 
 
 class CreateGuesUserResponse(BaseModel):
-    jwt: str
+    jwt: str = Field(repr=False)
     device_id: str
     guest_id: str
 
@@ -60,25 +63,24 @@ def create_guest_user(session: Session = Depends(get_session)):
             jwt=jwt, device_id=new_device.id, guest_id=new_user.id
         )
     except Exception:
-        session.rollback()
-        logger.exception(f"unable to create a guest account due to following error")
+        rollback_and_log_failure(session, logger, CredentialOperation.GUEST_CREATE)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
-        )
+        ) from None
 
 
 class CreateUserRequest(BaseModel):
-    apple_jwt: str
-    full_name: str | None = None
-    email: str | None = None
+    apple_jwt: str = Field(repr=False)
+    full_name: str | None = Field(default=None, repr=False)
+    email: str | None = Field(default=None, repr=False)
 
 
 class CreateUserResponse(BaseModel):
-    jwt: str
+    jwt: str = Field(repr=False)
     user_id: str
-    full_name: str | None = None
-    email: str | None = None
+    full_name: str | None = Field(default=None, repr=False)
+    email: str | None = Field(default=None, repr=False)
 
 
 @router.post("/me/", response_model=CreateUserResponse)
@@ -133,19 +135,16 @@ async def create_user(
             jwt=jwt, full_name=user.full_name, email=user.email, user_id=user.id
         )
     except Exception:
-        session.rollback()
-        logger.exception(
-            f"Unable to create a user for guest user id={user.id}, data={data}"
-        )
+        rollback_and_log_failure(session, logger, CredentialOperation.APPLE_SIGN_IN)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
-        )
+        ) from None
 
 
 class RefreshApnToken(BaseModel):
     device_id: str
-    apn_token: str
+    apn_token: str = Field(repr=False)
     supports_localized_push: bool = False
 
 
@@ -188,22 +187,17 @@ def refresh_apn_token(
     except HTTPException:
         raise
     except Exception:
-        session.rollback()
-        logger.exception(
-            "Unable to update APNs token for user_id=%s device_id=%s",
-            user.id,
-            data.device_id,
-        )
+        rollback_and_log_failure(session, logger, CredentialOperation.APN_REFRESH)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
-        )
+        ) from None
 
 
 class RegisterLiveActivityRequest(BaseModel):
     device_id: str
     flight_id: int
-    push_token: str = Field(min_length=32, max_length=512)
+    push_token: str = Field(min_length=32, max_length=512, repr=False)
     apns_environment: Literal["sandbox", "production"] = "production"
     uses_12_hour_time: bool = False
 
@@ -222,7 +216,7 @@ class RegisterLiveActivityRequest(BaseModel):
 
 class RegisterLiveActivityPushToStartRequest(BaseModel):
     device_id: str
-    push_token: str = Field(min_length=32, max_length=512)
+    push_token: str = Field(min_length=32, max_length=512, repr=False)
     apns_environment: Literal["sandbox", "production"] = "production"
     uses_12_hour_time: bool = False
 
@@ -294,15 +288,13 @@ def register_live_activity_push_to_start(
         )
         return {"detail": "Live Activity push-to-start token registered"}
     except Exception:
-        session.rollback()
-        logger.exception(
-            "Unable to register Live Activity push-to-start token: device_id=%s",
-            data.device_id,
+        rollback_and_log_failure(
+            session, logger, CredentialOperation.ACTIVITY_START_REGISTER
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
-        )
+        ) from None
 
 
 @router.put("/me/live-activities/{activity_id}", response_model=dict)
@@ -433,17 +425,11 @@ def register_live_activity(
         session.rollback()
         raise
     except Exception:
-        session.rollback()
-        logger.exception(
-            "Unable to register Live Activity: activity_id=%s flight_id=%s device_id=%s",
-            activity_id,
-            data.flight_id,
-            data.device_id,
-        )
+        rollback_and_log_failure(session, logger, CredentialOperation.ACTIVITY_REGISTER)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
-        )
+        ) from None
 
 
 @router.delete(
@@ -493,12 +479,11 @@ def clear_user_notification(
         session.add(user)
         session.commit()
     except Exception:
-        session.rollback()
-        logger.exception("Something went wrong while clearing user notification")
+        rollback_and_log_failure(session, logger, CredentialOperation.NOTIFICATION_CLEAR)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
-        )
+        ) from None
 
 
 @router.delete("/me/")
@@ -526,9 +511,8 @@ def delete_user(
         session.delete(user)
         session.commit()
     except Exception:
-        session.rollback()
-        logger.exception(f"Something went wrong while deleting user id={user.id}")
+        rollback_and_log_failure(session, logger, CredentialOperation.ACCOUNT_DELETE)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
-        )
+        ) from None

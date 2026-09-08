@@ -1,3 +1,5 @@
+import logging
+
 from sqlmodel import Session, SQLModel, create_engine
 
 from .activation_recovery import PurchaseActivationRecovery
@@ -24,11 +26,29 @@ from .subscription_lifecycle import AppStoreSubscriptionLifecycleEvent
 from .transaction import Transaction
 
 DATABASE_URL = "sqlite:///./database.db"
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, hide_parameters=True)
 
 SQLModel.metadata.create_all(engine)
 
 
 def get_session():
-    with Session(engine) as session:
+    session = Session(engine)
+    try:
         yield session
+    finally:
+        try:
+            session.close()
+        except Exception:
+            # Database driver messages can echo credential-bearing parameters.
+            # Teardown must not reintroduce a traceback after a safe route error.
+            logging.getLogger(__name__).error(
+                "database_session_cleanup_failed", exc_info=False, stack_info=False
+            )
+            try:
+                session.invalidate()
+            except Exception:
+                logging.getLogger(__name__).error(
+                    "database_session_invalidation_failed",
+                    exc_info=False,
+                    stack_info=False,
+                )
