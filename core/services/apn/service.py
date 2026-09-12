@@ -52,6 +52,34 @@ class ApnService:
     """
 
     @staticmethod
+    def _build_alert(
+        notification: Notification,
+        supports_localized_push: bool,
+        localized_push_version: int,
+    ) -> dict[str, object]:
+        alert: dict[str, object] = {
+            "title": notification.title,
+            "body": notification.body,
+        }
+        required_version = 2 if notification.update_type == "flight_added" else 1
+        if not (
+            supports_localized_push
+            and type(localized_push_version) is int
+            and required_version <= localized_push_version <= 2
+        ):
+            return alert
+
+        if notification.title_loc_key:
+            alert["title-loc-key"] = notification.title_loc_key
+            alert["title-loc-args"] = notification.title_loc_args
+            alert.pop("title", None)
+        if notification.body_loc_key:
+            alert["loc-key"] = notification.body_loc_key
+            alert["loc-args"] = notification.body_loc_args
+            alert.pop("body", None)
+        return alert
+
+    @staticmethod
     async def send_silent_push_notification(apn_token: str, invoke_review: bool):
         request = NotificationRequest(
             device_token=apn_token,
@@ -93,7 +121,8 @@ class ApnService:
 
     @staticmethod
     async def send_single_push_notification(
-        notification: Notification, fcm_token: str, badge_count: int
+        notification: Notification, fcm_token: str, badge_count: int,
+        *, supports_localized_push: bool = False, localized_push_version: int = 1,
     ):
         """
         Send a single push notification to a single device
@@ -102,10 +131,9 @@ class ApnService:
             device_token=fcm_token,
             message={
                 "aps": {
-                    "alert": {
-                        "title": notification.title,
-                        "body": notification.body,
-                    },
+                    "alert": ApnService._build_alert(
+                        notification, supports_localized_push, localized_push_version,
+                    ),
                     "badge": badge_count,
                 },
                 **notification.apns_custom_payload(),
@@ -126,19 +154,9 @@ class ApnService:
 
         for device in notification_batch.devices:
             notification = notification_batch.notification
-            alert: dict[str, object] = {
-                "title": notification.title,
-                "body": notification.body,
-            }
-            if device.supports_localized_push:
-                if notification.title_loc_key:
-                    alert["title-loc-key"] = notification.title_loc_key
-                    alert["title-loc-args"] = notification.title_loc_args
-                    alert.pop("title", None)
-                if notification.body_loc_key:
-                    alert["loc-key"] = notification.body_loc_key
-                    alert["loc-args"] = notification.body_loc_args
-                    alert.pop("body", None)
+            alert = ApnService._build_alert(
+                notification, device.supports_localized_push, device.localized_push_version,
+            )
 
             request = NotificationRequest(
                 device_token=device.token,
@@ -174,6 +192,7 @@ class ApnService:
                 Device.apn_token,
                 User.notification_count,
                 Device.supports_localized_push,
+                Device.localized_push_version,
             )
             .join(User)  # type: ignore
             .join(UserFlightLink)  # type: ignore
@@ -198,8 +217,9 @@ class ApnService:
                     user_id=user_id,
                     notification_count=notification_count,
                     supports_localized_push=supports_localized_push,
+                    localized_push_version=localized_push_version,
                 )
-                for user_id, token, notification_count, supports_localized_push in result
+                for user_id, token, notification_count, supports_localized_push, localized_push_version in result
             ]  # type: ignore
 
         return []
@@ -303,6 +323,9 @@ class ApnService:
             flight_id=flight_id,
             update_type="flight_added",
             new_value=flight_full_number,
+            title_loc_key="New flight added to your account",
+            body_loc_key="Flight %@ has been added to your account automatically from your forwarded email.",
+            body_loc_args=[flight_full_number],
         )
 
     @staticmethod
@@ -584,6 +607,13 @@ class ApnService:
             body_loc_args = [new_reg or "", new_model or "Unknown model"]
         else:
             body = f"Aircraft information has been updated for flight {flight_number}."
+            body_loc_key = "Aircraft information has been updated for flight %@."
+            body_loc_args = [flight_number]
+
+        if not (new_model or "").strip():
+            # APNs substitutes arguments literally, so an English fallback
+            # model name cannot be translated by the surrounding loc-key.
+            # Reuse an existing key without changing legacy English alerts.
             body_loc_key = "Aircraft information has been updated for flight %@."
             body_loc_args = [flight_number]
 

@@ -39,7 +39,7 @@ PRIVACY_POLICY_HTML = """<!doctype html>
 <body>
   <main>
     <h1>Sofly Privacy Policy</h1>
-    <p>Effective date: September 8, 2026</p>
+    <p>Effective date: September 12, 2026</p>
 
     <p>
       Sofly: Track Flight Status helps people search, save, and track flight
@@ -63,13 +63,32 @@ PRIVACY_POLICY_HTML = """<!doctype html>
       Meta to understand app usage and measure campaign performance.
     </p>
 
+    <h2>Optional AI processing</h2>
+    <p>
+      Google Gemini is an optional third-party AI service. Before sending
+      search text and language context to Google Gemini, Sofly asks for your
+      search permission. This text may include personal or itinerary details
+      you enter. Flight-number, airport and other supported deterministic
+      searches can work without sharing the search text with Google Gemini.
+    </p>
+    <p>
+      AI search and forwarded-email AI processing have separate permissions,
+      both off by default and saved to your Sofly account. Granting one does
+      not grant the other. You can revoke either in Settings. Revocation stops
+      new requests to Google Gemini for that purpose, including queued retries;
+      it cannot undo information already sent or a request already in flight.
+      Declining AI permission does not opt you out of the hosting, flight-data
+      providers or diagnostics described elsewhere in this policy.
+    </p>
+
     <h2>Forwarded booking emails</h2>
     <p>
       If you forward a booking email to Sofly, the original message is stored
       in Amazon Web Services (AWS) S3 cloud storage. This includes the email
       headers, such as sender, recipients and subject, the message contents,
       and any attachments. We match the sender's email address to your Sofly
-      account. For a matching account, we send text extracted from the message
+      account. Only for a uniquely matched, Apple-verified email identity with separate
+      forwarded-email AI permission, we send text extracted from the message
       and supported PDF attachments to Google's Gemini AI service to identify
       flight details. Flights found through this process may be saved to your
       account.

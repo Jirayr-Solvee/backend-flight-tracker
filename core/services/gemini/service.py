@@ -15,6 +15,10 @@ from pydantic import BaseModel
 
 from ...config import settings
 from ...models.flight import SearchRecoveryRead, SearchSuggestionRead
+from ..ai_consent import (
+    AIConsentPurpose, AIConsentRequired, AIConsentUnavailable, require_ai_consent,
+)
+from ..email_ingress import EmailEgressContext, require_email_consent_for_send
 from .config import REQUIRED_FIELDS, email_config, query_config
 
 logger = logging.getLogger(__name__)
@@ -157,7 +161,11 @@ class GeminiService:
         "dezembro", "ديسمبر",
     }
 
-    def __init__(self):
+    def __init__(self, *, user_id: str | None = None, email_sender: str | None = None,
+                 email_receipt: EmailEgressContext | None = None):
+        self.user_id = user_id
+        self.email_sender = email_sender
+        self.email_receipt = email_receipt
         api_key = (settings.GEMINI_API_KEY or "").strip()
         if not api_key:
             logger.error("GEMINI_API_KEY is not configured")
@@ -167,18 +175,30 @@ class GeminiService:
         self.client = genai.Client(api_key=api_key)
 
     async def _generate(
-        self, contents: str, config: GenerateContentConfig
+        self, contents: str, config: GenerateContentConfig, *, purpose: AIConsentPurpose
     ) -> GenerateContentResponse:
         if self.client is None:
             raise RuntimeError("Gemini client is not configured")
 
-        return await asyncio.to_thread(
-            lambda: self.client.models.generate_content(
+        def send():
+            # This is the only SDK egress point. Authorize in the worker directly
+            # before EACH send/retry, including text extracted from email/PDFs.
+            email_sender = getattr(self, "email_sender", None)
+            if purpose == "forwarded_email":
+                context = getattr(self, "email_receipt", None)
+                if (not context or not email_sender or context.user_id != getattr(self, "user_id", None)
+                        or context.notification.receipt.sender != email_sender):
+                    raise AIConsentRequired(purpose)
+                require_email_consent_for_send(context)
+            else:
+                require_ai_consent(getattr(self, "user_id", None), purpose)
+            return self.client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=contents,
                 config=config,
             )
-        )
+
+        return await asyncio.to_thread(send)
 
     def _extract_function_call(
         self, response: GenerateContentResponse
@@ -238,7 +258,8 @@ class GeminiService:
         for attempt in range(attempts):
             try:
                 response = await self._generate(
-                    query, email_config if email else query_config
+                    query, email_config if email else query_config,
+                    purpose="forwarded_email" if email else "search",
                 )
                 if not response:
                     logger.warning(
@@ -259,8 +280,7 @@ class GeminiService:
                 )
                 if not valid_function_call:
                     logger.warning(
-                        "Gemini produced an invalid function call function=%s email_mode=%s attempt=%s",
-                        extracted_function_call.function_name,
+                        "Gemini produced an invalid function call email_mode=%s attempt=%s",
                         email,
                         attempt,
                     )
@@ -277,11 +297,20 @@ class GeminiService:
                     args=extracted_function_call.args,
                     handler=handler,
                 )
+            except (AIConsentRequired, AIConsentUnavailable):
+                # A denial/revocation is not a provider failure and cannot be
+                # bypassed by a retry or converted into a successful zero result.
+                raise
             except Exception:
-                logger.exception(
+                # Provider/parser errors can quote private search or email text,
+                # request credentials, or the full response. Keep retries useful
+                # operationally without attaching the exception or traceback.
+                logger.error(
                     "Error retrieving Gemini function call email_mode=%s attempt=%s",
                     email,
                     attempt,
+                    exc_info=False,
+                    stack_info=False,
                 )
 
         logger.warning(
@@ -801,7 +830,8 @@ class GeminiService:
         function_def = REQUIRED_FIELDS.get(function_name)
 
         if not function_def:
-            logger.warning(f"un-registred function: {function_name}")
+            # This name comes from the provider response, not our allowlist.
+            logger.warning("Gemini produced an unregistered function")
             return False
 
         required_fields = function_def.required_fields

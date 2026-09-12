@@ -1,15 +1,17 @@
 import logging
 import re
 import time
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field as PydanticField, model_validator
+from pydantic import BaseModel, Field as PydanticField, ValidationError, field_validator, model_validator
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 from ..config import settings
+from ..activation_journey_contract import ActivationJourneyContext
+from ..services.activation_journey import attribute_journey_transaction, confirm_journey_goals, reserve_legacy_installation
 from ..dependency import check_lambda_auth_token, get_current_user
 from ..models import Session, get_session
 from ..models.activation_recovery import PurchaseActivationRecovery
@@ -83,7 +85,8 @@ ActivationGoalKey = Literal[
 
 
 class ExperimentGoalSelectionRequest(BaseModel):
-    experiment: ExperimentContext
+    experiment: ExperimentContext | None = None
+    journey: ActivationJourneyContext | None = None
     selected_goal_keys: list[ActivationGoalKey] = PydanticField(
         min_length=1,
         max_length=4,
@@ -96,6 +99,10 @@ class ExperimentGoalSelectionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_goal_keys(self):
+        if (self.experiment is None) == (self.journey is None):
+            raise ValueError("Exactly one experiment or journey context is required")
+        if self.journey is not None and (self.confirmation_revision is None or self.confirmation_id is None):
+            raise ValueError("Journey goals require durable ordered confirmation identity")
         if (self.confirmation_revision is None) != (self.confirmation_id is None):
             raise ValueError("confirmation_revision and confirmation_id must be supplied together")
         if len(set(self.selected_goal_keys)) != len(self.selected_goal_keys):
@@ -153,6 +160,24 @@ class ExperimentEnrollmentRequest(BaseModel):
 class CreateTransactionRequest(BaseModel):
     jws_payload: str
     experiment: ExperimentContext | None = None
+    # Optional attribution cannot reject a verified financial fact at request
+    # validation time. Keep only a bounded scalar object; validate its contract
+    # after the financial commit and report malformed metadata as a conflict.
+    journey: Any = None
+
+    @field_validator("journey", mode="before")
+    @classmethod
+    def bound_journey_metadata(cls, value):
+        if value is None or isinstance(value, ActivationJourneyContext):
+            return value
+        if not isinstance(value, dict) or len(value) > 24:
+            return "invalid_metadata"
+        if any(not isinstance(key, str) or len(key) > 50
+               or not isinstance(item, (str, int, bool, UUID))
+               or (isinstance(item, str) and len(item) > 200)
+               for key, item in value.items()):
+            return "invalid_metadata"
+        return value
 
 
 class ActivationRecoveryRequest(BaseModel):
@@ -214,6 +239,7 @@ def _upsert_experiment_exposure(
 ) -> ExperimentExposure | None:
     if not context.eligible or context.exposed_at_ms is None:
         return None
+    reserve_legacy_installation(session=session, user=user, installation_id=context.installation_id)
 
     exposure_id = _canonical_exposure_id(context)
     enrollment = session.get(ExperimentEnrollment, f"{exposure_id}:v2")
@@ -336,6 +362,7 @@ def report_experiment_exposure(
         session.commit()
         return {"detail": "success"}
     except HTTPException:
+        session.rollback()
         raise
     except Exception:
         session.rollback()
@@ -412,6 +439,14 @@ def report_experiment_enrollment(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
+    try:
+        return _report_experiment_enrollment(data, user, session)
+    except Exception:
+        session.rollback()
+        raise
+
+
+def _report_experiment_enrollment(data, user, session):
     context = data.experiment
     if (
         context.experiment_id != "paywall_flight_detail_2026_09"
@@ -422,6 +457,7 @@ def report_experiment_enrollment(
         or context.measurement_revision not in (None, 2)
     ):
         raise HTTPException(status_code=422, detail="Invalid eligible enrollment")
+    reserve_legacy_installation(session=session, user=user, installation_id=context.installation_id)
     exposure_id = _canonical_exposure_id(context)
     enrollment_id = f"{exposure_id}:v2"
     existing = session.get(ExperimentEnrollment, enrollment_id)
@@ -431,6 +467,7 @@ def report_experiment_enrollment(
             or existing.analytics_environment != context.analytics_environment
         ):
             raise HTTPException(status_code=409, detail="Experiment assignment conflict")
+        session.commit()
         return {"detail": "success", "measurement_revision": 2}
 
     # Delivery can be out of order: only a strictly earlier legacy exposure
@@ -473,6 +510,17 @@ def report_experiment_goal_selection(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
+    if data.journey is not None:
+        try:
+            result = confirm_journey_goals(session=session, user=user, data=data)
+            session.commit()
+            return result
+        except HTTPException:
+            session.rollback()
+            raise
+        except Exception:
+            session.rollback()
+            raise HTTPException(status_code=503, detail="Journey goal confirmation unavailable") from None
     context = data.experiment
     if not context.eligible or context.variant != "treatment_simplified":
         raise HTTPException(
@@ -550,7 +598,16 @@ def report_experiment_goal_selection(
         )
 
 
-def _verified_transaction_for_user(
+def _activation_recovery_owner_matches(owner_id: str | None, user_id: str) -> bool:
+    # Apple may encode an equivalent UUID with different casing/hyphens.
+    # Missing or malformed provenance is never permission to adopt an owner.
+    try:
+        return UUID(owner_id) == UUID(user_id)
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _verified_transaction_for_activation_owner(
     transaction_id: str,
     user: User,
     session: Session,
@@ -562,13 +619,10 @@ def _verified_transaction_for_user(
             detail="Verified transaction was not found",
         )
 
-    subscription_link = session.exec(
-        select(UserSubscriptionLink).where(
-            UserSubscriptionLink.user_id == user.id,
-            UserSubscriptionLink.subscription_id == transaction.subscription_id,
-        )
-    ).first()
-    if transaction.app_account_token != user.id and subscription_link is None:
+    # Restored entitlement is not ownership of the original selected-flight
+    # checkout. Keep this stricter boundary local to recovery reporting; never
+    # change the independent verified-money or restore-entitlement paths.
+    if not _activation_recovery_owner_matches(transaction.app_account_token, user.id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Verified transaction was not found",
@@ -585,15 +639,22 @@ def report_activation_recovery(
     """Track whether a verified purchase is still waiting for its flight."""
 
     try:
-        transaction = _verified_transaction_for_user(
+        transaction = _verified_transaction_for_activation_owner(
             data.transaction_id,
             user,
             session,
         )
+        recovery = session.get(PurchaseActivationRecovery, data.transaction_id, populate_existing=True)
+        if recovery is not None and not _activation_recovery_owner_matches(recovery.user_id, user.id):
+            # A legacy/stale row with a different owner is not a record that a
+            # current authenticated caller may resolve, replace or reassign.
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Verified transaction was not found",
+            )
         if _enum_value(transaction.environment).casefold() != "production":
             return {"detail": "ignored_non_production"}
 
-        recovery = session.get(PurchaseActivationRecovery, data.transaction_id)
         current_time = int(time.time())
 
         if data.state == "resolved":
@@ -1025,6 +1086,7 @@ def create_or_update_transaction(
             detail="Internal server error",
         )
 
+    metadata_statuses = []
     if data.experiment:
         try:
             _upsert_experiment_exposure(
@@ -1038,11 +1100,32 @@ def create_or_update_transaction(
             session.commit()
         except HTTPException as error:
             session.rollback()
-            return {"detail": "successfull", "experiment_tracking_status": (
+            metadata_statuses.append(
                 "conflict" if error.status_code == 409 else "pending"
-            )}
+            )
         except Exception:
             session.rollback()
             logger.exception("Verified purchase metadata retry needed user_id=%s", user.id)
-            return {"detail": "successfull", "experiment_tracking_status": "pending"}
+            metadata_statuses.append("pending")
+    if data.journey is not None:
+        try:
+            context = (data.journey if isinstance(data.journey, ActivationJourneyContext)
+                       else ActivationJourneyContext.model_validate(data.journey))
+            attribute_journey_transaction(session=session, user=user, context=context,
+                                          transaction_id=decoded_jws.transactionId)
+            session.commit()
+        except ValidationError:
+            session.rollback()
+            metadata_statuses.append("conflict")
+        except HTTPException as error:
+            session.rollback()
+            metadata_statuses.append("conflict" if error.status_code in (403, 409, 422) else "pending")
+        except Exception:
+            session.rollback()
+            logger.warning("Verified journey metadata retry needed", exc_info=False)
+            metadata_statuses.append("pending")
+    if metadata_statuses:
+        return {"detail": "successfull", "experiment_tracking_status": (
+            "pending" if "pending" in metadata_statuses else "conflict"
+        )}
     return {"detail": "successfull"}

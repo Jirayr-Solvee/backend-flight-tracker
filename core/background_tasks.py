@@ -8,6 +8,7 @@ import httpx
 from sqlmodel import select, update
 
 from .config import settings
+from .email_ingress_contract import MAX_EMAIL_BYTES, EmailIngressRejected, verify_object_bytes
 from .models import Session, engine
 from .models.aerodatabox import (FlightNotificationContractSubscription,
                                  FlightStatusEnum)
@@ -17,6 +18,10 @@ from .models.flight import Flight, FlightStatusEnum, UserFlightLink
 from .models.live_activity import LiveActivityRegistration
 from .models.user import User
 from .services.activation_recovery import emit_due_activation_recovery_alerts
+from .services.ai_consent import AIConsentRequired, AIConsentUnavailable
+from .services.email_ingress import (
+    claim_email_receipt, finish_email_receipt, require_email_consent_for_send, validate_intake,
+)
 from .services.apn.live_activity import LiveActivityService
 from .services.apn.service import ApnService
 from .services.flight import FlightPersistence
@@ -27,36 +32,62 @@ logger = logging.getLogger(__name__)
 
 
 async def handle_incoming_email(notification: S3EmailNotification):
-    """
-    Background task to handle email parsing form a user for awaiting flights
-    """
-    with Session(engine) as session:
+    try:
+        await _handle_incoming_email(notification)
+    except Exception:
+        # Session construction/entry/cleanup happen outside the inner handler's
+        # try block. Driver exceptions must not escape with email parameters.
+        logger.error("forwarded_email_session_failed", exc_info=False, stack_info=False)
+
+
+async def _handle_incoming_email(notification: S3EmailNotification):
+    context = None
+    final_state = "failed"
+    try:
+        payload = validate_intake(notification)
+        request = {"Bucket": notification.bucket, "Key": notification.key, "IfMatch": notification.receipt.etag}
+        if notification.receipt.version_id is not None:
+            request["VersionId"] = notification.receipt.version_id
+        obj = get_s3_client().get_object(**request)
+        stream = obj["Body"]
         try:
-            s3_client = get_s3_client()
+            size = obj.get("ContentLength")
+            if type(size) is not int or not 0 < size <= MAX_EMAIL_BYTES:
+                raise EmailIngressRejected()
+            data = stream.read(MAX_EMAIL_BYTES + 1)
+            if (len(data) != size or obj.get("ETag") != notification.receipt.etag
+                    or (notification.receipt.version_id is not None
+                        and obj.get("VersionId") != notification.receipt.version_id)):
+                raise EmailIngressRejected()
+        finally:
+            stream.close()
+        frozen_sender = verify_object_bytes(payload, data)
+        context = claim_email_receipt(notification)
+        if context is None:
+            logger.info("forwarded_email_receipt_duplicate")
+            return
+        # Only parse private body/PDF contents after the trusted receipt is
+        # bound to its original unique Apple owner and preexisting email grant.
+        parsed = parse_email(data)
+        if parsed.sender.strip().casefold() != frozen_sender:
+            raise EmailIngressRejected()
+        require_email_consent_for_send(context)
 
-            obj = s3_client.get_object(Bucket=notification.bucket, Key=notification.key)
-            data = obj["Body"].read()
-
-            parsed = parse_email(data)
-
-            user = session.exec(select(User).where(User.email == parsed.sender)).first()
-            if not user:
-                logger.warning(
-                    f"Got an email from unregistered user for following lambda notification payload={notification}"
-                )
-                return
-
-            # 4. extract flight details
-            ai_parser = GeminiService()
+        with Session(engine) as session:
+            user = session.get(User, context.user_id)
+            if user is None:
+                raise AIConsentRequired("forwarded_email")
+            ai_parser = GeminiService(user_id=user.id, email_sender=frozen_sender, email_receipt=context)
             result = await ai_parser.get_function_call(query=parsed.body, email=True)
 
             if not result:
-                logger.warning(
-                    "Gemini unable to extract function call for fowrarded email"
-                )
+                logger.warning("forwarded_email_extraction_unavailable")
+                final_state = "no_result"
                 return
 
+            require_email_consent_for_send(context)
             flights = await result.handler(**result.args, session=session)
+            require_email_consent_for_send(context)
             if len(flights) > 0:
                 # NOTE: edge case: as api may return multiple flights -> we assign the first one -> a sulotion maybe instructing AI model to extract utc of departure and compare it here ( also should have some variable range as many flight trackers have deffrent departure timestamp )
 
@@ -68,10 +99,8 @@ async def handle_incoming_email(notification: S3EmailNotification):
                 ).first()
 
                 if link:
-                    logger.info(
-                        f"Flight already exsist for flight.id={flights[0].id}, user.id={user.id}, payload={notification}"
-                    )
-                    # NOTE: maybe send a notification says hey flight already linked to your account
+                    logger.info("forwarded_email_flight_already_linked")
+                    final_state = "completed"
                     return
 
                 FlightPersistence.link_flight_and_user(
@@ -86,26 +115,38 @@ async def handle_incoming_email(notification: S3EmailNotification):
                 user.notification_count += 1
 
                 devices: list[Device] = user.devices
-                user_devices_tokens = [
-                    d.apn_token
+                active_devices = [
+                    d
                     for d in devices
                     if d.apn_token is not None and d.apn_token_active
                 ]
-                if user_devices_tokens:
-                    for tk in user_devices_tokens:
+                if active_devices:
+                    for device in active_devices:
                         await ApnService.send_single_push_notification(
                             notification=push_notification,
-                            fcm_token=tk,
+                            fcm_token=device.apn_token,
                             badge_count=user.notification_count,
+                            supports_localized_push=device.supports_localized_push,
+                            localized_push_version=device.localized_push_version,
                         )
 
                 session.commit()
-
-        except Exception:
-            logger.exception(
-                f"Error during flight assignment for a user with following lambda notification payload {notification}"
-            )
-            session.rollback()
+                final_state = "completed"
+            else:
+                final_state = "no_result"
+    except (AIConsentRequired, AIConsentUnavailable):
+        final_state = "not_authorized"
+        logger.info("forwarded_email_ai_processing_not_authorized")
+    except EmailIngressRejected:
+        logger.warning("forwarded_email_receipt_rejected")
+    except Exception:
+        logger.error("forwarded_email_processing_failed", exc_info=False, stack_info=False)
+    finally:
+        if context is not None:
+            try:
+                finish_email_receipt(context, final_state)
+            except Exception:
+                logger.error("forwarded_email_receipt_finalize_failed", exc_info=False, stack_info=False)
 
 
 async def create_webhook_for_flight(

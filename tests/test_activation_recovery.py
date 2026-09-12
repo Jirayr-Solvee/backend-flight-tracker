@@ -45,6 +45,7 @@ from fastapi import HTTPException
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from core.models.activation_recovery import PurchaseActivationRecovery
+from core.models.apple_ads import AppStoreRevenueEvent
 from core.models.experiment import ExperimentConversion
 from core.models.subscription import Subscription
 from core.models.transaction import Transaction
@@ -66,7 +67,7 @@ class ActivationRecoveryTests(unittest.TestCase):
         )
         SQLModel.metadata.create_all(self.engine)
         self.session = Session(self.engine)
-        self.user = User(id="user-1")
+        self.user = User(id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         self.session.add(self.user)
         self.session.add(Subscription(id="original-1"))
         self.session.add(
@@ -103,6 +104,11 @@ class ActivationRecoveryTests(unittest.TestCase):
                 starts_trial=True,
             )
         )
+        self.session.add(AppStoreRevenueEvent(
+            id="transaction-1", original_transaction_id="original-1", user_id=self.user.id,
+            product_id="yearly", purchase_date_ms=1000, purchase_environment="Production",
+            price_milliunits=0, currency="USD", app_account_token=self.user.id, starts_trial=True,
+        ))
         self.session.commit()
 
     def tearDown(self):
@@ -187,7 +193,7 @@ class ActivationRecoveryTests(unittest.TestCase):
         self.assertEqual(recovery.resolved_at, 1_120)
 
     def test_other_user_cannot_report_recovery(self):
-        other_user = User(id="user-2")
+        other_user = User(id="cccccccc-cccc-4ccc-8ccc-cccccccccccc")
         self.session.add(other_user)
         self.session.commit()
 
@@ -202,6 +208,119 @@ class ActivationRecoveryTests(unittest.TestCase):
             self.session.exec(select(PurchaseActivationRecovery)).all(),
             [],
         )
+
+    def _restoring_user(self):
+        other = User(id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", premium_valid_until=9_999_999_999)
+        self.session.add(other)
+        self.session.add(UserSubscriptionLink(user_id=other.id, subscription_id="original-1"))
+        self.session.commit()
+        return other
+
+    def _assert_owner_failure_preserves_all_facts(self, user, state):
+        transaction_before = self.session.get(Transaction, "transaction-1").model_dump()
+        conversion_before = self.session.get(ExperimentConversion, "transaction-1").model_dump()
+        revenue_before = self.session.get(AppStoreRevenueEvent, "transaction-1").model_dump()
+        user_before = self.session.get(User, user.id).model_dump()
+        links_before = sorted((row.user_id, row.subscription_id) for row in self.session.exec(select(UserSubscriptionLink)).all())
+        recovery = self.session.get(PurchaseActivationRecovery, "transaction-1")
+        recovery_before = recovery.model_dump() if recovery else None
+        with self.assertRaises(HTTPException) as failure:
+            report_activation_recovery(
+                ActivationRecoveryRequest(transaction_id="transaction-1", state=state,
+                    flight_id=999, failure_reason="backend_rejected" if state == "recovery_pending" else None),
+                user, self.session,
+            )
+        self.assertEqual(failure.exception.status_code, 404)
+        self.assertEqual(failure.exception.detail, "Verified transaction was not found")
+        recovery = self.session.get(PurchaseActivationRecovery, "transaction-1", populate_existing=True)
+        self.assertEqual(recovery.model_dump() if recovery else None, recovery_before)
+        self.assertEqual(self.session.get(Transaction, "transaction-1", populate_existing=True).model_dump(), transaction_before)
+        self.assertEqual(self.session.get(ExperimentConversion, "transaction-1", populate_existing=True).model_dump(), conversion_before)
+        self.assertEqual(self.session.get(AppStoreRevenueEvent, "transaction-1", populate_existing=True).model_dump(), revenue_before)
+        self.assertEqual(self.session.get(User, user.id, populate_existing=True).model_dump(), user_before)
+        self.assertEqual(sorted((row.user_id, row.subscription_id) for row in self.session.exec(select(UserSubscriptionLink)).all()), links_before)
+
+    def test_restored_entitlement_cannot_create_or_resolve_missing_original_owner_row(self):
+        restoring = self._restoring_user()
+        for state in ("recovery_pending", "resolved"):
+            with self.subTest(state=state):
+                self._assert_owner_failure_preserves_all_facts(restoring, state)
+
+    def test_restored_entitlement_cannot_mutate_existing_original_owner_row(self):
+        restoring = self._restoring_user()
+        report_activation_recovery(self.pending_request(), self.user, self.session)
+        for state in ("recovery_pending", "resolved"):
+            with self.subTest(state=state):
+                self._assert_owner_failure_preserves_all_facts(restoring, state)
+        # Original ownership still allows normal resolution, despite B's valid
+        # entitlement link. B cannot use the already-resolved response either.
+        result = report_activation_recovery(ActivationRecoveryRequest(transaction_id="transaction-1", state="resolved", flight_id=42), self.user, self.session)
+        self.assertEqual(result["detail"], "resolved")
+        for state in ("recovery_pending", "resolved"):
+            with self.subTest(existing="resolved", state=state):
+                self._assert_owner_failure_preserves_all_facts(restoring, state)
+
+    def test_original_transaction_owner_cannot_overwrite_another_recovery_row_owner(self):
+        restoring = self._restoring_user()
+        # Reproduce an older/corrupt row created under entitlement-only checks.
+        report_activation_recovery(self.pending_request(), self.user, self.session)
+        row = self.session.get(PurchaseActivationRecovery, "transaction-1")
+        row.user_id = restoring.id
+        self.session.add(row)
+        self.session.commit()
+        for state in ("recovery_pending", "resolved"):
+            with self.subTest(state=state):
+                self._assert_owner_failure_preserves_all_facts(self.user, state)
+
+    def test_missing_transaction_owner_is_not_inferred_from_entitlement_link(self):
+        transaction = self.session.get(Transaction, "transaction-1")
+        transaction.app_account_token = None
+        self.session.add(transaction)
+        self.session.commit()
+        for state in ("recovery_pending", "resolved"):
+            with self.subTest(state=state):
+                self._assert_owner_failure_preserves_all_facts(self.user, state)
+
+    def test_malformed_transaction_or_recovery_owner_is_not_trusted(self):
+        transaction = self.session.get(Transaction, "transaction-1")
+        transaction.app_account_token = "not-a-uuid"
+        self.session.add(transaction)
+        self.session.commit()
+        for state in ("recovery_pending", "resolved"):
+            self._assert_owner_failure_preserves_all_facts(self.user, state)
+        transaction.app_account_token = self.user.id
+        self.session.add(transaction)
+        self.session.commit()
+        report_activation_recovery(self.pending_request(), self.user, self.session)
+        row = self.session.get(PurchaseActivationRecovery, "transaction-1")
+        row.user_id = "not-a-uuid"
+        self.session.add(row)
+        self.session.commit()
+        for state in ("recovery_pending", "resolved"):
+            self._assert_owner_failure_preserves_all_facts(self.user, state)
+
+    def test_equivalent_uuid_owner_casing_and_format_remain_authorized(self):
+        transaction = self.session.get(Transaction, "transaction-1")
+        transaction.app_account_token = self.user.id.upper().replace("-", "")
+        self.session.add(transaction)
+        self.session.commit()
+        self.assertEqual(report_activation_recovery(self.pending_request(), self.user, self.session)["detail"], "recovery_pending")
+        row = self.session.get(PurchaseActivationRecovery, "transaction-1")
+        row.user_id = self.user.id.upper()
+        self.session.add(row)
+        self.session.commit()
+        result = report_activation_recovery(ActivationRecoveryRequest(transaction_id="transaction-1", state="resolved", flight_id=42), self.user, self.session)
+        self.assertEqual(result["detail"], "resolved")
+        self.assertEqual(self.session.get(PurchaseActivationRecovery, "transaction-1").user_id, self.user.id.upper())
+
+    def test_original_owner_does_not_need_a_restore_entitlement_link_for_recovery(self):
+        link = self.session.exec(select(UserSubscriptionLink).where(UserSubscriptionLink.user_id == self.user.id)).one()
+        self.session.delete(link)
+        self.session.commit()
+        result = report_activation_recovery(self.pending_request(), self.user, self.session)
+        self.assertEqual(result["detail"], "recovery_pending")
+        result = report_activation_recovery(ActivationRecoveryRequest(transaction_id="transaction-1", state="resolved", flight_id=42), self.user, self.session)
+        self.assertEqual(result["detail"], "resolved")
 
     def test_nonproduction_purchase_is_ignored(self):
         transaction = self.session.get(Transaction, "transaction-1")

@@ -236,7 +236,7 @@ class LiveActivityRegistrationTests(unittest.TestCase):
         self.engine = create_engine("sqlite://")
         SQLModel.metadata.create_all(self.engine)
 
-    def _seed_registration_owner(self, session: Session):
+    def _seed_registration_owner(self, session: Session, *, link_flight: bool = True):
         user = User(id="user-1")
         device = Device(id="device-1", user_id=user.id)
         flight = Flight(
@@ -249,9 +249,70 @@ class LiveActivityRegistrationTests(unittest.TestCase):
         session.add(flight)
         session.commit()
         session.refresh(flight)
-        session.add(UserFlightLink(user_id=user.id, flight_id=flight.id))
-        session.commit()
+        if link_flight:
+            session.add(UserFlightLink(user_id=user.id, flight_id=flight.id))
+            session.commit()
         return user, device, flight
+
+    def test_registration_rejects_existing_flight_without_user_link(self):
+        with Session(self.engine) as session:
+            user, device, flight = self._seed_registration_owner(
+                session, link_flight=False
+            )
+            background_tasks = BackgroundTasks()
+
+            with self.assertRaises(HTTPException) as raised:
+                register_live_activity(
+                    activity_id="untracked-activity",
+                    data=RegisterLiveActivityRequest(
+                        device_id=device.id,
+                        flight_id=flight.id,
+                        push_token="ab" * 32,
+                    ),
+                    background_tasks=background_tasks,
+                    user=user,
+                    session=session,
+                )
+
+            self.assertEqual(raised.exception.status_code, 404)
+            self.assertEqual(raised.exception.detail, "Tracked flight not found")
+            self.assertIsNotNone(session.get(Device, device.id))
+            self.assertIsNotNone(session.get(Flight, flight.id))
+            self.assertEqual(session.exec(select(UserFlightLink)).all(), [])
+            self.assertEqual(session.exec(select(LiveActivityRegistration)).all(), [])
+            self.assertEqual(background_tasks.tasks, [])
+
+    def test_another_users_flight_link_does_not_authorize_registration(self):
+        with Session(self.engine) as session:
+            user, device, flight = self._seed_registration_owner(
+                session, link_flight=False
+            )
+            other_user = User(id="other-flight-owner")
+            session.add(other_user)
+            session.add(UserFlightLink(user_id=other_user.id, flight_id=flight.id))
+            session.commit()
+            background_tasks = BackgroundTasks()
+
+            with self.assertRaises(HTTPException) as raised:
+                register_live_activity(
+                    activity_id="other-users-flight-activity",
+                    data=RegisterLiveActivityRequest(
+                        device_id=device.id,
+                        flight_id=flight.id,
+                        push_token="ab" * 32,
+                    ),
+                    background_tasks=background_tasks,
+                    user=user,
+                    session=session,
+                )
+
+            self.assertEqual(raised.exception.status_code, 404)
+            self.assertEqual(raised.exception.detail, "Tracked flight not found")
+            links = session.exec(select(UserFlightLink)).all()
+            self.assertEqual([(link.user_id, link.flight_id) for link in links],
+                             [(other_user.id, flight.id)])
+            self.assertEqual(session.exec(select(LiveActivityRegistration)).all(), [])
+            self.assertEqual(background_tasks.tasks, [])
 
     def test_registration_rotates_token_and_unregisters(self):
         with Session(self.engine) as session:

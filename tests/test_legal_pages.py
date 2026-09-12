@@ -20,7 +20,7 @@ class LegalPageTests(unittest.TestCase):
 
     def test_sofly_privacy_discloses_retained_sign_in_details(self):
         text = " ".join(PRIVACY_POLICY_HTML.split())
-        self.assertIn("Effective date: September 8, 2026", text)
+        self.assertIn("Effective date: September 12, 2026", text)
         self.assertIn("Apple sign-in identifier", text)
         self.assertIn("name and email address provided during sign-in", text)
         self.assertIn("associate these details with your Sofly account", text)
@@ -44,6 +44,14 @@ class LegalPageTests(unittest.TestCase):
         self.assertIn("associated personal data, including forwarded booking emails", text)
         self.assertNotIn("not used for training", text)
         self.assertNotIn("deleted immediately", text)
+
+    def test_sofly_privacy_has_separate_explicit_ai_permissions_and_revoke_limits(self):
+        text = " ".join(PRIVACY_POLICY_HTML.split())
+        self.assertIn("AI search and forwarded-email AI processing have separate permissions", text)
+        self.assertIn("both off by default", text)
+        self.assertIn("revoke either in Settings", text)
+        self.assertIn("cannot undo information already sent", text)
+        self.assertIn("searches can work without sharing the search text", text)
 
     def test_sofly_privacy_explains_bounded_non_anonymous_search_diagnostics(self):
         text = " ".join(PRIVACY_POLICY_HTML.split())

@@ -5,12 +5,13 @@ from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
-from sqlmodel import Session, and_, select, update
+from sqlmodel import Session, and_, delete, select, update
 
 from ..background_tasks import create_webhook_for_flight
 from ..dependency import check_guest_auth_token, get_current_user
 from ..models import get_session
 from ..models.device import Device
+from ..models.ai_consent import AIConsentReceipt, UserAIConsent, UserAIEmailIdentity
 from ..models.flight import Flight, FlightRead
 from ..models.live_activity import (
     LiveActivityPushToStartDelivery,
@@ -22,6 +23,7 @@ from ..security_logging import (
     CredentialOperation, CredentialSafeRoute, rollback_and_log_failure,
 )
 from ..services.apn.live_activity import LiveActivityService
+from ..services.ai_consent import record_verified_apple_email_identity
 from ..utils import create_jwt, verify_apple_identity_token
 
 router = APIRouter(route_class=CredentialSafeRoute)
@@ -109,6 +111,8 @@ async def create_user(
             select(User).where(User.apple_id == apple_user_id)
         ).first()
         if apple_user:
+            record_verified_apple_email_identity(session, apple_user.id, apple_token_parts)
+            session.commit()
             jwt = create_jwt(sub=apple_user.id)
             return CreateUserResponse(
                 jwt=jwt,
@@ -126,6 +130,9 @@ async def create_user(
         user.full_name = full_name
         user.email = email
         user.verified = True
+
+        session.flush()
+        record_verified_apple_email_identity(session, user.id, apple_token_parts)
 
         jwt = create_jwt(sub=user.id)
 
@@ -146,6 +153,8 @@ class RefreshApnToken(BaseModel):
     device_id: str
     apn_token: str = Field(repr=False)
     supports_localized_push: bool = False
+    # Missing means the original dictionary, never implicit support for new keys.
+    localized_push_version: int = Field(default=1, strict=True, ge=0, le=2)
 
 
 @router.put("/me/apn/refresh", response_model=dict)
@@ -179,6 +188,7 @@ def refresh_apn_token(
         device.apn_token = data.apn_token
         device.apn_token_active = True
         device.supports_localized_push = data.supports_localized_push
+        device.localized_push_version = data.localized_push_version
         device.user_id = user.id
         session.add(device)
         session.commit()
@@ -506,6 +516,10 @@ def delete_user(
 
         user.subscriptions.clear()
         user.flights.clear()
+
+        session.exec(delete(AIConsentReceipt).where(AIConsentReceipt.user_id == user.id))
+        session.exec(delete(UserAIConsent).where(UserAIConsent.user_id == user.id))
+        session.exec(delete(UserAIEmailIdentity).where(UserAIEmailIdentity.user_id == user.id))
 
         session.flush()
         session.delete(user)

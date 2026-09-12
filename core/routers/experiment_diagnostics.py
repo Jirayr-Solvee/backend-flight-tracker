@@ -17,23 +17,46 @@ from ..models.experiment import ExperimentDiagnosticEvent, current_time_ms
 from ..models.transaction import Transaction
 from ..models.user import User, UserSubscriptionLink
 from .subscriptions import ExperimentContext
+from ..activation_journey_contract import ActivationJourneyContext
+from ..models.activation_journey import ActivationJourneyDiagnosticContext
+from ..services.activation_journey import record_journey_diagnostic, validate_journey, reserve_legacy_installation
 
 router = APIRouter()
 Token = Annotated[str, Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_.:-]+$")]
 ProductID = Annotated[str, Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_.-]+$")]
 FlightIdentity = Annotated[str, Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")]
+SETTING_VALUES = {
+    "distance_unit": frozenset(("km", "mi")),
+    "time_format": frozenset(("12_hour", "24_hour")),
+    "history_sort": frozenset(("date_ascending", "date_descending", "airline_ascending", "airline_descending",
+                                "departure_ascending", "departure_descending", "arrival_ascending", "arrival_descending")),
+}
 EventName = Literal[
+    "app_launched", "app_became_active", "app_became_inactive",
+    "apns_registered", "apns_registration_failed", "push_received", "push_opened",
+    "screen_viewed", "screen_home_viewed", "screen_flight_search_viewed",
+    "screen_flight_search_results_viewed", "screen_history_viewed", "screen_profile_viewed",
+    "screen_copilot_viewed", "screen_arrival_summary_viewed",
+    "activation_journey_enrolled", "activation_journey_selected_flight",
+    "activation_experiment_exposed", "pricing_experiment_exposed", "onboarding_choice_selected",
     "paywall_viewed", "paywall_dismissed", "flight_detail_paywall_experiment_exposed",
     "flight_detail_paywall_experiment_enrolled",
     "subscription_product_selected", "af_initiated_checkout", "checkout_attempt_completed",
     "af_start_trial", "af_purchase", "purchase_cancelled", "purchase_pending",
     "purchase_unverified", "purchase_error", "flight_selected", "flight_added",
+    "subscription_restore_started", "subscription_restore_completed", "subscription_restore_failed",
     "screen_flight_detail_viewed", "post_purchase_flight_activation",
     "notification_permission_result", "tracking_briefing_scheduled",
     "flight_notification_scheduling", "live_activity_started", "live_activity_start_failed",
+    "notification_deep_link_opened", "post_arrival_follow_up_action", "live_activity_opened",
     "live_activity_push_to_start_registration",
     "live_activity_update_registration",
     "flight_add_blocked", "flight_add_failed", "transaction_registration_outcome",
+    "flight_deleted", "flight_deletion_outcome", "global_flight_tapped", "global_flight_resolved", "global_flight_discarded",
+    "copilot_tapped", "copilot_opened", "copilot_telemetry_loaded",
+    "delay_risk_loaded", "delay_risk_failed", "arrival_card_viewed", "arrival_card_action",
+    "review_prompt_requested", "voice_search_action", "permission_result", "setting_changed",
+    "search_suggestion_selected", "account_action", "flight_import_action",
     "paywall_alternative_plans_revealed", "paywall_products_loaded",
     "af_search", "search_completed", "search_failed", "no_search_results",
     "search_recovery_shown", "search_recovery_suggestion_selected",
@@ -91,6 +114,45 @@ class DiagnosticProperties(BaseModel):
     suggestion_count: Annotated[int, Field(ge=0, le=1000)] | None = None
     step: Annotated[int, Field(ge=0, le=100)] | None = None
     total_steps: Annotated[int, Field(ge=0, le=100)] | None = None
+    effective_onboarding: Literal["search_first", "goals"] | None = None
+    effective_paywall: Literal["standard", "flight_detail"] | None = None
+    effective_offer: Literal["standard", "flight_detail_treatment"] | None = None
+    goals_status: Literal["not_asked", "required", "confirmed"] | None = None
+    paywall_surface: Literal["selected_flight", "skip_flight", "other"] | None = None
+    operational_override: Literal["none", "forced_standard", "configuration_fallback"] | None = None
+    selection_eligible: bool | None = None
+    # Schema 20 extends the operational projection, never arbitrary analytics
+    # dictionaries. Human labels, queries, routes, callsigns and payload bodies
+    # remain absent; these values are machine-readable bounded codes only.
+    screen: Token | None = None
+    app_language: Token | None = None
+    permission: Literal["speech", "microphone", "tracking", "location"] | None = None
+    setting: Literal["distance_unit", "time_format", "history_sort"] | None = None
+    value: Literal["km", "mi", "12_hour", "24_hour", "date_ascending", "date_descending",
+                   "airline_ascending", "airline_descending", "departure_ascending", "departure_descending",
+                   "arrival_ascending", "arrival_descending"] | None = None
+    choice_key: Token | None = None
+    update_type: Token | None = None
+    level: Token | None = None
+    confidence: Token | None = None
+    exposure_scope: Token | None = None
+    enrollment_scope: Token | None = None
+    completion_semantics: Token | None = None
+    selection_stage: Token | None = None
+    view_scope: Token | None = None
+    load_scope: Token | None = None
+    layout: Token | None = None
+    has_transcript: bool | None = None
+    has_active_entitlement: bool | None = None
+    has_flight_context: bool | None = None
+    has_live_telemetry: bool | None = None
+    shows_summary_action: bool | None = None
+    selected: bool | None = None
+    selected_count: Annotated[int, Field(ge=0, le=20)] | None = None
+    score: Annotated[int, Field(ge=0, le=100)] | None = None
+    measurement_revision: Annotated[int, Field(ge=1, le=100)] | None = None
+    source_flight_id: Annotated[int, Field(ge=1, le=9_223_372_036_854_775_807)] | None = None
+    new_flight_id: Annotated[int, Field(ge=1, le=9_223_372_036_854_775_807)] | None = None
 
 
 class DiagnosticEvent(BaseModel):
@@ -106,6 +168,7 @@ class DiagnosticEvent(BaseModel):
     paywall_presentation_id: UUID | None = None
     checkout_attempt_id: UUID | None = None
     experiment: ExperimentContext | None = None
+    journey: ActivationJourneyContext | None = None
     properties: DiagnosticProperties = Field(default_factory=DiagnosticProperties)
 
     @model_validator(mode="after")
@@ -117,6 +180,32 @@ class DiagnosticEvent(BaseModel):
             or self.experiment.analytics_environment != self.analytics_environment
         ):
             raise ValueError("Experiment and event context must match")
+        if self.journey:
+            if self.experiment is not None:
+                raise ValueError("New journey diagnostics must not create legacy experiment facts")
+            if self.journey.installation_id != self.installation_id or self.journey.analytics_environment != self.analytics_environment:
+                raise ValueError("Journey and event context must match")
+            if self.occurred_at_ms < self.journey.enrolled_at_ms or (self.properties.event_schema_version or 0) < 18:
+                raise ValueError("Journey events require capture-time schema 18 and valid timing")
+            if self.event_name in ("flight_detail_paywall_experiment_exposed", "flight_detail_paywall_experiment_enrolled"):
+                raise ValueError("Legacy cohort events cannot enroll a new journey")
+            if self.properties.paywall_surface == "skip_flight" and (
+                self.properties.effective_offer != "standard" or self.properties.effective_paywall != "standard"
+            ):
+                raise ValueError("Skip-flight uses the standard offer and paywall")
+            if self.journey.goals_status == "not_asked" and self.properties.goals_status not in (None, "not_asked"):
+                raise ValueError("A search-first journey cannot claim asked or confirmed goals")
+        if self.event_name in ("activation_journey_enrolled", "activation_journey_selected_flight"):
+            if self.journey is None:
+                raise ValueError("Canonical journey milestones require journey context")
+        if self.event_name == "activation_journey_enrolled" and (
+            self.event_id != self.journey.enrollment_event_id or self.occurred_at_ms != self.journey.enrolled_at_ms
+        ):
+            raise ValueError("Canonical enrollment ID and capture time must match")
+        if self.event_name == "activation_journey_selected_flight" and (
+            self.properties.selection_eligible is not True or self.properties.flight_identity is None
+        ):
+            raise ValueError("First eligible selection requires a frozen flight identity")
         if self.event_name in (
             "paywall_viewed", "paywall_dismissed", "subscription_product_selected",
             "af_initiated_checkout", "checkout_attempt_completed",
@@ -130,6 +219,53 @@ class DiagnosticEvent(BaseModel):
             "verified", "cancelled", "pending", "unverified", "error",
         ):
             raise ValueError("Invalid checkout terminal outcome")
+        # These new schema-20 event names have no historical loose payload to
+        # preserve. Require their minimal operational meaning, not free text.
+        required = {
+            "voice_search_action": ("action", "source", "has_transcript"),
+            "permission_result": ("permission", "status", "source"),
+            "setting_changed": ("setting", "value", "source"),
+            "search_suggestion_selected": ("suggestion_kind", "source"),
+            "account_action": ("action", "outcome", "source"),
+            "flight_import_action": ("action", "outcome", "source"),
+            "flight_deletion_outcome": ("flight_id", "stage", "outcome"),
+        }.get(self.event_name, ())
+        if required and (
+            (self.properties.event_schema_version or 0) < 20
+            or any(getattr(self.properties, key) is None for key in required)
+        ):
+            raise ValueError("Operational event requires schema 20 and its bounded context")
+        if self.event_name == "setting_changed" and self.properties.value not in SETTING_VALUES[self.properties.setting]:
+            raise ValueError("Setting value does not match its finite setting contract")
+        if self.event_name == "permission_result" and self.properties.status not in (
+            "authorized", "denied", "restricted", "not_determined", "unknown", "priming_declined",
+        ):
+            raise ValueError("Permission result must use a fixed authorization state")
+        if self.event_name == "voice_search_action" and (
+            self.properties.action not in ("microphone_tapped", "priming_shown", "priming_declined",
+                                           "recording_started", "recording_stopped", "submitted", "failed")
+            or self.properties.reason not in (None, "user", "submitted", "dismissed", "interrupted", "completed",
+                                              "recognition_failed", "speech_denied", "microphone_denied",
+                                              "recognizer_unavailable", "invalid_audio_format", "audio_start_failed")
+        ):
+            raise ValueError("Voice diagnostics must use fixed action and failure codes")
+        if self.event_name == "search_suggestion_selected" and self.properties.suggestion_kind != "example":
+            raise ValueError("Example-chip diagnostics must not include suggestion text")
+        if self.event_name == "account_action" and (
+            self.properties.action not in ("guest_create", "apple_sign_in", "sign_out", "account_delete")
+            or self.properties.outcome not in ("started", "succeeded", "cancelled", "failed")
+        ):
+            raise ValueError("Account diagnostics must use fixed action and outcome codes")
+        if self.event_name == "flight_import_action" and (
+            self.properties.action != "forwarding_address_share"
+            or self.properties.outcome not in ("presented", "completed", "cancelled", "failed")
+        ):
+            raise ValueError("Forwarding share-sheet diagnostics are not verified flight import")
+        if self.event_name == "flight_deletion_outcome" and (self.properties.stage, self.properties.outcome) not in (
+            ("local_save", "succeeded"), ("local_save", "failed"),
+            ("backend_delete", "succeeded"), ("backend_delete", "failed"), ("backend_delete", "skipped"),
+        ):
+            raise ValueError("Flight deletion diagnostics require a fixed persistence stage and outcome")
         return self
 
 
@@ -139,6 +275,9 @@ class DiagnosticBatch(BaseModel):
 
 
 def _row(event: DiagnosticEvent, user: User) -> ExperimentDiagnosticEvent:
+    properties = event.properties.model_dump(mode="json", exclude_none=True)
+    if event.journey:
+        properties["_activation_journey"] = event.journey.model_dump(mode="json")
     return ExperimentDiagnosticEvent(
         id=str(event.event_id), user_id=user.id,
         installation_id=str(event.installation_id), event_name=event.event_name,
@@ -150,7 +289,7 @@ def _row(event: DiagnosticEvent, user: User) -> ExperimentDiagnosticEvent:
         experiment_id=event.experiment.experiment_id if event.experiment else None,
         variant=event.experiment.variant if event.experiment else None,
         measurement_revision=event.experiment.measurement_revision if event.experiment else None,
-        properties_json=json.dumps(event.properties.model_dump(mode="json", exclude_none=True), sort_keys=True, separators=(",", ":")),
+        properties_json=json.dumps(properties, sort_keys=True, separators=(",", ":")),
     )
 
 
@@ -168,6 +307,8 @@ def record_diagnostic_events(
     for event in data.events:
         if not now_ms - 90 * 86_400_000 <= event.occurred_at_ms <= now_ms + 86_400_000:
             raise HTTPException(status_code=422, detail="Event timestamp is outside the diagnostic window")
+        if event.journey:
+            validate_journey(session=session, user=user, context=event.journey)
         row = _row(event, user)
         existing = incoming.get(row.id) or session.get(ExperimentDiagnosticEvent, row.id)
         if existing:
@@ -198,9 +339,24 @@ def record_diagnostic_events(
                            and value.event_name == "checkout_attempt_completed"]
         if existing_terminal is not None or len(batch_terminals) > 1:
             raise HTTPException(status_code=409, detail="Checkout attempt already has a terminal event")
-    for row in incoming.values():
-        session.add(row)
     try:
+        for row in incoming.values():
+            session.add(row)
+        session.flush()
+        for event in data.events:
+            if event.journey:
+                record_journey_diagnostic(session=session, user=user, event=event)
+            elif event.event_name in ("onboarding_started", "onboarding_completed", "flight_detail_paywall_experiment_exposed", "flight_detail_paywall_experiment_enrolled") and (
+                event.experiment is not None or (event.properties.event_schema_version or 0) < 20
+            ):
+                # Schema-20 lifecycle/QA capture can intentionally have a random
+                # diagnostics installation ID but no cohort. It is not evidence
+                # of an old protocol entry. Keep historical pre-20 behavior.
+                reserve_legacy_installation(session=session, user=user, installation_id=event.installation_id)
+        expired_ids = select(ExperimentDiagnosticEvent.id).where(
+            ExperimentDiagnosticEvent.received_at_ms < now_ms - 90 * 86_400_000,
+        )
+        session.exec(delete(ActivationJourneyDiagnosticContext).where(ActivationJourneyDiagnosticContext.id.in_(expired_ids)))
         session.exec(delete(ExperimentDiagnosticEvent).where(
             ExperimentDiagnosticEvent.received_at_ms < now_ms - 90 * 86_400_000,
         ))
@@ -215,6 +371,9 @@ def record_diagnostic_events(
             if not existing or existing.model_dump(exclude={"received_at_ms"}) != row.model_dump(exclude={"received_at_ms"}):
                 raise HTTPException(status_code=409, detail="Concurrent diagnostic facts conflict")
         return {"detail": "success", "accepted": 0, "duplicates": len(data.events)}
+    except Exception:
+        session.rollback()
+        raise
     return {"detail": "success", "accepted": len(incoming), "duplicates": duplicates}
 
 
@@ -249,6 +408,7 @@ def get_diagnostic_report(
     events = []
     for row in rows:
         properties = json.loads(row.properties_json)
+        journey_context = properties.pop("_activation_journey", None)
         properties_by_id[row.id] = properties
         if row.checkout_attempt_id:
             attempts[row.checkout_attempt_id].append(row)
@@ -269,6 +429,7 @@ def get_diagnostic_report(
         events.append({
             **row.model_dump(exclude={"properties_json", "user_id"}),
             "properties": properties,
+            **({"journey": journey_context} if journey_context else {}),
             "server_verified_transaction": owned_transaction,
             "server_transaction_product_id": transaction.product_id if owned_transaction else None,
             "server_purchase_environment": getattr(transaction.environment, "value", transaction.environment) if owned_transaction else None,

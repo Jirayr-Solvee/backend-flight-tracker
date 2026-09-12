@@ -15,6 +15,7 @@ from jwt.algorithms import RSAAlgorithm
 from mypy_boto3_s3 import S3Client
 
 from .config import settings
+from .email_ingress_contract import mime_sender
 from .models.email import EmailRead
 from .models.user import User
 
@@ -31,15 +32,8 @@ def get_s3_client() -> S3Client:
 
 
 def parse_email(raw_bytes: bytes) -> EmailRead:
+    sender = mime_sender(raw_bytes)
     msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
-
-    raw_from = msg.get("From")
-    if not raw_from:
-        raise ValueError("raw_from not found while parsing email")
-
-    sender = parseaddr(raw_from)[1]
-    if not sender:
-        raise ValueError(f"unable to retrive sender from raw_from={raw_from}")
 
     collected_text = []
 
@@ -70,9 +64,9 @@ def parse_email(raw_bytes: bytes) -> EmailRead:
             try:
                 pdf_bytes = part.get_payload(decode=True)
                 if pdf_bytes:
-                    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                    for page in doc:
-                        collected_text.append(page.get_text())
+                    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+                        for page in doc:
+                            collected_text.append(page.get_text())
             except Exception:
                 # Corrupted or unreadable PDF
                 continue

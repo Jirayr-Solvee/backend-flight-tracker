@@ -33,6 +33,7 @@ class DeviceInfo(BaseModel):
     user_id: str
     notification_count: int
     supports_localized_push: bool = False
+    localized_push_version: int = Field(default=1, strict=True, ge=0, le=2)
 
 
 class NotificationBatch(BaseModel):

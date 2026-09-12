@@ -29,6 +29,7 @@ from ..services.flight.delay_risk import DelayRiskResponse, DelayRiskService
 from ..services.flight import FlightPersistence, FlightQueryHandler, FlightService
 from ..services.flight.api_client import AerodataboxUnavailableError
 from ..services.gemini.service import GeminiService, ResolvedFunctionCall
+from ..services.ai_consent import AIConsentRequired, AIConsentUnavailable, POLICY_VERSION
 from ..services.search_failure import RETENTION_DAYS, SearchFailureService
 from ..search_failure_retention_policy import effective_expiry_ms, sample_is_live
 from ..utils import user_has_active_subscription, normalize_offset
@@ -511,7 +512,7 @@ async def search_flights_from_text(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
-    ai_service = GeminiService()
+    ai_service = GeminiService(user_id=user.id)
     normalized_term = ai_service.normalize_query(term)
     normalization_applied = normalized_term != term.strip()
     resolved_call = None
@@ -756,6 +757,25 @@ async def search_flights_from_text(
         session.commit()
 
         return flights
+    except AIConsentRequired:
+        # GET remains usable by legacy clients, using its familiar recovery
+        # envelope. The modern POST adapter below emits a typed 403 instead.
+        # This isn't a failed provider lookup: do not retain a query sample.
+        return QuerySearchResponse(
+            recovery=SearchRecoveryRead(
+                reason="ai_consent_required", detected_query_type="unknown",
+                suggestions=[SearchSuggestionRead(
+                    label="Try a flight number or airport code",
+                    query="", kind="search_help",
+                )],
+            ),
+            diagnostics=SearchDiagnosticsRead(
+                failure_reason="ai_consent_required", provider_outcome="not_called",
+                normalization_applied=normalization_applied,
+            ),
+        )
+    except AIConsentUnavailable:
+        raise HTTPException(503, {"code": "ai_consent_unavailable"}) from None
     except HTTPException as exc:
         session.rollback()
         if exc.status_code == status.HTTP_404_NOT_FOUND:
@@ -829,7 +849,7 @@ async def search_flights_from_text_post(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
-    return await search_flights_from_text(
+    response = await search_flights_from_text(
         term=payload.term,
         language=payload.language,
         app_version=payload.app_version,
@@ -839,6 +859,11 @@ async def search_flights_from_text_post(
         session=session,
         user=user,
     )
+    if response.recovery and response.recovery.reason == "ai_consent_required":
+        raise HTTPException(403, {
+            "code": "ai_consent_required", "purpose": "search", "policy_version": POLICY_VERSION,
+        })
+    return response
 
 
 @router.post("/search/failures", response_model=dict)

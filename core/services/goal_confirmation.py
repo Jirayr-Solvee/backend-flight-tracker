@@ -38,6 +38,11 @@ def apply_goal_confirmation(*, session, data, user) -> dict:
     revision = data.confirmation_revision or 0
     confirmation_id = str(data.confirmation_id) if data.confirmation_id else None
     payload = data.model_dump(mode="json")
+    # Preserve pre-journey capture bytes and durable receipt hashes exactly.
+    # Adding an optional null field must not turn old lost-ACK retries into
+    # conflicts against already persisted confirmation identities.
+    if payload.get("journey") is None:
+        payload.pop("journey", None)
     payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     digest = (hashlib.sha256(payload_json.encode()).hexdigest() if revision else
               _legacy_hash(",".join(data.selected_goal_keys), data.selected_at_ms))

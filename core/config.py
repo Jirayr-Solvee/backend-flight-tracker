@@ -20,6 +20,12 @@ class Settings(BaseSettings):
 
     LAMBDA_FUNCTION_AUTH_TOKEN: str
 
+    # New protected SES prefix only. Empty bucket fails closed until the exact
+    # reviewed receipt-rule/bucket-policy deployment config is installed.
+    FORWARDED_EMAIL_BUCKET: str = ""
+    FORWARDED_EMAIL_KEY_PREFIX: str = "authenticated-v1/"
+    FORWARDED_EMAIL_RECIPIENT: str = "track@sofly.to"
+
     GEMINI_API_KEY: str
 
     API_URL: str
@@ -86,6 +92,20 @@ class Settings(BaseSettings):
     FLIGHT_DETAIL_PAYWALL_TREATMENT_PERCENT: int = 50
     FLIGHT_DETAIL_PAYWALL_CONFIG_VERSION: str = "1"
     FLIGHT_DETAIL_PAYWALL_CACHE_TTL_SECONDS: int = 60
+
+    # A new full-journey protocol, never an implicit extension of the old test.
+    # Deployment/configuration changes require separate launch authorization.
+    ACTIVATION_JOURNEY_PRODUCTION_ENROLLMENT_ENABLED: bool = False
+    ACTIVATION_JOURNEY_NONPRODUCTION_ENROLLMENT_ENABLED: bool = False
+    # Retained setting name: the share assigned to search_first_standard, not
+    # every variant that omits goals. The remaining share uses the explicit arm.
+    ACTIVATION_JOURNEY_SEARCH_FIRST_PERCENT: int = 50
+    ACTIVATION_JOURNEY_FLIGHT_DETAIL_VARIANT: Literal[
+        "goals_flight_detail", "search_first_flight_detail"
+    ] = "goals_flight_detail"
+    ACTIVATION_JOURNEY_CONFIG_VERSION: str = "draft_1"
+    ACTIVATION_JOURNEY_FORCE_STANDARD_PAYWALL: bool = False
+    ACTIVATION_JOURNEY_OPERATIONAL_CONFIG_VERSION: str = "draft_1"
 
 
 settings = Settings()  # type: ignore

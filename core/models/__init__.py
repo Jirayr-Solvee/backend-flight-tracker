@@ -3,6 +3,12 @@ import logging
 from sqlmodel import Session, SQLModel, create_engine
 
 from .activation_recovery import PurchaseActivationRecovery
+from .ai_consent import AIConsentReceipt, UserAIConsent, UserAIEmailIdentity, UserAIEmailReceipt
+from .activation_journey import (
+    ActivationJourneyIdentity, ActivationJourneyAssignment, ActivationJourneyEnrollment,
+    ActivationJourneyDiagnosticContext, ActivationJourneySelection,
+    ActivationJourneyAttribution, ActivationJourneyGoalSelection, ActivationJourneyGoalReceipt,
+)
 from .apple_ads import AppleAdsAttribution, AppleAdsSpendDaily, AppStoreRevenueEvent
 from .device import Device
 from .experiment import (

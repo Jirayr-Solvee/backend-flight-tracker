@@ -94,6 +94,7 @@ class CredentialLoggingTests(unittest.TestCase):
         with patch.object(users, "verify_apple_identity_token", new=AsyncMock(
             return_value={"sub": SUBJECT},
         )), patch.object(users, "create_jwt", return_value=SESSION_TOKEN), \
+                patch.object(users, "record_verified_apple_email_identity"), \
                 self.assertLogs(level="ERROR") as logs, self.assertRaises(HTTPException) as error:
             self.sign_in()
         self.assert_private_logs(logs)
@@ -112,7 +113,8 @@ class CredentialLoggingTests(unittest.TestCase):
         self.session.exec.return_value.first.return_value = None
         with patch.object(users, "verify_apple_identity_token", new=AsyncMock(
             return_value={"sub": SUBJECT},
-        )), patch.object(users, "create_jwt", return_value=SESSION_TOKEN):
+        )), patch.object(users, "create_jwt", return_value=SESSION_TOKEN), \
+                patch.object(users, "record_verified_apple_email_identity"):
             response = self.sign_in()
         self.assertEqual(response.jwt, SESSION_TOKEN)
         self.assertEqual(response.email, EMAIL)
@@ -126,11 +128,16 @@ class CredentialLoggingTests(unittest.TestCase):
         self.session.exec.return_value.first.return_value = existing
         with patch.object(users, "verify_apple_identity_token", new=AsyncMock(
             return_value={"sub": SUBJECT},
-        )), patch.object(users, "create_jwt", return_value=SESSION_TOKEN):
+        )), patch.object(users, "create_jwt", return_value=SESSION_TOKEN), \
+                patch.object(users, "record_verified_apple_email_identity") as proof:
             response = self.sign_in()
         self.assertEqual(response.user_id, "existing")
         self.assertEqual(response.jwt, SESSION_TOKEN)
-        self.session.commit.assert_not_called()
+        proof.assert_called_once()
+        self.assertEqual(proof.call_args.args[1], "existing")
+        self.assertEqual(existing.email, EMAIL)
+        self.assertEqual(existing.full_name, NAME)
+        self.session.commit.assert_called_once()
 
     def test_credential_model_repr_hides_fields_but_wire_json_is_unchanged(self):
         examples = [
