@@ -128,7 +128,10 @@ def extract_ses_receipt(event, config: EmailIngressConfig, *, function_arn: str,
         if mail.get("headersTruncated") is not False:
             raise EmailIngressRejected()
         action = receipt["action"]
-        if action != {"type": "Lambda", "functionArn": function_arn, "invocationType": "Event"}:
+        if action not in (
+            {"type": "Lambda", "functionArn": function_arn, "invocationType": "Event"},
+            {"type": "Lambda", "functionArn": function_arn, "invocationType": "RequestResponse"},
+        ):
             raise EmailIngressRejected()
         if mail.get("destination") != [config.recipient] or receipt.get("recipients") != [config.recipient]:
             raise EmailIngressRejected()

@@ -108,8 +108,9 @@ Enabling or re-enabling permission later never authorizes a queued older email.
 
 ## Trusted forwarded-email intake
 
-The Lambda accepts one direct SES receipt event, not an S3 notification or a
-MIME-supplied authentication result. It checks the configured function ARN,
+The Lambda accepts one direct SES receipt event with an exact `Event` or
+`RequestResponse` Lambda action, not an S3 notification or a MIME-supplied
+authentication result. It checks the configured function ARN,
 recipient, untruncated single sender header and SES authentication/scan verdicts.
 DMARC, spam and virus verdicts must be PASS; at least SPF or DKIM must be PASS.
 The authenticated single From mailbox must match SES common headers and the
@@ -162,6 +163,13 @@ and retention controls; this migration does not change or assert their policy.
 HTTP 202 and `lambda_email_intake_accepted` mean backend scheduling only. They do
 not prove consent, Gemini egress, a saved flight, APNs delivery or device display.
 Success logging is enabled on the Lambda module only, not on SDK/root loggers.
+Intentional terminal Lambda returns use SES `STOP_RULE_SET`, including permanent
+rejections; asynchronous invocations ignore return payloads. Synchronous work has
+a 20-second soft budget further limited by Lambda remaining time minus a two-second
+reserve. Chunk and stage checks cannot interrupt blocking I/O or guarantee a
+controlled disposition before the runtime/SES timeout. Operational exceptions
+remain bounded; they are not a documented SES retry or SMTP rejection request.
+See [synchronous intake rollout](ses-synchronous-intake.md) for deployment limits.
 
 Deterministic flight-number, airport, route, registration and preflight-recovery
 paths do not require Gemini consent. AI-required search with no permission:
@@ -204,6 +212,10 @@ Supply its existing credential securely via `LAMBDA_FUNCTION_AUTH_TOKEN`, plus
 `BACKEND_URL=https://api.sofly.to`, the three forwarded-email storage/recipient
 settings and `FORWARDED_EMAIL_LAMBDA_ARN`. Never write secrets into source or
 retained deployment payloads. Keep the old S3-only invocation path disabled.
+The two-mode handler can be installed before changing SES's action to
+`RequestResponse`. That separate mode switch and proposed 25-second Lambda
+runtime backstop require operator approval and exact configuration readback;
+local tests do not establish either has been deployed.
 
 Follow the repository's sequential fetcher/API readiness gates and authenticated
 functional checks. A safe consent smoke uses a disposable guest and synthetic

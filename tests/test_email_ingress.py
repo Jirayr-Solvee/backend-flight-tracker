@@ -118,7 +118,7 @@ class SESContractTests(unittest.TestCase):
             lambda x: x["ses"]["mail"].pop("headersTruncated"),
             lambda x: x["ses"]["mail"].update(destination=["wrong@example.invalid"]),
             lambda x: x["ses"]["receipt"].update(recipients=[RECIPIENT, "wrong@example.invalid"]),
-            lambda x: x["ses"]["receipt"]["action"].update(invocationType="RequestResponse"),
+            lambda x: x["ses"]["receipt"]["action"].update(invocationType="DryRun"),
             lambda x: x["ses"]["receipt"]["action"].update(functionArn=FUNCTION_ARN + "-other"),
             lambda x: x["ses"]["mail"].update(messageId="../wrong-key"),
         )
@@ -191,6 +191,21 @@ class SESContractTests(unittest.TestCase):
             contract.validate_notification(base, CONFIG, at_ms=current + contract.MAX_RECEIPT_AGE_MS)
 
 
+class SynchronousSESContractTests(SESContractTests):
+    """Run the full preexisting receipt-negative matrix in synchronous mode too."""
+
+    def extract(self, event, **kwargs):
+        candidate = copy.deepcopy(event)
+        try:
+            action = candidate["Records"][0]["ses"]["receipt"]["action"]
+            if isinstance(action, dict) and action.get("invocationType") == "Event":
+                action["invocationType"] = "RequestResponse"
+        except (KeyError, IndexError, TypeError):
+            # Preserve malformed inputs so the contract, not the test, rejects them.
+            pass
+        return super().extract(candidate, **kwargs)
+
+
 class LambdaTransportTests(unittest.TestCase):
     def invoke(self, event=None, data=None, opener=None, obj=None):
         data = raw_email() if data is None else data
@@ -206,7 +221,7 @@ class LambdaTransportTests(unittest.TestCase):
     def test_valid_ses_only_reads_configured_key_and_sends_bounded_bound_proof(self):
         event = ses_event()
         result = self.invoke(event=event)
-        self.assertEqual(result["statusCode"], 202)
+        self.assertEqual(result, {"disposition": "STOP_RULE_SET"})
         identifier = event["Records"][0]["ses"]["mail"]["messageId"]
         self.s3.get_object.assert_called_once_with(Bucket=BUCKET, Key=contract.DEFAULT_KEY_PREFIX + identifier)
         request = self.opener.open.call_args.args[0]
@@ -227,7 +242,7 @@ class LambdaTransportTests(unittest.TestCase):
         LAMBDA.logger.addHandler(handler)
         try:
             with patch.object(LAMBDA.logger, "propagate", False):
-                self.assertEqual(self.invoke()["statusCode"], 202)
+                self.assertEqual(self.invoke(), {"disposition": "STOP_RULE_SET"})
         finally:
             LAMBDA.logger.removeHandler(handler)
             handler.close()
@@ -237,7 +252,7 @@ class LambdaTransportTests(unittest.TestCase):
 
     def test_legacy_or_invalid_event_never_reads_storage_or_posts(self):
         event = {"Records": [{"s3": {"bucket": {"name": BUCKET}, "object": {"key": PRIVATE}}}]}
-        self.assertEqual(self.invoke(event=event)["statusCode"], 403)
+        self.assertEqual(self.invoke(event=event), {"disposition": "STOP_RULE_SET"})
         self.s3.get_object.assert_not_called()
         self.opener.open.assert_not_called()
 
@@ -249,7 +264,7 @@ class LambdaTransportTests(unittest.TestCase):
                    dict(s3_object(data), ETag="unbounded-etag"))
         for obj in objects:
             with self.subTest(metadata={k: v for k, v in obj.items() if k != "Body"}):
-                self.assertEqual(self.invoke(obj=obj)["statusCode"], 403)
+                self.assertEqual(self.invoke(obj=obj), {"disposition": "STOP_RULE_SET"})
                 self.opener.open.assert_not_called()
                 self.assertTrue(obj["Body"].closed)
 
@@ -270,15 +285,20 @@ class LambdaTransportTests(unittest.TestCase):
         opener = MagicMock()
         opener.open.side_effect = urllib.error.HTTPError("https://api.sofly.to/emails/", 403, SECRET, {}, io.BytesIO(PRIVATE.encode()))
         result = self.invoke(opener=opener)
-        self.assertEqual(result, {"statusCode": 403, "body": "email_intake_rejected"})
+        self.assertEqual(result, {"disposition": "STOP_RULE_SET"})
 
     def test_http_error_close_failure_cannot_escape_with_private_details(self):
         opener = MagicMock()
         error = urllib.error.HTTPError("https://api.sofly.to/emails/", 403, SECRET, {}, None)
+        original_close = error.close
         error.close = MagicMock(side_effect=RuntimeError(SECRET + PRIVATE))
         opener.open.side_effect = error
-        with self.assertRaisesRegex(RuntimeError, "^Email intake delivery failed$") as caught:
-            self.invoke(opener=opener)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "^Email intake delivery failed$") as caught:
+                self.invoke(opener=opener)
+        finally:
+            # The injected close failure must not leak the test's own fixture.
+            original_close()
         self.assertTrue(caught.exception.__suppress_context__)
 
     def test_redirect_handler_blocks_every_redirect_without_followup_request(self):
@@ -544,8 +564,10 @@ class EmailIngressTests(unittest.TestCase):
                     ),
                 }):
             event = ses_event()
-            self.assertEqual(LAMBDA.lambda_handler(event, SimpleNamespace(invoked_function_arn=FUNCTION_ARN))["statusCode"], 202)
-            self.assertEqual(LAMBDA.lambda_handler(event, SimpleNamespace(invoked_function_arn=FUNCTION_ARN))["statusCode"], 202)
+            self.assertEqual(LAMBDA.lambda_handler(event, SimpleNamespace(invoked_function_arn=FUNCTION_ARN)),
+                             {"disposition": "STOP_RULE_SET"})
+            self.assertEqual(LAMBDA.lambda_handler(event, SimpleNamespace(invoked_function_arn=FUNCTION_ARN)),
+                             {"disposition": "STOP_RULE_SET"})
         self.assertEqual(self.sdk.models.generate_content.call_count, 1)
         self.assertIn(PRIVATE, self.sdk.models.generate_content.call_args.kwargs["contents"])
         with Session(self.engine) as session:

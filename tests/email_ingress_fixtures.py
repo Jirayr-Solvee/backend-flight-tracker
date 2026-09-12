@@ -51,7 +51,8 @@ def s3_object(data: bytes, *, version_id=None) -> dict:
     return response
 
 
-def ses_event(*, sender=SENDER, received_at_ms=None, message_id=None, action_delay_ms=0) -> dict:
+def ses_event(*, sender=SENDER, received_at_ms=None, message_id=None, action_delay_ms=0,
+              invocation_type="Event") -> dict:
     received = now_ms() - 100 if received_at_ms is None else received_at_ms
     timestamp = lambda value: datetime.fromtimestamp(value / 1000, timezone.utc).isoformat(timespec="milliseconds")
     return {"Records": [{"eventSource": "aws:ses", "eventVersion": "1.0", "ses": {
@@ -66,6 +67,6 @@ def ses_event(*, sender=SENDER, received_at_ms=None, message_id=None, action_del
             "spamVerdict": {"status": "PASS"}, "virusVerdict": {"status": "PASS"},
             "spfVerdict": {"status": "PASS"}, "dkimVerdict": {"status": "PASS"},
             "dmarcVerdict": {"status": "PASS"},
-            "action": {"type": "Lambda", "functionArn": FUNCTION_ARN, "invocationType": "Event"},
+            "action": {"type": "Lambda", "functionArn": FUNCTION_ARN, "invocationType": invocation_type},
         },
     }}]}
