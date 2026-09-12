@@ -22,6 +22,12 @@ reserve. It checks before network stages and before/after 64 KiB body chunks,
 preserving the 20 MiB plus one-byte limit, exact declared length, closed stream,
 single SDK attempt and bounded socket timeouts. Event mode retains its prior
 transport behavior and does not require the context's remaining-time callback.
+The SDK can release its HTTP socket after the declared byte count is read.
+The reader therefore stops retuning that socket at the declared boundary, but
+still performs the bounded EOF/sentinel read and checks the work budget before
+and after it. Extra bytes, partial content and exact-length mismatches are not
+accepted. Setter failures before the boundary remain operational failures; no
+fallback or global SDK logger mutation is introduced.
 
 Exhaustion is an operational failure, never a permanent sender/receipt rejection.
 Synchronous socket timeouts are capped by the remaining budget, but one blocking

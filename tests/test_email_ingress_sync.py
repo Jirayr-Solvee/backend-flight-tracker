@@ -201,7 +201,7 @@ class SyncLambdaBudgetTests(unittest.TestCase):
             self.assertEqual(harness.invoke(), STOP)
             self.assertGreater(len(harness.body.read_sizes), 2)
             self.assertTrue(all(0 < amount <= CHUNK for amount in harness.body.read_sizes))
-            self.assertEqual(harness.body.socket_timeouts, [3] * len(harness.body.read_sizes))
+            self.assertEqual(harness.body.socket_timeouts, [3] * (len(harness.body.read_sizes) - 1))
             self.assertEqual(harness.body.close_calls, 1)
             self.assertTrue(harness.body.closed)
             config = harness.client.call_args.kwargs["config"]
@@ -262,7 +262,7 @@ class SyncLambdaBudgetTests(unittest.TestCase):
                 config = harness.client.call_args.kwargs["config"]
                 self.assertAlmostEqual(config.connect_timeout, expected, places=9)
                 self.assertAlmostEqual(config.read_timeout, expected, places=9)
-                self.assertEqual(len(harness.body.socket_timeouts), len(harness.body.read_sizes))
+                self.assertEqual(len(harness.body.socket_timeouts), len(harness.body.read_sizes) - 1)
                 for timeout in harness.body.socket_timeouts:
                     self.assertAlmostEqual(timeout, expected, places=9)
                 harness.opener.open.assert_called_once()
@@ -327,7 +327,7 @@ class SyncLambdaBudgetTests(unittest.TestCase):
         with Harness() as harness:
             harness.s3.get_object.side_effect = lambda **_: (setattr(harness, "runtime_ms", 3500) or harness.obj)
             self.assertEqual(harness.invoke(), STOP)
-            self.assertEqual(harness.body.socket_timeouts, [1.5] * len(harness.body.read_sizes))
+            self.assertEqual(harness.body.socket_timeouts, [1.5] * (len(harness.body.read_sizes) - 1))
             self.assertEqual(harness.opener.open.call_args.kwargs["timeout"], 1.5)
 
     def test_expiry_during_client_construction_prevents_get_and_post(self):
@@ -335,6 +335,39 @@ class SyncLambdaBudgetTests(unittest.TestCase):
             harness.client.side_effect = lambda *_, **__: (harness.clock.advance(20) or harness.s3)
             self.assert_operational_failure(harness)
             harness.s3.get_object.assert_not_called()
+            harness.opener.open.assert_not_called()
+
+    def test_eof_read_still_detects_extra_bytes_without_retuning_released_socket(self):
+        for extra in (b"", b"x"):
+            with self.subTest(extra_bytes=len(extra)), Harness() as harness:
+                chunks = [harness.data, extra]
+                if extra:
+                    chunks.append(b"")
+                harness.body.read = MagicMock(side_effect=chunks)
+                self.assertEqual(harness.invoke(), STOP)
+                self.assertEqual(harness.body.socket_timeouts, [3])
+                self.assertEqual(harness.body.read.call_count, len(chunks))
+                self.assertTrue(harness.body.closed)
+                if extra:
+                    harness.opener.open.assert_not_called()
+                    self.assertNotIn("lambda_email_intake_accepted", harness.log.getvalue())
+                else:
+                    harness.opener.open.assert_called_once()
+                    self.assertEqual(harness.log.getvalue(), "lambda_email_intake_accepted\n")
+
+    def test_eof_read_keeps_post_read_budget_check_after_socket_release(self):
+        with Harness() as harness:
+            reads = 0
+            def on_read(*_):
+                nonlocal reads
+                reads += 1
+                if reads == 2:
+                    harness.clock.advance(20)
+            harness.body.on_read = on_read
+            self.assert_operational_failure(harness)
+            self.assertEqual(reads, 2)
+            self.assertEqual(harness.body.socket_timeouts, [3])
+            self.assertTrue(harness.body.closed)
             harness.opener.open.assert_not_called()
 
     def test_expiry_during_get_closes_body_without_reading_or_posting(self):

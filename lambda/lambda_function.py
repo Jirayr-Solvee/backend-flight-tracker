@@ -57,7 +57,9 @@ def read_email_bytes(stream, size, budget):
         while total < MAX_EMAIL_BYTES + 1:
             budget.remaining()
             set_timeout = getattr(stream, "set_socket_timeout", None)
-            if callable(set_timeout):
+            # The SDK may release the socket after the declared bytes arrive.
+            # Keep the EOF/sentinel read, but do not retune that closed socket.
+            if total < size and callable(set_timeout):
                 set_timeout(budget.timeout(3))
             requested = min(64 * 1024, MAX_EMAIL_BYTES + 1 - total)
             budget.remaining()
