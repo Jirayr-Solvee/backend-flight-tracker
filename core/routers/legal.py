@@ -39,7 +39,7 @@ PRIVACY_POLICY_HTML = """<!doctype html>
 <body>
   <main>
     <h1>Sofly Privacy Policy</h1>
-    <p>Effective date: September 12, 2026</p>
+    <p>Effective date: September 28, 2026</p>
 
     <p>
       Sofly: Track Flight Status helps people search, save, and track flight
@@ -120,6 +120,32 @@ PRIVACY_POLICY_HTML = """<!doctype html>
       excluded from reports and removed by an independent cleanup process.
       This limit applies to failed-search diagnostic samples, not to saved
       flights, account records, purchases or forwarded booking emails.
+    </p>
+
+    <h2>Notification-open analytics</h2>
+    <p>
+      When you open Sofly by tapping one of its notifications, we record the
+      notification's title, subtitle and message, notification and flight
+      identifiers, delivery and opening timing, and associated account,
+      installation, app-version and diagnostic identifiers. We use this to
+      understand which alerts are useful and investigate notification navigation.
+      This does not give Sofly access to notifications from other apps.
+    </p>
+    <p>
+      Notification text is sent to our backend, not to AppsFlyer. Detected email
+      addresses, phone numbers and web URLs are redacted before the text is
+      encrypted for storage. Redaction does not make the record anonymous;
+      it can remain linked to your account and flights. Access to notification
+      text is restricted to our authenticated diagnostic reports. Notification
+      interaction events without this text may also be sent to our analytics
+      provider under the analytics practices described above.
+    </p>
+    <p>
+      Notification-open reports cover the most recent 90 days. Backend
+      diagnostic records older than 90 days after receipt are removed during
+      diagnostics collection. Undelivered diagnostics may remain temporarily
+      in device-protected app storage for retry, for no more than seven days.
+      Account deletion also removes associated notification-open diagnostics.
     </p>
 
     <h2>How we use information</h2>

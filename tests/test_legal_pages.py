@@ -20,7 +20,7 @@ class LegalPageTests(unittest.TestCase):
 
     def test_sofly_privacy_discloses_retained_sign_in_details(self):
         text = " ".join(PRIVACY_POLICY_HTML.split())
-        self.assertIn("Effective date: September 12, 2026", text)
+        self.assertIn("Effective date: September 28, 2026", text)
         self.assertIn("Apple sign-in identifier", text)
         self.assertIn("name and email address provided during sign-in", text)
         self.assertIn("associate these details with your Sofly account", text)
@@ -64,6 +64,17 @@ class LegalPageTests(unittest.TestCase):
         self.assertIn("a retry does not restart this period", text)
         self.assertIn("Expired samples are excluded from reports", text)
         self.assertIn("independent cleanup process", text)
+
+    def test_notification_copy_retention_and_provider_boundary(self):
+        text = " ".join(PRIVACY_POLICY_HTML.split())
+        self.assertIn("Notification-open analytics", text)
+        self.assertIn("title, subtitle and message", text)
+        self.assertIn("not to AppsFlyer", text)
+        self.assertIn("encrypted for storage", text)
+        self.assertIn("older than 90 days after receipt", text)
+        self.assertIn("removed during diagnostics collection", text)
+        self.assertIn("no more than seven days", text)
+        self.assertIn("Account deletion also removes", text)
 
     def test_sofly_privacy_preserves_attribution_disclosure(self):
         text = " ".join(PRIVACY_POLICY_HTML.split())
