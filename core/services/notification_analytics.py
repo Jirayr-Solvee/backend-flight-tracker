@@ -25,3 +25,17 @@ def open_copy(ciphertext):
         return json.loads(_cipher().decrypt(ciphertext.encode()))
     except (InvalidToken, ValueError, TypeError, AttributeError):
         return None
+
+def remove_notification_diagnostics(session, user_id):
+    """Part of the caller's account-deletion transaction; never commit here."""
+    from sqlalchemy import delete
+    from sqlmodel import select
+    from ..models.experiment import ExperimentDiagnosticEvent
+    from ..models.activation_journey import ActivationJourneyDiagnosticContext
+    ids = select(ExperimentDiagnosticEvent.id).where(
+        ExperimentDiagnosticEvent.user_id == user_id,
+        ExperimentDiagnosticEvent.event_name == 'push_opened')
+    session.exec(delete(ActivationJourneyDiagnosticContext).where(ActivationJourneyDiagnosticContext.id.in_(ids)))
+    session.exec(delete(ExperimentDiagnosticEvent).where(
+        ExperimentDiagnosticEvent.user_id == user_id,
+        ExperimentDiagnosticEvent.event_name == 'push_opened'))

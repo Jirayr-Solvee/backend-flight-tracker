@@ -501,6 +501,8 @@ def delete_user(
     session: Session = Depends(get_session), user: User = Depends(get_current_user)
 ):
     try:
+        from ..services.notification_analytics import remove_notification_diagnostics
+        remove_notification_diagnostics(session, user.id)
         device_ids = [device.id for device in user.devices]
         if device_ids:
             live_activities = session.exec(

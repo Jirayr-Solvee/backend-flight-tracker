@@ -75,3 +75,18 @@ class NotificationAnalyticsTests(UniversalAnalyticsContractTests):
             response=client.get('/notifications/engagement/report?analytics_environment=testflight',headers={'Authorization':'Bearer '+settings.LAMBDA_FUNCTION_AUTH_TOKEN})
             self.assertEqual(response.status_code,200)
             self.assertEqual(response.json()['opens'],1)
+
+    def test_account_deletion_cleanup_is_scoped_and_transactional(self):
+        from core.services.notification_analytics import remove_notification_diagnostics
+        notification=self.notification(); self.send(notification)
+        other=self.event('app_launched',uuid4()); self.send(other)
+        remove_notification_diagnostics(self.session,self.user.id)
+        self.session.rollback()
+        self.assertIsNotNone(self.session.get(ExperimentDiagnosticEvent,str(notification.event_id)))
+        remove_notification_diagnostics(self.session,self.user.id)
+        self.session.commit()
+        self.assertIsNone(self.session.get(ExperimentDiagnosticEvent,str(notification.event_id)))
+        self.assertIsNotNone(self.session.get(ExperimentDiagnosticEvent,str(other.event_id)))
+        from pathlib import Path
+        source=(Path(__file__).resolve().parents[1]/'core/routers/users.py').read_text()
+        self.assertIn('remove_notification_diagnostics(session, user.id)',source)
