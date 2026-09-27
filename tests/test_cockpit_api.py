@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 _import_scratch = tempfile.TemporaryDirectory(prefix='sofly-cockpit-api-')
 _previous_cwd = os.getcwd()
@@ -59,5 +60,27 @@ class CockpitAPITests(unittest.TestCase):
         response=self.client.get('/cockpit/stories')
         self.assertEqual(response.status_code,503)
         self.assertNotIn(self.path,response.text)
+
+    def test_flight_scope_requires_ownership_and_handles_missing_assignment(self):
+        self.assertIn(self.client.get('/cockpit/flights/1/stories').status_code,(401,403))
+        self.app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id='owner')
+        with patch('core.routers.cockpit.load_targets',return_value=(False,[])) as lookup:
+            self.assertEqual(self.client.get('/cockpit/flights/1/stories').status_code,404)
+            self.assertEqual(lookup.call_args.kwargs,{'user_id':'owner','flight_id':1})
+        with patch('core.routers.cockpit.load_targets',return_value=(True,[])):
+            response=self.client.get('/cockpit/flights/1/stories')
+            self.assertEqual(response.status_code,200)
+            self.assertEqual(response.json()['coverage'],'awaiting_aircraft_or_schedule')
+
+    def test_flight_scope_passed_to_reader_and_storage_errors_fail_closed(self):
+        self.app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id='owner')
+        with patch('core.routers.cockpit.load_targets',return_value=(True,[{'id':1}])):
+            with patch('core.routers.cockpit.read_stories',return_value={'stories':[]}) as reader:
+                self.assertEqual(self.client.get('/cockpit/flights/1/stories').status_code,200)
+                self.assertEqual(reader.call_args.kwargs,{'flight':{'id':1}})
+        with patch('core.routers.cockpit.load_targets',side_effect=OSError('private path')):
+            response=self.client.get('/cockpit/flights/1/stories')
+            self.assertEqual(response.status_code,503)
+            self.assertNotIn('private path',response.text)
 
 if __name__ == '__main__': unittest.main()

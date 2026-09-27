@@ -53,6 +53,33 @@ Heuristics and AI gates do not establish perfect privacy or factual accuracy;
 review remains needed before enabling automatic pushes. No manual review UI
 is included in this deployment.
 
+## Tracked-flight coverage
+
+The same ten-minute worker reads saved `userflightlink` flights from the existing
+database in read-only mode. Multiple users share one target per aircraft. Targets
+start one hour before the best known departure and remain eligible until two
+hours after the arrival window (which includes 30 minutes after arrival).
+Missing/invalid aircraft or UTC schedules are skipped, never invented.
+
+Up to eight additional provider calls per run share all existing minute/hour/day
+limits. Least recently attempted aircraft rotate first; high volume may defer
+some targets beyond ten minutes. Use existing Mode-S identity when available,
+otherwise resolve the exact registration once to an Airframes airframe ID.
+Pagination is persistent. Fetching uses provider creation times; attribution uses
+transmission time, exact normalized registration and matching flight number
+(including airline IATA/ICAO aliases and zero padding). Missing or conflicting
+flight numbers are omitted rather than assumed to belong to this leg.
+
+Matching pending messages receive AI priority before global stories, inside the
+same four-per-window and $180 reservation ceiling. Routine telemetry and sensitive
+messages remain excluded. This is useful decoded coverage, not all transmissions.
+
+`GET /cockpit/flights/{flight_id}/stories` requires the authenticated user's saved
+flight link (404 for missing/unowned), derives current aircraft and schedule from
+the backend, and filters before limiting to 50 stories. Missing assignment/schedule
+returns explicit `awaiting_aircraft_or_schedule`. Historical same-aircraft stories
+from other legs cannot appear just because the registration matches.
+
 ## State and credentials
 
 - Root-only `/etc/sofly/cockpit.env`: Airframes and existing Gemini keys.

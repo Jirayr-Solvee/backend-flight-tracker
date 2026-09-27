@@ -7,6 +7,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from .cockpit_stories import open_store, parse_time, utc_string
+from .cockpit_tracking import matches, tail
 
 TERMS = ('DEVIATING', 'DIVERTING', 'HOLDING', 'RETURNING', 'TURBULENCE',
          'BIRTHDAY', 'RETIREMENT', 'CONGRATULATIONS', 'THANK YOU', 'CHRISTMAS',
@@ -99,19 +100,89 @@ SCHEMA = {'type':'OBJECT','properties':{
     'required':['publish','needs_review','category','title','summary','excerpt','interest']}
 
 
-def pending_messages(db):
+def pending_messages(db, targets=()):
     """Round-robin themes so frequent operational reports cannot crowd out stories."""
     groups=[[] for _ in range(6)]
+    tracked=[]
     patterns=[r'BIRTHDAY|RETIREMENT|CONGRATULATIONS|THANK YOU|CHRISTMAS',
               r'LIVE ANIMAL|SPECIAL HANDLING|TEMPERATURE SENSITIVE',
               r'DEVIATING|TURBULENCE',r'DIVERTING|RETURNING',r'SMELL|OVEN|IFE PANEL|CATERING|COFFEE']
     for key,payload in db.execute("SELECT id,payload FROM cockpit_queue WHERE status='pending' ORDER BY received DESC"):
-        text=json.loads(payload)['text'].upper()
+        message=json.loads(payload)
+        if any(matches(message, flight) for flight in targets):
+            if len(tracked)<MAX_AI_PER_RUN:tracked.append((key,payload))
+            continue
+        text=message['text'].upper()
         group=next((i for i,pattern in enumerate(patterns) if re.search(pattern,text)),5)
         if len(groups[group])<MAX_AI_PER_RUN:groups[group].append((key,payload))
     offset=datetime.now(timezone.utc).minute//10
     groups=groups[offset:]+groups[:offset]
-    return [group[i] for i in range(MAX_AI_PER_RUN) for group in groups if len(group)>i][:MAX_AI_PER_RUN]
+    return (tracked+[group[i] for i in range(MAX_AI_PER_RUN) for group in groups if len(group)>i])[:MAX_AI_PER_RUN]
+
+
+async def ingest_tracked(db, targets, air_key, client, metrics, started, now):
+    """At most eight extra calls/run, shared by registration, least recently polled first."""
+    grouped={}
+    for flight in targets:grouped.setdefault(tail(flight['registration']), []).append(flight)
+    def last_poll(reg):
+        row=db.execute('SELECT value FROM cockpit_metadata WHERE key=?',('tracked-attempt:'+reg,)).fetchone()
+        return row[0] if row else ''
+    calls=0
+    for reg in sorted(grouped, key=last_poll):
+        if calls>=8 or time.monotonic()-started>100:break
+        flights=grouped[reg]
+        # Missing provider mappings must not monopolize every later run.
+        with db:db.execute('INSERT OR REPLACE INTO cockpit_metadata VALUES (?,?)',('tracked-attempt:'+reg,utc_string(now)))
+        icao=next((f['icao'] for f in flights if isinstance(f['icao'],str) and re.fullmatch('[A-Fa-f0-9]{6}',f['icao'])),None)
+        params={}
+        if icao:params['icao']=icao
+        else:
+            cached=db.execute('SELECT value FROM cockpit_metadata WHERE key=?',('airframe:'+reg,)).fetchone()
+            if cached:params['airframe_ids']=cached[0]
+            else:
+                if not api_allowance(db,datetime.now(timezone.utc)):break
+                calls+=1;metrics['provider_requests']+=1
+                response=await client.get('https://api.airframes.io/v1/airframes/tail/'+flights[0]['registration'],headers={'Authorization':'Bearer '+air_key})
+                if response.status_code==429:raise ValueError('provider_rate_limit')
+                if response.status_code==404:continue
+                response.raise_for_status();airframe=response.json()
+                if not isinstance(airframe,dict) or type(airframe.get('id')) is not int or tail(airframe.get('tail'))!=reg:
+                    continue
+                params['airframe_ids']=str(airframe['id'])
+                with db:db.execute('INSERT OR REPLACE INTO cockpit_metadata VALUES (?,?)',('airframe:'+reg,params['airframe_ids']))
+                await asyncio.sleep(.65)
+        key='tracked:'+reg
+        cursor=db.execute('SELECT since,until_time,before_id FROM cockpit_cursor WHERE term=?',(key,)).fetchone()
+        since,until,before=cursor or (utc_string(now-timedelta(hours=24)),None,None)
+        until=until or utc_string(now)
+        for _ in range(2):
+            if calls>=8 or time.monotonic()-started>100:break
+            if not api_allowance(db,datetime.now(timezone.utc)):break
+            query=dict(params,since=since,until=until,limit=100)
+            if before:query['before_id']=before
+            calls+=1;metrics['provider_requests']+=1
+            response=await client.get('https://api.airframes.io/v1/messages',params=query,headers={'Authorization':'Bearer '+air_key})
+            if response.status_code==429:raise ValueError('provider_rate_limit')
+            response.raise_for_status();rows=response.json()
+            if not isinstance(rows,list) or len(rows)>100:raise ValueError('provider_schema')
+            ids=[]
+            with db:
+                for row in rows:
+                    if not isinstance(row,dict) or type(row.get('id')) is not int:raise ValueError('provider_schema')
+                    created=parse_time(row.get('createdAt'))
+                    if not created or not parse_time(since)<=created<=parse_time(until):raise ValueError('provider_window')
+                    if before and row['id']>=before:raise ValueError('provider_cursor')
+                    ids.append(row['id'])
+                    candidate=dict(receivedAt=row.get('timestamp'),registration=row.get('tail'),flight=row.get('flightNumber'))
+                    if any(matches(candidate,f) for f in flights):queue_message(db,row,now)
+                if len(rows)==100:before=min(ids)
+                else:since=utc_string(parse_time(until)-timedelta(minutes=2));until=None;before=None
+                db.execute('INSERT OR REPLACE INTO cockpit_cursor VALUES (?,?,?,?)',(key,since,until,before))
+                db.execute('INSERT OR REPLACE INTO cockpit_metadata VALUES (?,?)',(key,utc_string(now)))
+            await asyncio.sleep(.65)
+            if until is None:break
+    metrics['tracked_aircraft']=len(grouped)
+    metrics['tracked_requests']=calls
 
 
 def validate_story(message,item):
@@ -126,7 +197,7 @@ def validate_story(message,item):
                 interestScore=item['interest'],notificationEligible=False)
 
 
-async def run(path,air_key,gem_key,client):
+async def run(path,air_key,gem_key,client,targets=()):
     db=init_store(path)
     metrics=dict(provider_requests=0,ai_requests=0,published=0,held=0,errors=0)
     started=time.monotonic();now=datetime.now(timezone.utc)
@@ -136,6 +207,7 @@ async def run(path,air_key,gem_key,client):
         db.execute('DELETE FROM cockpit_stories WHERE received < ?',(cutoff,))
         db.execute("DELETE FROM cockpit_budget WHERE bucket LIKE 'api-minute:%' AND bucket < ?",('api-minute:'+utc_string(now-timedelta(days=2))[:16],))
     try:
+        await ingest_tracked(db,targets,air_key,client,metrics,started,now)
         for term in TERMS:
             if time.monotonic()-started>180:
                 metrics['errors']+=1;break
@@ -170,7 +242,7 @@ async def run(path,air_key,gem_key,client):
         # Provider freshness is separate from AI outcomes/budget exhaustion.
         if metrics['errors']==0:
             with db:db.execute("INSERT OR REPLACE INTO cockpit_metadata VALUES ('updated_at',?)",(utc_string(datetime.now(timezone.utc)),))
-        pending=pending_messages(db)
+        pending=pending_messages(db,targets)
         for key,payload in pending:
             if time.monotonic()-started>330:break
             message=json.loads(payload)

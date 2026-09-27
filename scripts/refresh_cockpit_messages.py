@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import httpx
 from core.services.cockpit_ingestion import run
+from core.services.cockpit_tracking import load_targets
 
 
 async def refresh():
@@ -21,7 +22,8 @@ async def refresh():
         try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError: return
         async with httpx.AsyncClient(timeout=15,follow_redirects=False) as client:
-            metrics=await run(path,air,gem,client)
+            targets=load_targets(os.environ.get('SOFLY_FLIGHT_DB','database.db'))
+            metrics=await run(path,air,gem,client,targets=targets)
             print(json.dumps(metrics))
             if metrics['errors']: raise SystemExit(1)
 

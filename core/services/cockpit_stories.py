@@ -121,7 +121,7 @@ def save_messages(path, messages, now=None):
         connection.close()
 
 
-def read_stories(path, registration=None, now=None):
+def read_stories(path, registration=None, now=None, flight=None):
     now = now or datetime.now(timezone.utc)
     if not Path(path).is_file():
         return None
@@ -133,10 +133,22 @@ def read_stories(path, registration=None, now=None):
             return None
         query = "SELECT payload FROM cockpit_stories WHERE received >= ? AND received <= ?"
         params = [utc_string(now - RETENTION), utc_string(now + timedelta(minutes=1))]
-        if registration:
+        if flight:
+            query += " AND received >= ? AND received <= ? AND REPLACE(registration, '-', '') = ?"
+            from .cockpit_tracking import tail
+            params.extend([utc_string(flight['start']),utc_string(flight['end']),tail(flight['registration'])])
+        elif registration:
             query += " AND registration = ?"
             params.append(registration.upper())
-        rows = connection.execute(query + " ORDER BY received DESC LIMIT 50", params).fetchall()
-        return {"stories": [json.loads(row[0]) for row in rows], "updatedAt": utc_string(updated)}
+        rows = connection.execute(query + " ORDER BY received DESC" + ("" if flight else " LIMIT 50"), params)
+        stories=[]
+        for row in rows:
+            story=json.loads(row[0])
+            if flight:
+                from .cockpit_tracking import matches
+                if not matches(story,flight):continue
+            stories.append(story)
+            if len(stories)>=50:break
+        return {"stories": stories, "updatedAt": utc_string(updated)}
     finally:
         connection.close()
