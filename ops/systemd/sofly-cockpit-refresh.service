@@ -1,0 +1,27 @@
+[Unit]
+Description=Refresh Sofly curated aircraft messages
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/backend-flight-tracker
+# Root-owned 0600 file, installed separately. Never commit provider credentials.
+EnvironmentFile=/etc/sofly/cockpit.env
+Environment=SOFLY_COCKPIT_DB=/var/lib/sofly-cockpit/stories.sqlite
+Environment=PYTHONDONTWRITEBYTECODE=1
+StateDirectory=sofly-cockpit
+StateDirectoryMode=0750
+UMask=0027
+ExecStart=/home/ubuntu/backend-flight-tracker/venv/bin/python3 scripts/refresh_cockpit_messages.py
+TimeoutStartSec=420
+MemoryMax=256M
+CPUQuota=25%
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/sofly-cockpit

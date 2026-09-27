@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Sofly aircraft messages every ten minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/10:00
+Persistent=true
+AccuracySec=1s
+Unit=sofly-cockpit-refresh.service
+
+[Install]
+WantedBy=timers.target

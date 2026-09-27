@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from .routers import activation_journey, experiment_diagnostics
+from .routers import activation_journey, experiment_diagnostics, cockpit
 
 # from . import lifespan
 from .routers import (ai_consent, apple_ads, flags, flights, incoming_email, legal,
@@ -21,3 +21,5 @@ app.include_router(apple_ads.router, prefix="/apple-ads", tags=["Apple Ads"])
 app.include_router(
     subscriptions.router, prefix="/subscriptions", tags=["apple subscriptions"]
 )
+
+app.include_router(cockpit.router, prefix="/cockpit", tags=["Aircraft messages"])
