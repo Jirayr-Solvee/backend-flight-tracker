@@ -20,6 +20,7 @@ from .subscriptions import ExperimentContext
 from ..activation_journey_contract import ActivationJourneyContext
 from ..models.activation_journey import ActivationJourneyDiagnosticContext
 from ..services.activation_journey import record_journey_diagnostic, validate_journey, reserve_legacy_installation
+from ..services.notification_analytics import seal_copy, open_copy
 
 router = APIRouter()
 Token = Annotated[str, Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_.:-]+$")]
@@ -94,6 +95,9 @@ class DiagnosticProperties(BaseModel):
     event_schema_version: Annotated[int, Field(ge=1, le=1000)] | None = None
     attempt_count: Annotated[int, Field(ge=0, le=1000)] | None = None
     notification_type: Token | None = None
+    notification_id: Token | None = None
+    notification_copy_id: FlightIdentity | None = None
+    notification_open_delay: Literal["under_1m", "1m_to_1h", "1h_to_1d", "over_1d"] | None = None
     status: Token | None = None
     activity_kind: Token | None = None
     search_journey_id: Annotated[UUID, Field(strict=False)] | None = None
@@ -159,6 +163,13 @@ class DiagnosticProperties(BaseModel):
     new_flight_id: Annotated[int, Field(ge=1, le=9_223_372_036_854_775_807)] | None = None
 
 
+class NotificationContent(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    title: str = Field(max_length=512)
+    subtitle: str = Field(default="", max_length=512)
+    body: str = Field(max_length=4096)
+
+
 class DiagnosticEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
     event_id: UUID
@@ -174,9 +185,16 @@ class DiagnosticEvent(BaseModel):
     experiment: ExperimentContext | None = None
     journey: ActivationJourneyContext | None = None
     properties: DiagnosticProperties = Field(default_factory=DiagnosticProperties)
+    notification_content: NotificationContent | None = None
 
     @model_validator(mode="after")
     def validate_context(self):
+        if self.notification_content is not None and (
+            self.event_name != "push_opened" or (self.properties.event_schema_version or 0) < 24
+            or not self.properties.notification_id or not self.properties.notification_copy_id
+            or self.properties.source not in ("remote", "local") or self.properties.action != "default_tap"
+        ):
+            raise ValueError("Notification copy requires a schema-24 notification tap")
         if self.build_configuration == "debug" and self.analytics_environment != "development":
             raise ValueError("Debug diagnostics must use development environment")
         if self.experiment and (
@@ -280,6 +298,10 @@ class DiagnosticBatch(BaseModel):
 
 def _row(event: DiagnosticEvent, user: User) -> ExperimentDiagnosticEvent:
     properties = event.properties.model_dump(mode="json", exclude_none=True)
+    if event.notification_content is not None:
+        encrypted, digest = seal_copy(event.notification_content.model_dump())
+        properties["_notification_copy_ciphertext"] = encrypted
+        properties["_notification_copy_digest"] = digest
     if event.journey:
         properties["_activation_journey"] = event.journey.model_dump(mode="json")
     return ExperimentDiagnosticEvent(
@@ -295,6 +317,15 @@ def _row(event: DiagnosticEvent, user: User) -> ExperimentDiagnosticEvent:
         measurement_revision=event.experiment.measurement_revision if event.experiment else None,
         properties_json=json.dumps(properties, sort_keys=True, separators=(",", ":")),
     )
+
+
+def _facts(row):
+    facts = row.model_dump(exclude={"received_at_ms", "properties_json"})
+    properties = json.loads(row.properties_json)
+    # Random encryption nonces must not make an identical stable-ID retry conflict.
+    properties.pop("_notification_copy_ciphertext", None)
+    facts["properties"] = properties
+    return facts
 
 
 @router.post("/experiments/events")
@@ -316,8 +347,7 @@ def record_diagnostic_events(
         row = _row(event, user)
         existing = incoming.get(row.id) or session.get(ExperimentDiagnosticEvent, row.id)
         if existing:
-            facts = lambda value: value.model_dump(exclude={"received_at_ms"})
-            if facts(existing) != facts(row):
+            if _facts(existing) != _facts(row):
                 raise HTTPException(status_code=409, detail="Event ID already has different facts")
             duplicates += 1
             continue
@@ -372,7 +402,7 @@ def record_diagnostic_events(
         # by the database's partial unique index even under concurrent requests.
         for row in incoming.values():
             existing = session.get(ExperimentDiagnosticEvent, row.id)
-            if not existing or existing.model_dump(exclude={"received_at_ms"}) != row.model_dump(exclude={"received_at_ms"}):
+            if not existing or _facts(existing) != _facts(row):
                 raise HTTPException(status_code=409, detail="Concurrent diagnostic facts conflict")
         return {"detail": "success", "accepted": 0, "duplicates": len(data.events)}
     except Exception:
@@ -412,6 +442,8 @@ def get_diagnostic_report(
     events = []
     for row in rows:
         properties = json.loads(row.properties_json)
+        notification_copy = open_copy(properties.pop("_notification_copy_ciphertext", None))
+        properties.pop("_notification_copy_digest", None)
         journey_context = properties.pop("_activation_journey", None)
         properties_by_id[row.id] = properties
         if row.checkout_attempt_id:
@@ -433,6 +465,7 @@ def get_diagnostic_report(
         events.append({
             **row.model_dump(exclude={"properties_json", "user_id"}),
             "properties": properties,
+            **({"notification_content": notification_copy} if notification_copy is not None else {}),
             **({"journey": journey_context} if journey_context else {}),
             "server_verified_transaction": owned_transaction,
             "server_transaction_product_id": transaction.product_id if owned_transaction else None,
@@ -500,3 +533,46 @@ def get_diagnostic_report(
         } for key, group in presentations.items()],
         "events": events,
     }
+
+
+@router.get("/notifications/engagement/report", dependencies=[Depends(check_lambda_auth_token)])
+def get_notification_engagement_report(
+    analytics_environment: Literal["production", "development", "testflight"] = "production",
+    since_ms: int | None = None,
+    until_ms: int | None = None,
+    limit: int = Query(default=2000, ge=1, le=10000),
+    session: Session = Depends(get_session),
+):
+    now = current_time_ms()
+    statement = select(ExperimentDiagnosticEvent).where(
+        ExperimentDiagnosticEvent.event_name == "push_opened",
+        ExperimentDiagnosticEvent.analytics_environment == analytics_environment,
+        ExperimentDiagnosticEvent.occurred_at_ms >= max(since_ms or 0, now - 90 * 86_400_000),
+        ExperimentDiagnosticEvent.occurred_at_ms < (until_ms if until_ms is not None else now + 1),
+    )
+    rows = session.exec(statement.order_by(ExperimentDiagnosticEvent.occurred_at_ms.desc(),
+                                         ExperimentDiagnosticEvent.id).limit(limit + 1)).all()
+    truncated = len(rows) > limit
+    groups = {}
+    for row in rows[:limit]:
+        p = json.loads(row.properties_json)
+        key = (p.get("notification_copy_id"), p.get("_notification_copy_digest"),
+               p.get("notification_type", "unknown"), p.get("app_language", "unknown"), p.get("source", "unknown"))
+        if key not in groups:
+            groups[key] = {"notification_copy_id": key[0], "notification_type": key[2], "language": key[3],
+                "source": key[4], "content": open_copy(p.get("_notification_copy_ciphertext")),
+                "opens": 0, "installations": set(), "notifications": set(), "open_delay_buckets": Counter()}
+        group = groups[key]
+        group["opens"] += 1
+        group["installations"].add(row.installation_id)
+        if p.get("notification_id"): group["notifications"].add(p["notification_id"])
+        group["open_delay_buckets"][p.get("notification_open_delay", "unknown")] += 1
+    result = []
+    for group in groups.values():
+        group["unique_installations"] = len(group.pop("installations"))
+        group["distinct_notifications_opened"] = len(group.pop("notifications"))
+        result.append(group)
+    return {"analytics_environment": analytics_environment, "opens": min(len(rows), limit),
+            "truncated": truncated, "groups": sorted(result, key=lambda g: -g["opens"]),
+            "open_rate": None,
+            "proof_scope": "Observed client notification taps only, not delivery or impressions. No sent/delivered denominator; an open rate cannot be inferred. Historical generic opens have unknown copy. Counts are limited to the returned window; check truncated before comparisons."}
