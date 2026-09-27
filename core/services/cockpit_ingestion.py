@@ -122,7 +122,8 @@ def validate_story(message,item):
     if item['excerpt'] not in message['text']:return None
     return dict(id=message['id'],title=item['title'],summary=item['summary'],category=item['category'],
                 flight=message['flight'],registration=message['registration'],receivedAt=message['receivedAt'],
-                transmission=item['excerpt'],latitude=None,longitude=None)
+                transmission=item['excerpt'],latitude=None,longitude=None,
+                interestScore=item['interest'],notificationEligible=False)
 
 
 async def run(path,air_key,gem_key,client):
