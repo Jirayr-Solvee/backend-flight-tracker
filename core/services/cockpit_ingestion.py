@@ -56,8 +56,10 @@ def api_allowance(db, now):
 
 def ai_allowance(db, now):
     days = calendar.monthrange(now.year,now.month)[1]
+    window=now.replace(minute=now.minute//10*10,second=0,microsecond=0)
     return reserve(db, [(now.strftime('ai-month:%Y-%m'),RESERVE_USD,MONTHLY_USD),
-                        (now.strftime('ai-day:%Y-%m-%d'),RESERVE_USD,MONTHLY_USD/days)])
+                        (now.strftime('ai-day:%Y-%m-%d'),RESERVE_USD,MONTHLY_USD/days),
+                        (window.strftime('ai-window:%Y-%m-%dT%H:%M'),RESERVE_USD,.04)])
 
 
 def queue_message(db,row,now):
@@ -107,6 +109,8 @@ def pending_messages(db):
         text=json.loads(payload)['text'].upper()
         group=next((i for i,pattern in enumerate(patterns) if re.search(pattern,text)),5)
         if len(groups[group])<MAX_AI_PER_RUN:groups[group].append((key,payload))
+    offset=datetime.now(timezone.utc).minute//10
+    groups=groups[offset:]+groups[:offset]
     return [group[i] for i in range(MAX_AI_PER_RUN) for group in groups if len(group)>i][:MAX_AI_PER_RUN]
 
 

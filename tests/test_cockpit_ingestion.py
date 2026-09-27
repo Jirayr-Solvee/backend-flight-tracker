@@ -85,7 +85,12 @@ class IngestionTests(unittest.TestCase):
             c.queue_message(self.db,dict(self.row(),text='ITS OUR FIRST OFFICERS BIRTHDAY TODAY'),datetime.now(timezone.utc))
         chosen=c.pending_messages(self.db)
         self.assertEqual(len(chosen),20)
-        self.assertIn('BIRTHDAY',json.loads(chosen[0][1])['text'])
+        self.assertTrue(any('BIRTHDAY' in json.loads(payload)['text'] for _,payload in chosen))
+    def test_spending_is_paced_and_persistent(self):
+        now=datetime(2026,9,1,12,0,tzinfo=timezone.utc)
+        self.assertTrue(all(c.ai_allowance(self.db,now) for _ in range(4)))
+        self.assertFalse(c.ai_allowance(self.db,now+timedelta(minutes=9)))
+        self.assertTrue(c.ai_allowance(self.db,now+timedelta(minutes=10)))
     def test_incomplete_ai_not_retried(self):
         def handler(req):
             if req.method=='GET':return httpx.Response(200,json=[self.row()])
