@@ -31,7 +31,7 @@ class IngestionTests(unittest.TestCase):
             self.assertEqual(sum(pool.map(worker,range(20))),5)
     def test_ai_month_ceiling_survives_restart_and_day_change(self):
         date=datetime(2026,9,1,tzinfo=timezone.utc)
-        self.db.execute('INSERT INTO cockpit_budget VALUES (?,?)',('ai-month:2026-09',179.99));self.db.commit()
+        self.db.execute('INSERT INTO cockpit_budget VALUES (?,?)',('ai-month:2026-09',c.MONTHLY_USD-c.RESERVE_USD));self.db.commit()
         self.assertTrue(c.ai_allowance(self.db,date))
         other=c.init_store(self.path)
         try:self.assertFalse(c.ai_allowance(other,date+timedelta(days=1)))
@@ -49,16 +49,16 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_queue').fetchone()[0],1)
     def test_publication_guards(self):
         msg=dict(id='x',text='NEED GPU UPON ARRIVAL APU INOP',flight=None,registration='N123AB',receivedAt=c.utc_string(self.now))
-        good=dict(publish=True,needs_review=False,category='Operations',title='Ground power requested',summary='The crew requests external power.',excerpt='NEED GPU',interest=50)
+        good=dict(publish=True,needs_review=False,category='Operations',title='Ground power requested',summary='The crew requests external power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
         self.assertIsNotNone(c.validate_story(msg,good))
-        for change in (dict(needs_review=True),dict(publish='true'),dict(excerpt='invented'),dict(interest=101),dict(summary='email me@example.com'),dict(category='Unknown')):
+        for change in (dict(translations={}),dict(translations=None),dict(needs_review=True),dict(publish='true'),dict(excerpt='invented'),dict(interest=101),dict(summary='email me@example.com'),dict(category='Unknown')):
             self.assertIsNone(c.validate_story(msg,dict(good,**change)))
     def test_success_mock_and_no_duplicate_ai(self):
         calls=[]
         def handler(req):
             calls.append(req.method)
             if req.method=='GET':return httpx.Response(200,json=[self.row()])
-            data=dict(publish=True,needs_review=False,category='Operations',title='Ground power',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50)
+            data=dict(publish=True,needs_review=False,category='Operations',title='Ground power',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
             return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(data)}]}}]})
         async def run():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -71,6 +71,15 @@ class IngestionTests(unittest.TestCase):
                     self.assertEqual(second['ai_requests'],0)
         asyncio.run(run())
         self.assertEqual(calls.count('POST'),1)
+    def test_translation_contract_and_budget_bound(self):
+        translations={lang:{'title':'A title','summary':'An explanation.'} for lang in c.LANGUAGES}
+        self.assertTrue(c.valid_translations(translations))
+        for invalid in ({},dict(translations,xx=translations['ar']),dict(translations,ar={'title':'','summary':'x'}),
+                        dict(translations,ar={'title':'x','summary':'email me@example.com'}),
+                        dict(translations,ar={'title':'x'*181,'summary':'x'})):
+            self.assertFalse(c.valid_translations(invalid))
+        self.assertGreaterEqual(c.RESERVE_USD,10000*.30/1_000_000+6144*2.50/1_000_000)
+        self.assertLessEqual(c.MONTHLY_USD,180)
     def test_429_does_not_advance_or_call_ai(self):
         async def run():
             async with httpx.AsyncClient(transport=httpx.MockTransport(lambda req:httpx.Response(429))) as client:
@@ -88,7 +97,8 @@ class IngestionTests(unittest.TestCase):
         self.assertTrue(any('BIRTHDAY' in json.loads(payload)['text'] for _,payload in chosen))
     def test_spending_is_paced_and_persistent(self):
         now=datetime(2026,9,1,12,0,tzinfo=timezone.utc)
-        self.assertTrue(all(c.ai_allowance(self.db,now) for _ in range(4)))
+        self.assertTrue(c.ai_allowance(self.db,now))
+        self.assertTrue(c.ai_allowance(self.db,now))
         self.assertFalse(c.ai_allowance(self.db,now+timedelta(minutes=9)))
         self.assertTrue(c.ai_allowance(self.db,now+timedelta(minutes=10)))
     def test_incomplete_ai_not_retried(self):

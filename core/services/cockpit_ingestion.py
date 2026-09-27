@@ -16,9 +16,10 @@ TERMS = ('DEVIATING', 'DIVERTING', 'HOLDING', 'RETURNING', 'TURBULENCE',
          'GATE REQUEST', 'BIRD STRIKE', 'LIGHTNING STRIKE')
 MODEL = 'gemini-2.5-flash'
 MAX_AI_PER_RUN = 20
-RESERVE_USD = .01
+RESERVE_USD = .02  # Includes all seven cached translations; same monthly/day/window caps.
 MONTHLY_USD = 180.0  # Unspent $20 margin beneath the user's $200 ceiling.
 CATEGORIES = ('Weather', 'Diversion', 'Crew', 'Cargo', 'Cabin', 'Operations')
+LANGUAGES = ('ar', 'de', 'es', 'fr', 'it', 'pt-BR', 'tr')
 PRIVATE = re.compile(r'https?://|www\.|[\w.+-]+@[\w.-]+|\b(?:PNR|PASSPORT|PHONE|EMAIL|MEDICAL|MAYDAY|HAZMAT|BOMB|HIJACK|PATIENT)\b', re.I)
 
 
@@ -90,14 +91,28 @@ excerpt (an exact contiguous substring of the message, <=280 characters), intere
 (integer 0-100 editorial score, not probability). Require review for safety,
 medical/security events, personal information, unclear meaning or potentially alarming
 claims. Only publish clearly supported, non-sensitive explanations. No notifications.
+Also return translations: an object with ar (Arabic), de (German), es (Spanish),
+fr (French), it (Italian), pt-BR (Brazilian Portuguese), tr (Turkish).
+Each contains title and summary translated faithfully from the English title and
+summary. Preserve negation, uncertainty, airport codes and numbers. Do not translate
+or change the original excerpt. Never add facts in any translation.
 '''
 
 SCHEMA = {'type':'OBJECT','properties':{
     'publish':{'type':'BOOLEAN'},'needs_review':{'type':'BOOLEAN'},
     'category':{'type':'STRING','enum':list(CATEGORIES)},
     'title':{'type':'STRING'},'summary':{'type':'STRING'},'excerpt':{'type':'STRING'},
-    'interest':{'type':'INTEGER'}},
-    'required':['publish','needs_review','category','title','summary','excerpt','interest']}
+    'interest':{'type':'INTEGER'},
+    'translations':{'type':'OBJECT','properties':{language:{'type':'OBJECT','properties':{
+        'title':{'type':'STRING'},'summary':{'type':'STRING'}},'required':['title','summary']} for language in LANGUAGES},'required':list(LANGUAGES)}},
+    'required':['publish','needs_review','category','title','summary','excerpt','interest','translations']}
+
+
+def valid_translations(value):
+    if not isinstance(value,dict) or set(value)!=set(LANGUAGES):return False
+    return all(isinstance(item,dict) and set(item)=={'title','summary'} and
+               all(isinstance(item.get(field),str) and 1<=len(item[field].strip())<=maximum and not PRIVATE.search(item[field])
+                   for field,maximum in [('title',180),('summary',900)]) for item in value.values())
 
 
 def pending_messages(db, targets=()):
@@ -191,7 +206,8 @@ def validate_story(message,item):
     for field, maximum in [('title',90),('summary',420),('excerpt',280)]:
         if not isinstance(item.get(field),str) or not 1<=len(item[field])<=maximum or PRIVATE.search(item[field]):return None
     if item['excerpt'] not in message['text']:return None
-    return dict(id=message['id'],title=item['title'],summary=item['summary'],category=item['category'],
+    if not valid_translations(item.get('translations')):return None
+    return dict(id=message['id'],title=item['title'],summary=item['summary'],category=item['category'], translations=item['translations'],
                 flight=message['flight'],registration=message['registration'],receivedAt=message['receivedAt'],
                 transmission=item['excerpt'],latitude=None,longitude=None,
                 interestScore=item['interest'],notificationEligible=False)
@@ -247,9 +263,9 @@ async def run(path,air_key,gem_key,client,targets=()):
             if time.monotonic()-started>330:break
             message=json.loads(payload)
             body={'contents':[{'parts':[{'text':PROMPT+'\n'+json.dumps({'message':message['text']})}]}],
-                  'generationConfig':{'temperature':0,'maxOutputTokens':1024,'thinkingConfig':{'thinkingBudget':0},'responseMimeType':'application/json','responseSchema':SCHEMA}}
-            # UTF-8 bytes conservatively bound input tokens: <=10000 input +1024
-            # output costs <$0.006 at configured prices. Reserve $0.01.
+                  'generationConfig':{'temperature':0,'maxOutputTokens':6144,'thinkingConfig':{'thinkingBudget':0},'responseMimeType':'application/json','responseSchema':SCHEMA}}
+            # <=10000 input tokens +6144 output tokens, no thinking tokens.
+            # Conservatively reserve $0.02 including translated outputs.
             if len(json.dumps(body).encode())>10000:continue
             if not ai_allowance(db,datetime.now(timezone.utc)):break
             with db:db.execute("UPDATE cockpit_queue SET status='attempted' WHERE id=?",(key,))

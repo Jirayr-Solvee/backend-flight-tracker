@@ -60,12 +60,16 @@ EventName = Literal[
     "paywall_alternative_plans_revealed", "paywall_products_loaded",
     "af_search", "search_completed", "search_failed", "no_search_results",
     "search_recovery_shown", "search_recovery_suggestion_selected",
-    "onboarding_started", "onboarding_step_viewed", "onboarding_completed", "activation_experiment_action",
+    "onboarding_started", "onboarding_step_viewed", "onboarding_completed", "activation_experiment_action", "experience_action",
 ]
 
 
 class DiagnosticProperties(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+    experience_presentation_id: Annotated[UUID, Field(strict=False)] | None = None
+    message_id: Token | None = None
+    message_category: Literal["All", "Weather", "Diversion", "Crew", "Cargo", "Cabin", "Operations"] | None = None
+    message_count: Annotated[int, Field(ge=0, le=100000)] | None = None
     product_id: ProductID | None = None
     displayed_product_id: ProductID | None = None
     assigned_product_id: ProductID | None = None
@@ -118,7 +122,7 @@ class DiagnosticProperties(BaseModel):
     effective_paywall: Literal["standard", "flight_detail"] | None = None
     effective_offer: Literal["standard", "flight_detail_treatment"] | None = None
     goals_status: Literal["not_asked", "required", "confirmed"] | None = None
-    paywall_surface: Literal["selected_flight", "skip_flight", "other"] | None = None
+    paywall_surface: Literal["selected_flight", "skip_flight", "airport", "other"] | None = None
     operational_override: Literal["none", "forced_standard", "configuration_fallback"] | None = None
     selection_eligible: bool | None = None
     # Schema 20 extends the operational projection, never arbitrary analytics
