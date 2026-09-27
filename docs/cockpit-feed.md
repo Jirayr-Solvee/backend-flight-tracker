@@ -1,8 +1,14 @@
 # Aircraft message feed operations
 
 The app reads authenticated `GET /cockpit/stories`, optionally filtered by exact
-registration. Reads never call Airframes or Gemini. Returns latest 50 published
-records from seven days. After two hours without successful provider ingestion,
+registration. Reads never call Airframes or Gemini. Returns 20 published records
+per page by default (limit 1–50) from seven days. `category` filters before paging;
+`cursor` is an opaque timestamp/ID keyset boundary from `nextCursor`. Equal-time
+records have deterministic ID ordering. Newer insertions do not shift subsequent
+pages; refresh from the first page to see them. Retention continues to apply to
+every request. A null `nextCursor` marks the end. Both global and owned-flight
+endpoints support the same parameters, and recheck authorization on every page.
+After two hours without successful provider ingestion,
 the endpoint returns 503 instead of pretending the cache is fresh.
 
 ## Worker

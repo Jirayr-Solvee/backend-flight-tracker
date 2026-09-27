@@ -77,10 +77,16 @@ class CockpitAPITests(unittest.TestCase):
         with patch('core.routers.cockpit.load_targets',return_value=(True,[{'id':1}])):
             with patch('core.routers.cockpit.read_stories',return_value={'stories':[]}) as reader:
                 self.assertEqual(self.client.get('/cockpit/flights/1/stories').status_code,200)
-                self.assertEqual(reader.call_args.kwargs,{'flight':{'id':1}})
+                self.assertEqual(reader.call_args.kwargs,{'flight':{'id':1},'limit':20,'category':None,'cursor':None})
         with patch('core.routers.cockpit.load_targets',side_effect=OSError('private path')):
             response=self.client.get('/cockpit/flights/1/stories')
             self.assertEqual(response.status_code,503)
             self.assertNotIn('private path',response.text)
+
+    def test_pagination_parameters_are_validated(self):
+        self.app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id='owner')
+        for query in ('limit=0','limit=51','category=Unknown','cursor=not-a-cursor'):
+            self.assertEqual(self.client.get('/cockpit/stories?'+query).status_code,422)
+            self.assertEqual(self.client.get('/cockpit/flights/1/stories?'+query).status_code,422)
 
 if __name__ == '__main__': unittest.main()

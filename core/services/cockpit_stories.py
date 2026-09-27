@@ -4,6 +4,7 @@ An explicit refresh job writes a small redacted cache. API workers only read it:
 opening the app cannot fan out provider calls or exhaust an account quota.
 """
 import hashlib
+import base64
 import json
 import math
 import re
@@ -102,6 +103,7 @@ def open_store(path):
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("CREATE TABLE IF NOT EXISTS cockpit_stories (id TEXT PRIMARY KEY, received TEXT NOT NULL, registration TEXT NOT NULL, payload TEXT NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS cockpit_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    connection.execute("CREATE INDEX IF NOT EXISTS cockpit_story_order ON cockpit_stories(received DESC,id DESC)")
     return connection
 
 
@@ -121,7 +123,20 @@ def save_messages(path, messages, now=None):
         connection.close()
 
 
-def read_stories(path, registration=None, now=None, flight=None):
+def decode_cursor(cursor):
+    if not cursor:return None
+    try:
+        value=json.loads(base64.urlsafe_b64decode(cursor + '=' * (-len(cursor)%4)))
+        if not isinstance(value,list) or len(value)!=2 or not all(isinstance(v,str) for v in value):raise ValueError()
+        if not parse_time(value[0]) or len(value[1])>128 or not value[1]:raise ValueError()
+        return value
+    except Exception:
+        raise ValueError('Invalid message cursor') from None
+
+
+def read_stories(path, registration=None, now=None, flight=None, *, limit=50, category=None, cursor=None):
+    boundary=decode_cursor(cursor)
+    if not 1<=limit<=50:raise ValueError('Invalid page size')
     now = now or datetime.now(timezone.utc)
     if not Path(path).is_file():
         return None
@@ -131,7 +146,7 @@ def read_stories(path, registration=None, now=None, flight=None):
         updated = parse_time(meta[0]) if meta else None
         if updated is None or now - updated > timedelta(hours=2):
             return None
-        query = "SELECT payload FROM cockpit_stories WHERE received >= ? AND received <= ?"
+        query = "SELECT id,received,payload FROM cockpit_stories WHERE received >= ? AND received <= ?"
         params = [utc_string(now - RETENTION), utc_string(now + timedelta(minutes=1))]
         if flight:
             query += " AND received >= ? AND received <= ? AND REPLACE(registration, '-', '') = ?"
@@ -140,15 +155,26 @@ def read_stories(path, registration=None, now=None, flight=None):
         elif registration:
             query += " AND registration = ?"
             params.append(registration.upper())
-        rows = connection.execute(query + " ORDER BY received DESC" + ("" if flight else " LIMIT 50"), params)
+        if category:
+            query += " AND json_extract(payload, '$.category') = ?"
+            params.append(category)
+        if boundary:
+            query += " AND (received < ? OR (received = ? AND id < ?))"
+            params.extend([boundary[0],boundary[0],boundary[1]])
+        rows = connection.execute(query + " ORDER BY received DESC,id DESC" + ("" if flight else " LIMIT ?"), params+([] if flight else [limit+1]))
         stories=[]
+        positions=[]
         for row in rows:
-            story=json.loads(row[0])
+            story=json.loads(row[2])
             if flight:
                 from .cockpit_tracking import matches
                 if not matches(story,flight):continue
             stories.append(story)
-            if len(stories)>=50:break
-        return {"stories": stories, "updatedAt": utc_string(updated)}
+            positions.append([row[1],row[0]])
+            if len(stories)>limit:break
+        next_cursor=None
+        if len(stories)>limit:
+            next_cursor=base64.urlsafe_b64encode(json.dumps(positions[limit-1]).encode()).decode().rstrip('=')
+        return {"stories": stories[:limit], "updatedAt": utc_string(updated), "nextCursor":next_cursor}
     finally:
         connection.close()
