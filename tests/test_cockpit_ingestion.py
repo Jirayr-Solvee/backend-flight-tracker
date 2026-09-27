@@ -79,5 +79,37 @@ class IngestionTests(unittest.TestCase):
                     self.assertEqual(result['errors'],1);self.assertEqual(result['ai_requests'],0)
         asyncio.run(run())
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_cursor').fetchone()[0],0)
+    def test_theme_fairness(self):
+        with self.db:
+            for i in range(25):c.queue_message(self.db,dict(self.row(),text=f'NEED GPU UPON ARRIVAL APU INOP {i}'),datetime.now(timezone.utc))
+            c.queue_message(self.db,dict(self.row(),text='ITS OUR FIRST OFFICERS BIRTHDAY TODAY'),datetime.now(timezone.utc))
+        chosen=c.pending_messages(self.db)
+        self.assertEqual(len(chosen),20)
+        self.assertIn('BIRTHDAY',json.loads(chosen[0][1])['text'])
+    def test_incomplete_ai_not_retried(self):
+        def handler(req):
+            if req.method=='GET':return httpx.Response(200,json=[self.row()])
+            return httpx.Response(200,json={'candidates':[{'finishReason':'MAX_TOKENS'}]})
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                with patch.object(c,'TERMS',('NEED GPU',)),patch.object(c.asyncio,'sleep',return_value=None):
+                    result=await c.run(self.path,'air','gem',client)
+                    self.assertEqual(result['errors'],1)
+        asyncio.run(run())
+        self.assertEqual(self.db.execute('SELECT status FROM cockpit_queue').fetchone()[0],'failed')
+        self.assertEqual(len(c.pending_messages(self.db)),0)
+        self.assertIsNotNone(self.db.execute("SELECT value FROM cockpit_metadata WHERE key='updated_at'").fetchone())
+    def test_full_pages_persist_cursor(self):
+        def handler(req):
+            first='before_id' not in req.url.params
+            return httpx.Response(200,json=[dict(self.row(),id=i) for i in range(101,201) if first] if first else [dict(self.row(),id=i) for i in range(1,101)])
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                with patch.object(c,'TERMS',('NEED GPU',)),patch.object(c,'MAX_AI_PER_RUN',0),patch.object(c.asyncio,'sleep',return_value=None):
+                    result=await c.run(self.path,'air','gem',client)
+                    self.assertEqual(result['backlogged_terms'],1)
+                    self.assertEqual(result['provider_requests'],2)
+        asyncio.run(run())
+        self.assertEqual(self.db.execute('SELECT before_id FROM cockpit_cursor').fetchone()[0],1)
 
 if __name__=='__main__':unittest.main()

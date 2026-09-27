@@ -89,6 +89,26 @@ medical/security events, personal information, unclear meaning or potentially al
 claims. Only publish clearly supported, non-sensitive explanations. No notifications.
 '''
 
+SCHEMA = {'type':'OBJECT','properties':{
+    'publish':{'type':'BOOLEAN'},'needs_review':{'type':'BOOLEAN'},
+    'category':{'type':'STRING','enum':list(CATEGORIES)},
+    'title':{'type':'STRING'},'summary':{'type':'STRING'},'excerpt':{'type':'STRING'},
+    'interest':{'type':'INTEGER'}},
+    'required':['publish','needs_review','category','title','summary','excerpt','interest']}
+
+
+def pending_messages(db):
+    """Round-robin themes so frequent operational reports cannot crowd out stories."""
+    groups=[[] for _ in range(6)]
+    patterns=[r'BIRTHDAY|RETIREMENT|CONGRATULATIONS|THANK YOU|CHRISTMAS',
+              r'LIVE ANIMAL|SPECIAL HANDLING|TEMPERATURE SENSITIVE',
+              r'DEVIATING|TURBULENCE',r'DIVERTING|RETURNING',r'SMELL|OVEN|IFE PANEL|CATERING|COFFEE']
+    for key,payload in db.execute("SELECT id,payload FROM cockpit_queue WHERE status='pending' ORDER BY received DESC"):
+        text=json.loads(payload)['text'].upper()
+        group=next((i for i,pattern in enumerate(patterns) if re.search(pattern,text)),5)
+        if len(groups[group])<MAX_AI_PER_RUN:groups[group].append((key,payload))
+    return [group[i] for i in range(MAX_AI_PER_RUN) for group in groups if len(group)>i][:MAX_AI_PER_RUN]
+
 
 def validate_story(message,item):
     if not isinstance(item,dict) or item.get('publish') is not True or item.get('needs_review') is not False:return None
@@ -145,15 +165,15 @@ async def run(path,air_key,gem_key,client):
         # Provider freshness is separate from AI outcomes/budget exhaustion.
         if metrics['errors']==0:
             with db:db.execute("INSERT OR REPLACE INTO cockpit_metadata VALUES ('updated_at',?)",(utc_string(datetime.now(timezone.utc)),))
-        pending=db.execute("SELECT id,payload FROM cockpit_queue WHERE status='pending' ORDER BY received DESC LIMIT ?",(MAX_AI_PER_RUN,)).fetchall()
+        pending=pending_messages(db)
         for key,payload in pending:
             if time.monotonic()-started>330:break
             message=json.loads(payload)
             body={'contents':[{'parts':[{'text':PROMPT+'\n'+json.dumps({'message':message['text']})}]}],
-                  'generationConfig':{'temperature':0,'maxOutputTokens':512,'thinkingConfig':{'thinkingBudget':0},'responseMimeType':'application/json'}}
-            # UTF-8 bytes conservatively bound input tokens: <=8000 input +512
-            # output costs <$0.004 at configured prices. Reserve $0.01.
-            if len(json.dumps(body).encode())>8000:continue
+                  'generationConfig':{'temperature':0,'maxOutputTokens':1024,'thinkingConfig':{'thinkingBudget':0},'responseMimeType':'application/json','responseSchema':SCHEMA}}
+            # UTF-8 bytes conservatively bound input tokens: <=10000 input +1024
+            # output costs <$0.006 at configured prices. Reserve $0.01.
+            if len(json.dumps(body).encode())>10000:continue
             if not ai_allowance(db,datetime.now(timezone.utc)):break
             with db:db.execute("UPDATE cockpit_queue SET status='attempted' WHERE id=?",(key,))
             metrics['ai_requests']+=1
@@ -169,8 +189,10 @@ async def run(path,air_key,gem_key,client):
                         metrics['published']+=1
                     else:metrics['held']+=1
                     db.execute('UPDATE cockpit_queue SET status=?,payload=? WHERE id=?',('published' if story else 'held','{}' if story else payload,key))
-            except Exception:
+            except Exception as exc:
                 metrics['errors']+=1
+                reason='ai_'+type(exc).__name__
+                metrics[reason]=metrics.get(reason,0)+1
                 with db:db.execute("UPDATE cockpit_queue SET status='failed',payload='{}' WHERE id=?",(key,))
         metrics['backlogged_terms']=db.execute('SELECT COUNT(*) FROM cockpit_cursor WHERE until_time IS NOT NULL').fetchone()[0]
         metrics['pending']=db.execute("SELECT COUNT(*) FROM cockpit_queue WHERE status='pending'").fetchone()[0]

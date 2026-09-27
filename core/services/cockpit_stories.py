@@ -136,7 +136,7 @@ def read_stories(path, registration=None, now=None):
         if registration:
             query += " AND registration = ?"
             params.append(registration.upper())
-        rows = connection.execute(query + " ORDER BY received DESC LIMIT 30", params).fetchall()
+        rows = connection.execute(query + " ORDER BY received DESC LIMIT 50", params).fetchall()
         return {"stories": [json.loads(row[0]) for row in rows], "updatedAt": utc_string(updated)}
     finally:
         connection.close()
