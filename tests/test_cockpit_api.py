@@ -36,6 +36,16 @@ class CockpitAPITests(unittest.TestCase):
 
     def test_unauthenticated_read_rejected(self):
         self.assertIn(self.client.get('/cockpit/stories').status_code, (401,403))
+        self.assertIn(self.client.get('/cockpit/stories/'+'a'*24).status_code, (401,403))
+
+    def test_exact_story_detail_and_missing_message(self):
+        self.app.dependency_overrides[get_current_user] = lambda: object()
+        now=datetime.now(timezone.utc)
+        save_messages(self.path,[dict(timestamp=utc_string(now),tail='OE-TEST',flightNumber='EC123',text='NEED GPU UPON ARRIVAL APU INOP')],now)
+        story=self.client.get('/cockpit/stories').json()['stories'][0]
+        self.assertEqual(self.client.get('/cockpit/stories/'+story['id']).json()['id'],story['id'])
+        self.assertEqual(self.client.get('/cockpit/stories/'+'b'*24).status_code,404)
+        self.assertEqual(self.client.get('/cockpit/stories/not-an-id').status_code,404)
 
     def test_unconfigured_and_stale_not_misreported_as_empty(self):
         self.app.dependency_overrides[get_current_user] = lambda: object()

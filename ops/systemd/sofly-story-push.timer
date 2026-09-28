@@ -1,0 +1,10 @@
+[Unit]
+Description=Check Sofly story notification windows every ten minutes
+
+[Timer]
+OnCalendar=*:0/10
+RandomizedDelaySec=30
+Persistent=false
+
+[Install]
+WantedBy=timers.target

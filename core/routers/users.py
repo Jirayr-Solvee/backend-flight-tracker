@@ -11,6 +11,7 @@ from ..background_tasks import create_webhook_for_flight
 from ..dependency import check_guest_auth_token, get_current_user
 from ..models import get_session
 from ..models.device import Device
+from ..models.story_push import StoryPushDevice, StoryPushDelivery
 from ..models.ai_consent import AIConsentReceipt, UserAIConsent, UserAIEmailIdentity
 from ..models.flight import Flight, FlightRead
 from ..models.live_activity import (
@@ -155,6 +156,21 @@ class RefreshApnToken(BaseModel):
     supports_localized_push: bool = False
     # Missing means the original dictionary, never implicit support for new keys.
     localized_push_version: int = Field(default=1, strict=True, ge=0, le=2)
+    app_version: str = Field(default="unknown", max_length=32)
+    build_number: int = Field(default=0, strict=True, ge=0, le=1000000)
+    story_push_capability: int = Field(default=0, strict=True, ge=0, le=1)
+    story_push_enabled: bool = False
+    app_language: Literal['en','ar','de','es','fr','it','pt-BR','tr'] = 'en'
+    time_zone: str = Field(default='UTC', max_length=64)
+    analytics_environment: Literal['unknown','development','testflight','production'] = 'unknown'
+
+    @field_validator('time_zone')
+    @classmethod
+    def valid_zone(cls, value):
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try: ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError): raise ValueError('Invalid time zone') from None
+        return value
 
 
 @router.put("/me/apn/refresh", response_model=dict)
@@ -191,6 +207,13 @@ def refresh_apn_token(
         device.localized_push_version = data.localized_push_version
         device.user_id = user.id
         session.add(device)
+        session.merge(StoryPushDevice(
+            device_id=device.id, user_id=user.id, app_version=data.app_version,
+            build_number=data.build_number, capability=data.story_push_capability,
+            enabled=data.story_push_enabled, language=data.app_language,
+            time_zone=data.time_zone, environment=data.analytics_environment,
+            updated_at=int(time.time()),
+        ))
         session.commit()
 
         return {"detail": "APN token refreshed successfully"}
@@ -503,6 +526,8 @@ def delete_user(
     try:
         from ..services.notification_analytics import remove_notification_diagnostics
         remove_notification_diagnostics(session, user.id)
+        session.exec(delete(StoryPushDelivery).where(StoryPushDelivery.user_id == user.id))
+        session.exec(delete(StoryPushDevice).where(StoryPushDevice.user_id == user.id))
         device_ids = [device.id for device in user.devices]
         if device_ids:
             live_activities = session.exec(

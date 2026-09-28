@@ -1,15 +1,35 @@
 """Authenticated read-only message feed. Provider access is an offline job."""
 import os
 import sqlite3
+import json
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from ..dependency import get_current_user
-from ..services.cockpit_stories import read_stories, decode_cursor
+from ..services.cockpit_stories import read_stories, decode_cursor, utc_string
 from ..services.cockpit_tracking import load_targets
 
 router = APIRouter()
 Category = Literal['Weather','Diversion','Crew','Cargo','Cabin','Operations']
+
+
+@router.get('/stories/{story_id}')
+def story_detail(story_id: str, user=Depends(get_current_user)):
+    import re
+    if not re.fullmatch(r'[a-f0-9]{24}', story_id):
+        raise HTTPException(404, 'Message not found')
+    path = os.environ.get('SOFLY_COCKPIT_DB')
+    if not path: raise HTTPException(503, 'Aircraft messages are temporarily unavailable')
+    try:
+        with closing(sqlite3.connect('file:' + path + '?mode=ro', uri=True)) as db:
+            row = db.execute('SELECT payload FROM cockpit_stories WHERE id=? AND received>=?',
+                             (story_id, utc_string(datetime.now(timezone.utc)-timedelta(days=7)))).fetchone()
+        if not row: raise HTTPException(404, 'Message no longer available')
+        return json.loads(row[0])
+    except (sqlite3.Error, ValueError, OSError):
+        raise HTTPException(503, 'Aircraft messages are temporarily unavailable') from None
 
 
 def check_cursor(cursor):
