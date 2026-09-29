@@ -1,0 +1,19 @@
+[Unit]
+Description=Sofly verified trial and payment Telegram alerts
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/backend-flight-tracker
+EnvironmentFile=/etc/sofly-revenue-alerts.env
+ExecStart=/usr/bin/python3 /home/ubuntu/backend-flight-tracker/scripts/telegram_revenue_alerts.py --db /home/ubuntu/backend-flight-tracker/database.db --state /var/lib/sofly-revenue-alerts/state.db
+StateDirectory=sofly-revenue-alerts
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+TimeoutStartSec=330

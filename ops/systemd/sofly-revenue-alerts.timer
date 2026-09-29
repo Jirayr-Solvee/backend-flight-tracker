@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Sofly verified transactions every minute
+
+[Timer]
+OnBootSec=60
+OnUnitInactiveSec=60
+AccuracySec=5
+Unit=sofly-revenue-alerts.service
+
+[Install]
+WantedBy=timers.target
