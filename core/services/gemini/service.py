@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from ...config import settings
 from ...models.flight import SearchRecoveryRead, SearchSuggestionRead
 from ..ai_consent import (
-    AIConsentPurpose, AIConsentRequired, AIConsentUnavailable, require_ai_consent,
+    AIConsentPurpose, AIConsentRequired, AIConsentUnavailable,
 )
 from ..email_ingress import EmailEgressContext, require_email_consent_for_send
 from .config import REQUIRED_FIELDS, email_config, query_config
@@ -181,8 +181,9 @@ class GeminiService:
             raise RuntimeError("Gemini client is not configured")
 
         def send():
-            # This is the only SDK egress point. Authorize in the worker directly
-            # before EACH send/retry, including text extracted from email/PDFs.
+            # Flight search is prompt-free. Booking import still authorizes
+            # its frozen receipt immediately before EACH send/retry. Never
+            # manufacture a search consent receipt as a side effect of search.
             email_sender = getattr(self, "email_sender", None)
             if purpose == "forwarded_email":
                 context = getattr(self, "email_receipt", None)
@@ -190,8 +191,10 @@ class GeminiService:
                         or context.notification.receipt.sender != email_sender):
                     raise AIConsentRequired(purpose)
                 require_email_consent_for_send(context)
-            else:
-                require_ai_consent(getattr(self, "user_id", None), purpose)
+            elif purpose != "search" or not getattr(self, "user_id", None):
+                # Search callers still need an authenticated account; unknown
+                # future purposes must not inherit the search exception.
+                raise AIConsentRequired(purpose)
             return self.client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=contents,

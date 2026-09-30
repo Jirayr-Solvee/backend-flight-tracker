@@ -45,11 +45,13 @@ class LegalPageTests(unittest.TestCase):
         self.assertNotIn("not used for training", text)
         self.assertNotIn("deleted immediately", text)
 
-    def test_sofly_privacy_has_separate_explicit_ai_permissions_and_revoke_limits(self):
+    def test_sofly_privacy_distinguishes_prompt_free_search_from_booking_permission(self):
         text = " ".join(PRIVACY_POLICY_HTML.split())
-        self.assertIn("AI search and forwarded-email AI processing have separate permissions", text)
-        self.assertIn("both off by default", text)
-        self.assertIn("revoke either in Settings", text)
+        self.assertIn("without a separate AI search permission prompt", text)
+        self.assertIn("Search text is not redacted before AI processing", text)
+        self.assertIn("Forwarded-email AI processing remains off by default", text)
+        self.assertIn("does not grant booking-import permission", text)
+        self.assertIn("revoke booking-import permission in Settings", text)
         self.assertIn("cannot undo information already sent", text)
         self.assertIn("searches can work without sharing the search text", text)
 

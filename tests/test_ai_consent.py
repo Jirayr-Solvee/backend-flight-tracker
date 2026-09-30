@@ -264,21 +264,42 @@ class AIConsentTests(unittest.TestCase):
         service = GeminiService(user_id=OWNER)
         self.change(enabled=False)
         with self.assertRaises(AIConsentRequired):
-            asyncio.run(service._generate(PRIVATE, query_config, purpose="search"))
+            require_ai_consent(OWNER, "search")
         self.sdk.models.generate_content.assert_not_called()
 
-    def test_actual_sdk_boundary_denies_missing_account_wrong_scope_and_stale_policy(self):
+    def test_actual_sdk_boundary_denies_missing_account_email_and_unknown_scope(self):
         self.change()
-        for owner, purpose in ((None, "search"), (OTHER, "search"), (OWNER, "forwarded_email")):
+        for owner, purpose in ((None, "search"), (OTHER, "forwarded_email"), (OWNER, "forwarded_email"), (OWNER, "unknown")):
             with self.subTest(owner=owner, purpose=purpose), self.assertRaises(AIConsentRequired):
                 asyncio.run(GeminiService(user_id=owner)._generate(PRIVATE, email_config, purpose=purpose))
+        self.sdk.models.generate_content.assert_not_called()
+
+    def test_prompt_free_search_does_not_create_or_rewrite_historical_consent(self):
+        for state in ("missing", "allowed", "revoked", "stale"):
+            if state == "allowed":
+                self.change()
+            elif state == "revoked":
+                self.change(enabled=False)
+            elif state == "stale":
+                self.session.exec(update(UserAIConsent).where(UserAIConsent.user_id == OWNER).values(policy_version=0))
+                self.session.commit()
+            before = self.snapshot()
+            receipts = len(self.session.exec(select(AIConsentReceipt)).all())
+            self.sdk.models.generate_content.reset_mock()
+            asyncio.run(GeminiService(user_id=OWNER)._generate("flights from Yerevan to Mexico", query_config, purpose="search"))
+            self.sdk.models.generate_content.assert_called_once()
+            self.assertEqual(self.snapshot(), before)
+            self.assertEqual(len(self.session.exec(select(AIConsentReceipt)).all()), receipts)
+
+    def test_historical_search_policy_still_denies_in_consent_api(self):
+        self.change()
         self.session.exec(update(UserAIConsent).where(UserAIConsent.user_id == OWNER).values(policy_version=0))
         self.session.commit()
         with self.assertRaises(AIConsentRequired):
-            asyncio.run(GeminiService(user_id=OWNER)._generate(PRIVATE, query_config, purpose="search"))
+            require_ai_consent(OWNER, "search")
         self.sdk.models.generate_content.assert_not_called()
 
-    def test_revocation_between_provider_retries_stops_second_sdk_send(self):
+    def test_search_provider_failures_remain_bounded_and_private_without_consent_lookup(self):
         self.change()
 
         def first_send(**kwargs):
@@ -288,34 +309,39 @@ class AIConsentTests(unittest.TestCase):
         self.sdk.models.generate_content.side_effect = first_send
         service = GeminiService(user_id=OWNER)
         with patch.object(service, "_deterministic_function_call", return_value=None), \
-                self.assertLogs("core.services.gemini.service", level="ERROR") as captured, \
-                self.assertRaises(AIConsentRequired):
-            asyncio.run(service.get_function_call(PRIVATE))
-        self.assertEqual(self.sdk.models.generate_content.call_count, 1)
+                self.assertLogs("core.services.gemini.service", level="ERROR") as captured:
+            self.assertIsNone(asyncio.run(service.get_function_call(PRIVATE)))
+        self.assertEqual(self.sdk.models.generate_content.call_count, 3)
         self.assertNotIn(PRIVATE, " ".join(captured.output))
         self.assertTrue(all(not record.exc_info for record in captured.records))
 
-    def test_storage_failure_is_unavailable_not_permission_or_provider_retry(self):
+    def test_search_does_not_depend_on_consent_storage(self):
         service = GeminiService(user_id=OWNER)
-        with patch("core.services.ai_consent.Session", side_effect=RuntimeError(PRIVATE)), \
-                self.assertRaises(AIConsentUnavailable):
+        with patch("core.services.ai_consent.Session", side_effect=RuntimeError(PRIVATE)):
             asyncio.run(service._generate(PRIVATE, query_config, purpose="search"))
-        self.sdk.models.generate_content.assert_not_called()
+        self.sdk.models.generate_content.assert_called_once()
 
-    def test_modern_post_403_and_legacy_get_recovery_never_capture_query_sample(self):
+    def test_modern_post_and_legacy_get_ai_search_need_no_consent(self):
+        self.sdk.models.generate_content.return_value = SimpleNamespace(candidates=[SimpleNamespace(
+            content=SimpleNamespace(parts=[SimpleNamespace(function_call=SimpleNamespace(
+                name="extract_flight_info", args={"flight_number": "178", "airline_iata": "BA", "departure_date": "2026-09-30"},
+            ))]),
+        )])
         with patch.object(GeminiService, "_deterministic_function_call", return_value=None), \
-                patch.object(GeminiService, "preflight_recovery", return_value=None):
+                patch.object(GeminiService, "preflight_recovery", return_value=None), \
+                patch.object(flights, "_execute_search_with_date_fallback_details", new=AsyncMock(return_value=flights.SearchExecutionResult(
+                    response=QuerySearchResponse(), provider_result_count=0, filtered_result_count=0,
+                    only_landed_results=False,
+                ))):
             response = self.client.post("/flights/search/term", headers=self.headers(), json={"term": PRIVATE})
-            self.assertEqual(response.status_code, 403)
-            self.assertEqual(response.json(), {"detail": {
-                "code": "ai_consent_required", "purpose": "search", "policy_version": 1,
-            }})
+            self.assertEqual(response.status_code, 200)
+            self.assertNotEqual(response.json().get("recovery", {}).get("reason"), "ai_consent_required")
             response = self.client.get("/flights/search/term", headers=self.headers(), params={"term": PRIVATE})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["recovery"]["reason"], "ai_consent_required")
-        self.assertEqual(response.json()["diagnostics"]["provider_outcome"], "not_called")
-        self.assertEqual(self.session.exec(select(SearchFailureSample)).all(), [])
-        self.sdk.models.generate_content.assert_not_called()
+        self.assertNotEqual(response.json().get("recovery", {}).get("reason"), "ai_consent_required")
+        self.assertEqual(self.sdk.models.generate_content.call_count, 2)
+        self.assertEqual(self.snapshot().revision, 0)
+        self.assertEqual(self.session.exec(select(AIConsentReceipt)).all(), [])
 
     def test_old_clients_deterministic_flight_airport_and_route_need_no_consent(self):
         for term in ("BA123", "JFK", "JFK to LHR today"):

@@ -63,21 +63,28 @@ PRIVACY_POLICY_HTML = """<!doctype html>
       Meta to understand app usage and measure campaign performance.
     </p>
 
-    <h2>Optional AI processing</h2>
+    <h2>AI flight search</h2>
     <p>
-      Google Gemini is an optional third-party AI service. Before sending
-      search text and language context to Google Gemini, Sofly asks for your
-      search permission. This text may include personal or itinerary details
-      you enter. Flight-number, airport and other supported deterministic
+      Sofly uses Google Gemini, a third-party AI service, to interpret flight
+      searches that its regular parser cannot understand. For these searches,
+      we send your search text, language context and the current date to
+      Google Gemini without a separate AI search permission prompt. We do not
+      add your Sofly account identifier or authentication token to this AI
+      request. Search text is not redacted before AI processing and may include
+      personal or itinerary details you enter. Please use search for flight
+      details and avoid entering names, contact details or booking references.
+      Flight-number, airport and other supported deterministic
       searches can work without sharing the search text with Google Gemini.
     </p>
     <p>
-      AI search and forwarded-email AI processing have separate permissions,
-      both off by default and saved to your Sofly account. Granting one does
-      not grant the other. You can revoke either in Settings. Revocation stops
-      new requests to Google Gemini for that purpose, including queued retries;
+      Forwarded-email AI processing remains off by default and requires a
+      separate permission saved to your Sofly account. Using flight search
+      does not grant booking-import permission. You can revoke booking-import
+      permission in Settings. Revocation stops new booking-import requests
+      to Google Gemini, including queued retries;
       it cannot undo information already sent or a request already in flight.
-      Declining AI permission does not opt you out of the hosting, flight-data
+      Declining booking-import permission does not opt you out of flight search,
+      hosting, flight-data
       providers or diagnostics described elsewhere in this policy.
     </p>
 
