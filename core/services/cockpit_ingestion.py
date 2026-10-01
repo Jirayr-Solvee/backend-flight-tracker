@@ -309,7 +309,7 @@ def validate_story(message,item):
     return dict(id=message['id'],title=item['title'],summary=item['summary'],category=item['category'], translations=item['translations'],
                 flight=message['flight'],registration=message['registration'],receivedAt=message['receivedAt'],
                 transmission=item['excerpt'],latitude=None,longitude=None,
-                interestScore=item['interest'],notificationEligible=item['interest'] >= 80)
+                interestScore=item['interest'],notificationEligible=item['interest'] >= 65)
 
 
 async def run(path,air_key,gem_key,client,targets=()):

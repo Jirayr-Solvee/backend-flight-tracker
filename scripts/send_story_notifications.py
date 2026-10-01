@@ -2,9 +2,28 @@
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+def supported_releases():
+    raw = os.environ.get('SOFLY_STORY_PUSH_RELEASES', '')
+    if not raw:
+        version = os.environ.get('SOFLY_STORY_PUSH_VERSION', '')
+        build = os.environ.get('SOFLY_STORY_PUSH_BUILD', '0')
+        raw = f'{version}:{build}' if version else ''
+    result = set()
+    for item in raw.split(','):
+        if not item:continue
+        if not re.fullmatch(r'[0-9]+(?:\.[0-9]+){2}:[1-9][0-9]{0,6}', item):
+            raise ValueError('Invalid supported story-push release')
+        version, build = item.split(':')
+        result.add((version, int(build)))
+    if not result:
+        raise ValueError('No supported story-push releases configured')
+    return result
 
 
 async def main():
@@ -25,6 +44,7 @@ async def main():
         os.environ.get('SOFLY_FLIGHT_DB', 'database.db'), os.environ['SOFLY_COCKPIT_DB'], send,
         enabled=True, version=os.environ.get('SOFLY_STORY_PUSH_VERSION', ''),
         build=int(os.environ.get('SOFLY_STORY_PUSH_BUILD', '0')),
+        releases=supported_releases(),
     )
     print(json.dumps(metrics))
 

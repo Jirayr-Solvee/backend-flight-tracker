@@ -26,3 +26,13 @@ class StoryPushDelivery(SQLModel, table=True):
     local_day: str
     slot: int
     status: str = "reserved"
+
+
+class StoryPushCampaign(SQLModel, table=True):
+    # One story is frozen for each local calendar day and delivery window.
+    day: str = Field(primary_key=True)
+    slot: int = Field(primary_key=True)
+    story_id: str
+    story_fingerprint: str
+    category: str
+    created_at: int
