@@ -47,6 +47,39 @@ class IngestionTests(unittest.TestCase):
             c.queue_message(self.db,self.row(),datetime.now(timezone.utc))
             c.queue_message(self.db,dict(self.row(),text='PLEASE EMAIL me@example.com'),datetime.now(timezone.utc))
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_queue').fetchone()[0],1)
+    def test_bulletins_are_not_aircraft_events(self):
+        for text in ('LEMH ATIS BIRD STRIKE WARNING IN VICINITY',
+                     'BIRD STRIKE RISK WARNING FOR ARRIVAL ROUTE',
+                     'SIGMET MODERATE TURBULENCE EXPECTED',
+                     'MSG FROM GND LOADCONTROL: FUEL FIGURES RECEIVED. THANK YOU',
+                     'LIVE ANIMALS ONBOARD TEMPERATURE CONTROL IN AFT COMPARTMENT'):
+            self.assertTrue(c.routine_message(text),text)
+            with self.db:c.queue_message(self.db,dict(self.row(),text=text),datetime.now(timezone.utc))
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_queue').fetchone()[0],0)
+        self.assertFalse(c.routine_message('DIVERTING TO KIAH DUE SIGMET AT DESTINATION'))
+        self.assertFalse(c.routine_message('BIRD STRIKE ON CLIMB OUT RETURNING TO KIAH'))
+        self.assertFalse(c.routine_message('ITS OUR FIRST OFFICERS BIRTHDAY TODAY'))
+    def test_sensitive_event_has_only_private_metadata(self):
+        row=dict(self.row(),text='MAYDAY DIVERTING TO KIAH PLEASE PHONE 12345678901')
+        with self.db:c.queue_message(self.db,row,datetime.now(timezone.utc))
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_queue').fetchone()[0],0)
+        record=self.db.execute('SELECT provider_id,reason FROM cockpit_review').fetchone()
+        self.assertEqual(record,(100,'sensitive_event'))
+        self.assertNotIn('MAYDAY',str(self.db.execute('SELECT * FROM cockpit_review').fetchall()))
+    def test_exact_global_duplicate_keeps_tracked_copy(self):
+        first=self.row();second=dict(first,tail='N456CD')
+        with self.db:
+            c.queue_message(self.db,first,datetime.now(timezone.utc))
+            c.queue_message(self.db,second,datetime.now(timezone.utc))
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_queue').fetchone()[0],1)
+        with self.db:c.queue_message(self.db,second,datetime.now(timezone.utc),tracked=True)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_queue').fetchone()[0],2)
+    def test_retire_legacy_bulletin_backlog(self):
+        legacy=dict(id='a'*24,registration='N123AB',receivedAt=c.utc_string(self.now),text='ATIS BIRD STRIKE WARNING')
+        with self.db:self.db.execute('INSERT INTO cockpit_queue VALUES (?,?,?,?)',
+                                     (legacy['id'],legacy['receivedAt'],json.dumps(legacy),'pending'))
+        self.assertEqual(c.suppress_routine_pending(self.db),1)
+        self.assertEqual(self.db.execute('SELECT status,payload FROM cockpit_queue').fetchone(),('suppressed','{}'))
     def test_publication_guards(self):
         msg=dict(id='x',text='NEED GPU UPON ARRIVAL APU INOP',flight=None,registration='N123AB',receivedAt=c.utc_string(self.now))
         good=dict(publish=True,needs_review=False,category='Operations',title='Ground power requested',summary='The crew requests external power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
@@ -95,6 +128,28 @@ class IngestionTests(unittest.TestCase):
         chosen=c.pending_messages(self.db)
         self.assertEqual(len(chosen),20)
         self.assertTrue(any('BIRTHDAY' in json.loads(payload)['text'] for _,payload in chosen))
+    def test_specific_action_precedes_weather_and_acknowledgement(self):
+        with self.db:
+            c.queue_message(self.db,dict(self.row(),tail='N1ABC',text='DEVIATING FOR TURBULENCE'),datetime.now(timezone.utc))
+            c.queue_message(self.db,dict(self.row(),tail='N2ABC',text='DIVERTING TO KIAH DUE FUEL'),datetime.now(timezone.utc))
+            c.queue_message(self.db,dict(self.row(),tail='N3ABC',text='ITS OUR FIRST OFFICERS BIRTHDAY TODAY'),datetime.now(timezone.utc))
+        chosen=c.pending_messages(self.db)
+        self.assertIn('DIVERTING TO KIAH',json.loads(chosen[0][1])['text'])
+        self.assertEqual(len(chosen),3)
+    def test_model_review_has_no_public_story_or_raw_queue_payload(self):
+        def handler(req):
+            if req.method=='GET':return httpx.Response(200,json=[dict(self.row(),text='SMELL IN CABIN REPORTED')])
+            item=dict(publish=False,needs_review=True,category='Cabin',title='Review',summary='Review needed',
+                      excerpt='SMELL',interest=80,translations={lang:{'title':'Review','summary':'Review needed'} for lang in c.LANGUAGES})
+            return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(item)}]}}]})
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                with patch.object(c,'TERMS',('SMELL',)),patch.object(c.asyncio,'sleep',return_value=None):
+                    return await c.run(self.path,'air','gem',client)
+        result=asyncio.run(run())
+        self.assertEqual(result['review'],1)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_stories').fetchone()[0],0)
+        self.assertEqual(self.db.execute('SELECT status,payload FROM cockpit_queue').fetchone(),('review','{}'))
     def test_spending_is_paced_and_persistent(self):
         now=datetime(2026,9,1,12,0,tzinfo=timezone.utc)
         self.assertTrue(c.ai_allowance(self.db,now))

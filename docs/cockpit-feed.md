@@ -19,8 +19,11 @@ read-only system/home mounts, and writes only its private state directory.
 Systemd plus a file lock prevents overlapping workers.
 
 23 targeted substring searches cover weather actions, changes of plan, human
-moments, unusual cargo, cabin and ground operations. This is curated coverage,
-not a complete global feed. Up to two pages per term per run; frozen query
+moments, cabin and ground operations. Broad `THANK YOU`, `LIVE ANIMAL`, and
+`TEMPERATURE SENSITIVE` searches were removed after repeated boilerplate
+crowded the feed. `MAYDAY`, `PAN PAN`, and `HIJACK` searches populate only a
+private review queue; they never publish automatically. This is curated
+coverage, not a complete global feed. Up to two pages per term per run; frozen query
 windows and pagination cursors persist. Full pages resume next run rather than
 silently advance. Initial lookback is 24 hours. Windows overlap by two minutes;
 content/tail/date deduplication persists across terms and restarts.
@@ -32,14 +35,21 @@ without retries. Next run resumes without marking incomplete ingestion fresh.
 
 ## AI and safety
 
-Existing Gemini 2.5 Flash credential. Four AI attempts per ten-minute UTC window,
-at most 576 scheduled attempts/day. Themes rotate so routine operations cannot
-occupy every slot. New candidates may wait; no exhaustive coverage is promised.
+Existing Gemini 2.5 Flash credential. Two AI attempts per ten-minute UTC window,
+at most 288 scheduled attempts/day. Generic ATIS, SIGMET, NOTAM and similar
+bulletins, routine acknowledgements, and repeated live-animal temperature
+instructions are suppressed before AI. Exact duplicate message text from
+different aircraft is collapsed for the global feed within one day; saved-flight
+messages keep their own copy. Remaining candidates are ranked by saved-flight
+match, explicit diversion/return, aircraft hazard, cabin and operational issue,
+weather and human moment. One candidate per priority band is selected first so
+one busy theme cannot occupy both reviews in a window. New candidates may wait;
+no exhaustive coverage is promised.
 
-Before sending, reserve $0.01 against the persisted UTC monthly and daily
+Before sending, reserve $0.02 against the persisted UTC monthly and daily
 ledgers. Maximum monthly reservation $180, with $20 unused headroom beneath the
 requested $200 feature budget. Daily allowance is $180/days-in-month. At most
-10,000 input UTF-8 bytes and 1,024 output tokens, thinking disabled; at pinned
+10,000 input UTF-8 bytes and 6,144 output tokens, thinking disabled; at pinned
 $0.30/M input and $2.50/M output prices this conservative reservation exceeds
 the bounded request price. Reservations are NOT refunded, even for failures;
 reserved amounts are not actual invoices. Price changes require review. This
@@ -53,8 +63,18 @@ Scores are editorial model estimates, not probabilities. They are retained as
 interestScore for later review. Notification eligibility is false; no push
 sender is present in this worker.
 
-Obvious contact/sensitive payloads are excluded before AI. Review-held text is
-private, retained no longer than seven days and not exposed in the public feed.
+Obvious contact payloads are excluded before AI. Messages with sensitive event
+terms create a metadata-only review record (provider ID, aircraft, timestamp,
+reason); their raw text is not cached. The model's `needs_review` outcomes also
+create review records without publishing. An operator can list candidates with
+`python scripts/review_cockpit_candidates.py`; viewing one requires running
+`sudo venv/bin/python3 scripts/review_cockpit_candidates.py --show ID` from the
+backend directory so
+the root-only `/etc/sofly/cockpit.env` credential can fetch it from Airframes.
+`--mark ID --decision reviewed` or `dismissed` records a manual disposition.
+Neither action publishes a story. Review records expire after seven days.
+Other held text remains private, retained no longer than seven days and not
+exposed in the public feed.
 Heuristics and AI gates do not establish perfect privacy or factual accuracy;
 review remains needed before enabling automatic pushes. No manual review UI
 is included in this deployment.
@@ -77,7 +97,7 @@ transmission time, exact normalized registration and matching flight number
 flight numbers are omitted rather than assumed to belong to this leg.
 
 Matching pending messages receive AI priority before global stories, inside the
-same four-per-window and $180 reservation ceiling. Routine telemetry and sensitive
+same two-per-window and $180 reservation ceiling. Routine telemetry and sensitive
 messages remain excluded. This is useful decoded coverage, not all transmissions.
 
 `GET /cockpit/flights/{flight_id}/stories` requires the authenticated user's saved
