@@ -80,6 +80,19 @@ class IngestionTests(unittest.TestCase):
                                      (legacy['id'],legacy['receivedAt'],json.dumps(legacy),'pending'))
         self.assertEqual(c.suppress_routine_pending(self.db),1)
         self.assertEqual(self.db.execute('SELECT status,payload FROM cockpit_queue').fetchone(),('suppressed','{}'))
+    def test_retire_previously_published_bulletin(self):
+        old={'id':'a'*24,'transmission':'ATIS BIRD STRIKE WARNING IN VICINITY'}
+        real={'id':'b'*24,'transmission':'BIRD STRIKE ON CLIMB OUT RETURNING TO KIAH'}
+        with self.db:
+            for story in (old,real):
+                self.db.execute('INSERT INTO cockpit_stories VALUES (?,?,?,?)',
+                                (story['id'],c.utc_string(self.now),'N123AB',json.dumps(story)))
+                self.db.execute('INSERT INTO cockpit_queue VALUES (?,?,?,?)',
+                                (story['id'],c.utc_string(self.now),'{}','published'))
+        self.assertEqual(c.retire_routine_stories(self.db),1)
+        self.assertEqual(c.retire_routine_stories(self.db),0)
+        self.assertEqual(self.db.execute('SELECT id FROM cockpit_stories').fetchone()[0],real['id'])
+        self.assertEqual(self.db.execute("SELECT status FROM cockpit_queue WHERE id=?",(old['id'],)).fetchone()[0],'suppressed')
     def test_publication_guards(self):
         msg=dict(id='x',text='NEED GPU UPON ARRIVAL APU INOP',flight=None,registration='N123AB',receivedAt=c.utc_string(self.now))
         good=dict(publish=True,needs_review=False,category='Operations',title='Ground power requested',summary='The crew requests external power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})

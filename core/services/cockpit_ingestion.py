@@ -222,6 +222,17 @@ def suppress_routine_pending(db):
     return len(ids)
 
 
+def retire_routine_stories(db):
+    """Remove previously published boilerplate using its saved source excerpt."""
+    ids=[]
+    for key,payload in db.execute('SELECT id,payload FROM cockpit_stories'):
+        if routine_message(json.loads(payload).get('transmission','')):ids.append((key,))
+    with db:
+        db.executemany('DELETE FROM cockpit_stories WHERE id=?',ids)
+        db.executemany("UPDATE cockpit_queue SET status='suppressed' WHERE id=? AND status='published'",ids)
+    return len(ids)
+
+
 async def ingest_tracked(db, targets, air_key, client, metrics, started, now):
     """At most eight extra calls/run, shared by registration, least recently polled first."""
     grouped={}
@@ -349,6 +360,7 @@ async def run(path,air_key,gem_key,client,targets=()):
         if metrics['errors']==0:
             with db:db.execute("INSERT OR REPLACE INTO cockpit_metadata VALUES ('updated_at',?)",(utc_string(datetime.now(timezone.utc)),))
         metrics['suppressed']=suppress_routine_pending(db)
+        metrics['retired_stories']=retire_routine_stories(db)
         pending=pending_messages(db,targets)
         for key,payload in pending:
             if time.monotonic()-started>330:break

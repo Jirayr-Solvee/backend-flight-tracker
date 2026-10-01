@@ -45,6 +45,8 @@ match, explicit diversion/return, aircraft hazard, cabin and operational issue,
 weather and human moment. One candidate per priority band is selected first so
 one busy theme cannot occupy both reviews in a window. New candidates may wait;
 no exhaustive coverage is promised.
+On each refresh, previously published stories whose saved transmission excerpt
+matches those routine patterns are retired from the cache as well.
 
 Before sending, reserve $0.02 against the persisted UTC monthly and daily
 ledgers. Maximum monthly reservation $180, with $20 unused headroom beneath the
