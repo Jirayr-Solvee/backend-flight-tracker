@@ -164,6 +164,37 @@ class StoryPushTests(unittest.TestCase):
         self.assertEqual(result['flight_reserved'],0)
         self.assertEqual(len(calls),1)
 
+    def test_testflight_qa_only_targets_one_opted_in_device_without_paid_entitlement(self):
+        self.db.execute('UPDATE user SET premium_valid_until=NULL WHERE id=?',('owner',))
+        self.db.execute("UPDATE storypushdevice SET environment='testflight' WHERE device_id='phone'")
+        self.db.execute('INSERT INTO user VALUES (?,NULL)',('other',))
+        self.db.execute('INSERT INTO device VALUES (?,?,?,?)',('tablet','other','tablet-token',1))
+        self.db.execute('INSERT INTO storypushdevice VALUES (?,?,?,?,?,?,?,?,?,?)',
+                        ('tablet','other','3.9.3',142,1,1,'en','UTC','testflight',int(self.now.timestamp())))
+        self.db.commit()
+        calls=[]
+        async def send(token,value,identifier):calls.append(token);return '200'
+        result=asyncio.run(dispatch(self.database,self.feed,send,enabled=True,
+            environment='testflight',qa_device_id='phone',releases={('3.9.3',142)},now=self.now))
+        self.assertEqual(result['accepted'],1)
+        self.assertEqual(calls,['test-token'])
+        self.assertFalse(eligible(dict(self.device,environment='testflight',premium_valid_until=None,
+                                       enabled=0),self.now,'3.9.3',142,'testflight',qa_device_id='phone'))
+        self.assertFalse(eligible(dict(self.device,environment='testflight',premium_valid_until=None,
+                                       app_version='3.9.2'),self.now,'3.9.3',142,'testflight',qa_device_id='phone'))
+        self.assertFalse(eligible(dict(self.device,environment='production',premium_valid_until=None),
+                                  self.now,'3.9.3',142,qa_device_id='phone'))
+
+    def test_testflight_scope_cannot_broadcast_or_bypass_production(self):
+        async def send(*args):self.fail('must not send')
+        with self.assertRaises(ValueError):
+            asyncio.run(dispatch(self.database,self.feed,send,enabled=True,
+                                 environment='testflight',releases={('3.9.3',142)},now=self.now))
+        with self.assertRaises(ValueError):
+            asyncio.run(dispatch(self.database,self.feed,send,enabled=True,
+                                 environment='production',qa_device_id='phone',
+                                 releases={('3.9.3',142)},now=self.now))
+
     def test_stale_and_unqualified_stories_do_not_fill_quota(self):
         async def send(*args): self.fail('must not send')
         with sqlite3.connect(self.feed) as db:

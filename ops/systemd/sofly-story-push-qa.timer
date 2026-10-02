@@ -1,0 +1,10 @@
+[Unit]
+Description=Check one TestFlight aircraft-story device every ten minutes
+
+[Timer]
+OnCalendar=*:2/10
+RandomizedDelaySec=30
+Persistent=false
+
+[Install]
+WantedBy=timers.target

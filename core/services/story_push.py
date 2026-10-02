@@ -25,16 +25,19 @@ def slot_for(now, time_zone):
     return local.date().isoformat(), slot
 
 
-def eligible(device, now, version, build, environment='production', releases=None):
+def eligible(device, now, version, build, environment='production', releases=None,
+             qa_device_id=None):
     supported = releases if releases is not None else {(version, build)}
+    qa_entitlement = (environment == 'testflight' and qa_device_id is not None
+                      and device['device_id'] == qa_device_id)
     return (bool(supported) and (device['app_version'], device['build_number']) in supported
             and device['capability'] == 1
             and device['enabled'] == 1 and device['apn_token_active'] == 1
             and bool(device['apn_token']) and device['environment'] == environment
             and int(now.timestamp()) - 30 * 86400 <= device['updated_at'] <= int(now.timestamp()) + 60
             and device['user_id'] == device['owner_id']
-            and type(device['premium_valid_until']) is int
-            and device['premium_valid_until'] > int(now.timestamp() * 1000))
+            and (qa_entitlement or (type(device['premium_valid_until']) is int
+                                    and device['premium_valid_until'] > int(now.timestamp() * 1000))))
 
 
 def candidates(path, now):
@@ -135,19 +138,29 @@ def payload(story, language, delivery, *, flight=False):
 
 
 async def dispatch(database, feed, send, *, enabled=False, version='', build=0,
-                   environment='production', releases=None, now=None, max_sends=200):
+                   environment='production', releases=None, now=None, max_sends=200,
+                   qa_device_id=None):
     metrics = dict(eligible=0, reserved=0, accepted=0, failed=0, flight_reserved=0)
     if not enabled: return metrics
+    if environment not in ('production', 'testflight'):
+        raise ValueError('Unsupported story-push environment')
+    if environment == 'testflight' and not qa_device_id:
+        raise ValueError('TestFlight delivery requires one exact device')
+    if environment == 'production' and qa_device_id:
+        raise ValueError('QA device cannot run in production delivery')
     now = now or datetime.now(timezone.utc)
     stories = candidates(feed, now)
     with closing(sqlite3.connect(database, timeout=10)) as db:
         db.row_factory = sqlite3.Row
-        devices = db.execute('SELECT p.*, d.user_id AS owner_id,d.apn_token,d.apn_token_active,u.premium_valid_until FROM storypushdevice p JOIN device d ON p.device_id=d.id JOIN user u ON u.id=p.user_id ORDER BY p.updated_at DESC').fetchall()
+        query = 'SELECT p.*, d.user_id AS owner_id,d.apn_token,d.apn_token_active,u.premium_valid_until FROM storypushdevice p JOIN device d ON p.device_id=d.id JOIN user u ON u.id=p.user_id'
+        devices = (db.execute(query + ' WHERE p.device_id=?', (qa_device_id,)).fetchall()
+                   if qa_device_id else db.execute(query + ' ORDER BY p.updated_at DESC').fetchall())
         campaign_cache = {}
         target_cache = {}
         for device in devices:
             if metrics['reserved'] >= max_sends: break
-            if not eligible(device, now, version, build, environment, releases): continue
+            if not eligible(device, now, version, build, environment, releases,
+                            qa_device_id=qa_device_id): continue
             metrics['eligible'] += 1
             day,slot = slot_for(now, device['time_zone'])
             sends=[]
@@ -174,9 +187,10 @@ async def dispatch(database, feed, send, *, enabled=False, version='', build=0,
                 metrics['reserved'] += 1
                 if is_flight:metrics['flight_reserved'] += 1
                 try:
-                    # Recheck ownership, entitlement, preference and token after reservation.
+                    # Recheck ownership, entitlement/QA scope, preference and token after reservation.
                     current = db.execute('SELECT p.*,d.user_id AS owner_id,d.apn_token,d.apn_token_active,u.premium_valid_until FROM storypushdevice p JOIN device d ON p.device_id=d.id JOIN user u ON u.id=p.user_id WHERE p.device_id=?', (device['device_id'],)).fetchone()
-                    if not current or not eligible(current, now, version, build, environment, releases) or current['user_id'] != device['user_id'] or current['apn_token'] != device['apn_token']:
+                    if not current or not eligible(current, now, version, build, environment, releases,
+                                                   qa_device_id=qa_device_id) or current['user_id'] != device['user_id'] or current['apn_token'] != device['apn_token']:
                         outcome = 'suppressed'
                     else:
                         status = await send(device['apn_token'], payload(story, device['language'], delivery, flight=is_flight), delivery)

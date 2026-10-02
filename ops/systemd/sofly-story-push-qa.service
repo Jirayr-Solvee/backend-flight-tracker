@@ -1,0 +1,21 @@
+[Unit]
+Description=Send aircraft-story notifications to one opted-in TestFlight device
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/backend-flight-tracker
+EnvironmentFile=/etc/sofly/story-push-qa.env
+Environment=SOFLY_COCKPIT_DB=/var/lib/sofly-cockpit/stories.sqlite
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/backend-flight-tracker/venv/bin/python3 scripts/send_story_notifications.py
+TimeoutStartSec=300
+MemoryMax=256M
+CPUQuota=25%
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0027
