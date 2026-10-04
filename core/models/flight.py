@@ -91,6 +91,17 @@ class Arrival(FlightOriginAndDestinationInformation, table=True):
     flight: Optional["Flight"] = Relationship(back_populates="arrival")
 
 
+class FlightTimeNotice(SQLModel, table=True):
+    """The departure or arrival time a flight's users were last told about.
+
+    Time alerts compare against this rather than the previous provider
+    snapshot, so small estimate drifts add up to one useful alert instead of
+    a push for every minute."""
+    flight_id: int = Field(foreign_key="flight.id", primary_key=True)
+    direction: str = Field(primary_key=True)
+    notified_time_utc: str
+
+
 class Airport(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     iata: str

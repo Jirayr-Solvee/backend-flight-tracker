@@ -54,18 +54,25 @@ from sqlmodel import Session, SQLModel, create_engine
 from core import background_tasks
 from core.models.aerodatabox import (
     AerodataboxOriginAndDestinationInformationWebhook,
+    AerodataboxTimeStamp,
+    FlightNotificationContractItem,
+    FlightStatusEnum,
 )
 from core.models.device import Device
 from core.models.email import EmailRead, SESReceiptProof, S3EmailNotification
-from core.models.flight import Departure, Flight
+from core.models.flight import Arrival, Departure, Flight, FlightTimeNotice
 from core.models.notification import DeviceInfo, Notification, NotificationBatch
 from core.models.user import User
 from core.routers import users
 from core.routers.webhook import partition_notification_refresh_tokens
 from core.services.apn.service import ApnService
 from core.services.apn.utils import (
+    TIME_ALERT_MINUTES,
     consolidate_notification_batches,
+    extract_all_notifications_for_flight,
     extract_nested_notifications_for_flight,
+    load_notified_times,
+    save_notified_times,
 )
 from scripts.migrate_device_localized_push_version import migrate
 
@@ -742,6 +749,136 @@ class EmailPushCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(user.notification_count, 5)
         session.commit.assert_called_once()
         session.rollback.assert_not_called()
+
+
+def stamp(clock):
+    return AerodataboxTimeStamp(utc=f"2026-10-05 {clock}Z", local=f"2026-10-05 {clock}+00:00")
+
+
+def provider_side(*, scheduled=None, revised=None, predicted=None, runway=None, gate=None):
+    return AerodataboxOriginAndDestinationInformationWebhook.model_construct(
+        terminal=None, checkInDesk=None, gate=gate, baggageBelt=None,
+        scheduledTime=scheduled and stamp(scheduled), revisedTime=revised and stamp(revised),
+        predictedTime=predicted and stamp(predicted), runwayTime=runway and stamp(runway),
+    )
+
+
+def utc(clock):
+    return clock and f"2026-10-05 {clock}Z"
+
+
+class FlightTimeAlertTests(unittest.TestCase):
+    """A time alert needs a real move from what users were last told."""
+
+    def setUp(self):
+        # Extraction reads plain attributes; endpoints stay real models for their direction.
+        self.flight = SimpleNamespace(
+            id=42, number="AC907", status=FlightStatusEnum.ENROUTE,
+            aircraft_reg=None, aircraft_model=None, aircraft_modeS=None,
+            departure=Departure(scheduled_time_utc=utc("14:20"), revised_time_utc=utc("14:20"),
+                                runway_time_utc=utc("14:24")),
+            arrival=Arrival(scheduled_time_utc=utc("17:50"), revised_time_utc=utc("17:50")),
+        )
+        self.notified: dict[str, str] = {}
+
+    def update(self, *, status=FlightStatusEnum.ENROUTE, arrival=None, departure=None):
+        """One provider snapshot; the database then keeps the new values, as the webhook does."""
+        snapshot = FlightNotificationContractItem.model_construct(
+            number="AC 907", status=status, aircraft=None,
+            departure=departure or provider_side(scheduled="14:20", revised="14:20", runway="14:24"),
+            arrival=arrival or provider_side(scheduled="17:50"),
+        )
+        result = extract_all_notifications_for_flight(
+            flight=self.flight, webhook_flight=snapshot, devices_info=[device()],
+            notified_times=self.notified,
+        )
+        self.flight.status = status
+        for side, info in ((snapshot.departure, self.flight.departure), (snapshot.arrival, self.flight.arrival)):
+            info.revised_time_utc = side.revisedTime and side.revisedTime.utc
+            info.predicted_time_utc = side.predictedTime and side.predictedTime.utc
+            info.runway_time_utc = side.runwayTime and side.runwayTime.utc
+            info.gate = side.gate
+        return [batch.notification for batch in result]
+
+    def test_minute_drifts_add_up_to_one_alert_with_the_delay_against_schedule(self):
+        for clock in ("17:51", "17:53", "17:56", "17:59"):
+            self.assertEqual(self.update(arrival=provider_side(scheduled="17:50", revised=clock)), [], clock)
+        self.assertEqual(self.notified, {"Arrival": utc("17:50")})
+
+        [alert] = self.update(arrival=provider_side(scheduled="17:50", revised="18:01"))
+        self.assertEqual(alert.update_type, "delay")
+        self.assertEqual(alert.body_loc_key, "Flight %@ arrival is delayed by %@ min.")
+        self.assertEqual(alert.body_loc_args, ["AC907", "11"])
+        self.assertEqual((alert.previous_value, alert.new_value), (utc("17:50"), utc("18:01")))
+        self.assertEqual(self.notified, {"Arrival": utc("18:01")})
+        self.assertEqual(self.update(arrival=provider_side(scheduled="17:50", revised="18:02")), [])
+
+    def test_recovery_and_early_arrival_read_against_schedule(self):
+        self.notified["Arrival"] = utc("18:20")
+        [alert] = self.update(arrival=provider_side(scheduled="17:50", revised="18:05"))
+        self.assertEqual((alert.update_type, alert.body_loc_args), ("delay", ["AC907", "15"]))
+
+        [alert] = self.update(arrival=provider_side(scheduled="17:50", revised="17:50"))
+        self.assertEqual(alert.body_loc_key, "Flight %@ arrival remains on time.")
+
+        [alert] = self.update(arrival=provider_side(scheduled="17:50", predicted="17:37"))
+        self.assertEqual(alert.update_type, "time")
+        self.assertEqual(alert.body_loc_key, "Flight %@ arrival moved %@ min earlier.")
+        self.assertEqual(alert.body_loc_args, ["AC907", "13"])
+
+    def test_first_estimate_and_zero_minute_changes_are_not_news(self):
+        self.flight.arrival.revised_time_utc = None
+        self.assertEqual(self.update(arrival=provider_side(scheduled="17:50", predicted="17:54")), [])
+        self.assertEqual(self.update(arrival=provider_side(scheduled="17:50", predicted="17:54")), [])
+        self.assertEqual(self.notified, {"Arrival": utc("17:50")})
+
+    def test_departure_times_stop_once_the_flight_has_left(self):
+        self.flight.status = FlightStatusEnum.BOARDING
+        self.flight.departure.runway_time_utc = None
+        [alert] = self.update(status=FlightStatusEnum.DEPARTED,
+                              departure=provider_side(scheduled="14:20", revised="14:45"))
+        self.assertEqual(alert.update_type, "status")
+        self.assertNotIn("Departure", self.notified)
+        self.assertEqual(self.update(status=FlightStatusEnum.DEPARTED,
+                                     departure=provider_side(scheduled="14:20", revised="15:10", runway="14:44")), [])
+
+    def test_arrival_times_stop_once_landed_canceled_or_diverted(self):
+        for status in (FlightStatusEnum.ARRIVED, FlightStatusEnum.CANCELED, FlightStatusEnum.DIVERTED):
+            with self.subTest(status=status):
+                self.flight.status = FlightStatusEnum.ENROUTE
+                alerts = self.update(status=status, arrival=provider_side(scheduled="17:50", revised="18:40"))
+                self.assertEqual([a.update_type for a in alerts], ["status"])
+
+    def test_time_alert_that_loses_the_snapshot_is_sent_next_update(self):
+        self.flight.departure.gate = "A1"
+        alerts = self.update(arrival=provider_side(scheduled="17:50", predicted="17:35"),
+                             departure=provider_side(scheduled="14:20", revised="14:20", runway="14:24", gate="B9"))
+        self.assertEqual([a.update_type for a in alerts], ["gate"])
+        self.assertEqual(self.notified, {"Arrival": utc("17:50")})
+
+        [alert] = self.update(arrival=provider_side(scheduled="17:50", predicted="17:36"),
+                              departure=provider_side(scheduled="14:20", revised="14:20", runway="14:24", gate="B9"))
+        self.assertEqual((alert.update_type, alert.body_loc_args), ("time", ["AC907", "14"]))
+        self.assertEqual(self.notified, {"Arrival": utc("17:36")})
+
+    def test_threshold_is_ten_minutes_either_way(self):
+        self.assertEqual(TIME_ALERT_MINUTES, 10)
+        self.notified["Arrival"] = utc("17:50")
+        self.assertEqual(self.update(arrival=provider_side(scheduled="17:50", revised="17:41")), [])
+        [alert] = self.update(arrival=provider_side(scheduled="17:50", revised="17:40"))
+        self.assertEqual(alert.body_loc_args, ["AC907", "10"])
+
+    def test_baselines_persist_per_flight_and_direction(self):
+        engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        SQLModel.metadata.create_all(engine, tables=[Flight.__table__, FlightTimeNotice.__table__])
+        with Session(engine) as session:
+            save_notified_times(session, 7, {"Arrival": utc("18:01")})
+            session.commit()
+            save_notified_times(session, 7, {"Arrival": utc("18:20"), "Departure": utc("14:30")})
+            save_notified_times(session, 8, {"Arrival": utc("09:00")})
+            session.commit()
+            self.assertEqual(load_notified_times(session, 7), {"Arrival": utc("18:20"), "Departure": utc("14:30")})
+            self.assertEqual(load_notified_times(session, 9), {})
 
 
 class LocalizedPushMigrationTests(unittest.TestCase):

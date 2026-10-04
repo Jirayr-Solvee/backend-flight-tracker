@@ -16,7 +16,8 @@ from ..models.user import User
 from ..services.apn.service import ApnService
 from ..services.apn.live_activity import LiveActivityService
 from ..services.apn.utils import (extract_all_notifications_for_flight,
-                                  increase_notifications_of_users)
+                                  increase_notifications_of_users,
+                                  load_notified_times, save_notified_times)
 from ..services.app_store.service import AppStoreService
 from ..services.revenue_measurement import refresh_current_entitlement, upsert_verified_transaction, upsert_verified_revenue_event
 from ..services.subscription_lifecycle import upsert_subscription_lifecycle_event
@@ -101,10 +102,19 @@ async def receive_aerodatabox_update(
 
             devices_info = ApnService.get_devices_payload_for_a_flight(session=session, flight_id=db_flight.id)  # type: ignore
 
+            notified_times = load_notified_times(session, db_flight.id)  # type: ignore[arg-type]
             notification_batchs = extract_all_notifications_for_flight(
-                flight=db_flight, webhook_flight=f, devices_info=devices_info
+                flight=db_flight, webhook_flight=f, devices_info=devices_info,
+                notified_times=notified_times,
             )
-            logger.info(f"how many notificaions {len(notification_batchs)}, notification_batchs = {notification_batchs}")
+            save_notified_times(session, db_flight.id, notified_times)  # type: ignore[arg-type]
+            # Types only: batches carry device tokens and user identifiers.
+            logger.info(
+                "flight_update_alerts flight_id=%s alerts=%s devices=%d",
+                db_flight.id,
+                [batch.notification.update_type for batch in notification_batchs],
+                len(devices_info),
+            )
             global_notification_batchs.extend(notification_batchs)
 
             FlightPersistence.update_flight_from_webhook_data(
