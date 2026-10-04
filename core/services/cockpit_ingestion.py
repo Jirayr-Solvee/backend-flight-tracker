@@ -29,6 +29,13 @@ ACTUAL_ACTION = re.compile(r'\b(?:DIVERT(?:ING|ED)? TO|RETURN(?:ING|ED)? TO|GO[ 
 BULLETIN = re.compile(r'\b(?:ATIS|SIGMET|NOTAM|TAF|AIRMET)\b', re.I)
 HUMAN_MOMENT = re.compile(r'\b(?:BIRTHDAY|RETIREMENT|CONGRATULATIONS|CHRISTMAS)\b', re.I)
 STRIKE_ADVISORY = re.compile(r'\b(?:RISK|WARNING|POSSIBLE|FORECAST|ADVISORY|HAZARD|PREVENTION)\b', re.I)
+# Automated climb/cruise speed uplinks sent to whole fleets, not aircraft events.
+PERFORMANCE_ADVISORY = re.compile(r'\b(?:OPTICLIMB|REVERT TO MANAGED SPEED|USE (?:FMC )?(?:ECON SPD|STANDARD SPEEDS))\b', re.I)
+# Airport broadcast vocabulary (closures, frequencies, obstacles). Three distinct
+# terms mark a notice relayed to every arrival, not one aircraft's situation.
+AIRPORT_NOTICE = tuple(re.compile(pattern, re.I) for pattern in (
+    r'\bTWY\b', r'\bCLSD\b', r'\bHOLDING PAD\b', r'\b(?:TOWER|TWR|GND|GROUND) FREQ\b', r'\bCRANE\b',
+    r'\bCONDITION CODES?\b', r'\bADVZYS?\b', r'\bCTC (?:GC|GND|GROUND)\b', r'\bWAKE TURBULENCE\b.{0,6}STANDARDS\b'))
 
 
 def init_store(path):
@@ -88,6 +95,26 @@ def routine_message(text):
         return True
     if 'LIVE ANIMAL' in upper and ('TEMPERATURE' in upper or 'COMPARTMENT' in upper):
         return True
+    if PERFORMANCE_ADVISORY.search(upper):
+        return True
+    if sum(1 for pattern in AIRPORT_NOTICE if pattern.search(upper)) >= 3:
+        return True
+    return False
+
+
+def story_identity(story):
+    """One story per aircraft and headline: re-sent alerts and standing notices
+    differ in raw text but describe the same thing."""
+    registration=str(story.get('registration') or '').upper().replace('-','')
+    title=' '.join(str(story.get('title') or '').lower().split())
+    return (registration,title) if registration and title else None
+
+
+def duplicate_story(db, story):
+    identity=story_identity(story)
+    if identity is None:return False
+    for (payload,) in db.execute("SELECT payload FROM cockpit_stories WHERE REPLACE(registration,'-','')=?",(identity[0],)):
+        if story_identity(json.loads(payload))==identity:return True
     return False
 
 
@@ -222,6 +249,20 @@ def suppress_routine_pending(db):
     return len(ids)
 
 
+def retire_duplicate_stories(db):
+    """Keep the first story for each aircraft and headline; remove later copies."""
+    seen=set();ids=[]
+    for key,payload in db.execute('SELECT id,payload FROM cockpit_stories ORDER BY received,id'):
+        identity=story_identity(json.loads(payload))
+        if identity is None:continue
+        if identity in seen:ids.append((key,))
+        else:seen.add(identity)
+    with db:
+        db.executemany('DELETE FROM cockpit_stories WHERE id=?',ids)
+        db.executemany("UPDATE cockpit_queue SET status='duplicate' WHERE id=? AND status='published'",ids)
+    return len(ids)
+
+
 def retire_routine_stories(db):
     """Remove previously published boilerplate using its saved source excerpt."""
     ids=[]
@@ -314,7 +355,7 @@ def validate_story(message,item):
 
 async def run(path,air_key,gem_key,client,targets=()):
     db=init_store(path)
-    metrics=dict(provider_requests=0,ai_requests=0,published=0,held=0,errors=0)
+    metrics=dict(provider_requests=0,ai_requests=0,published=0,held=0,duplicates=0,errors=0)
     started=time.monotonic();now=datetime.now(timezone.utc)
     cutoff=utc_string(now-timedelta(days=7))
     with db:
@@ -361,6 +402,7 @@ async def run(path,air_key,gem_key,client,targets=()):
             with db:db.execute("INSERT OR REPLACE INTO cockpit_metadata VALUES ('updated_at',?)",(utc_string(datetime.now(timezone.utc)),))
         metrics['suppressed']=suppress_routine_pending(db)
         metrics['retired_stories']=retire_routine_stories(db)
+        metrics['retired_duplicates']=retire_duplicate_stories(db)
         pending=pending_messages(db,targets)
         for key,payload in pending:
             if time.monotonic()-started>330:break
@@ -380,17 +422,22 @@ async def run(path,air_key,gem_key,client,targets=()):
                 item=json.loads(''.join(p.get('text','') for p in choice['content']['parts']))
                 story=validate_story(message,item)
                 with db:
-                    if story:
+                    if story and duplicate_story(db,story):
+                        metrics['duplicates']+=1
+                        status='duplicate'
+                    elif story:
                         db.execute('INSERT OR IGNORE INTO cockpit_stories VALUES (?,?,?,?)',(key,message['receivedAt'],message['registration'],json.dumps(story)))
                         metrics['published']+=1
+                        status='published'
                     else:
                         metrics['held']+=1
                         if isinstance(item,dict) and item.get('needs_review') is True:
                             review_row={'id':message.get('providerId'),'tail':message['registration']}
                             recorded=record_review(db,review_row,key,parse_time(message['receivedAt']),'model_review')
                         else:recorded=False
-                    status='published' if story else ('review' if recorded else 'held')
-                    db.execute('UPDATE cockpit_queue SET status=?,payload=? WHERE id=?',(status,'{}' if status in ('published','review') else payload,key))
+                        status='review' if recorded else 'held'
+                    # Raw text is kept only while a message may still be retried.
+                    db.execute('UPDATE cockpit_queue SET status=?,payload=? WHERE id=?',(status,'{}' if status in ('published','review','duplicate') else payload,key))
             except Exception as exc:
                 metrics['errors']+=1
                 reason='ai_'+type(exc).__name__

@@ -195,4 +195,61 @@ class IngestionTests(unittest.TestCase):
         asyncio.run(run())
         self.assertEqual(self.db.execute('SELECT before_id FROM cockpit_cursor').fetchone()[0],1)
 
+    def test_fleet_advisories_and_airport_notices_are_not_aircraft_events(self):
+        # Wording observed in the published feed, sent to many aircraft at once.
+        for text in ('COMPUTED UP TO FL240 REVERT TO MANAGED SPEED ABOVE FL240 DO NOT USE OPTICLIMB SPEEDS IF ACTUAL TOW ABOVE 82282 KG',
+                     'STANDARD SPEEDS IF ACTUAL TOW ABOVE 68544 USE STANDARD SPEEDS IF TURBULENCE OR TEMPERATURE INVERSION IS EXPECTED',
+                     'RUNWAY 9R HOLDING PAD CLSD. TWY Y CLSD BTN RWY 27L AND UPS RAMP. TOWER FREQ 118.5 FOR ALL RUNWAYS.',
+                     "CONSOLIDATED WAKE TURBULENCE . STANDARDS IN EFFECT. 222' CRANE IS DOWN. AT GATES 18, 20 CTC GC FOR PUSHBACK."):
+            self.assertTrue(c.routine_message(text),text)
+        # One aircraft's own situation stays eligible, even near airport vocabulary.
+        for text in ('HOLDING AT TWY B DUE RWY CLSD',
+                     'APU INOP PROCEDURES CAUSED LATE BRAKE RELEASE',
+                     'LENGTHY TARMAC DELAY OFF GATE FOR 60 MINS. FLIGHT MUST BE AIRBORNE OR RETURNING TO GATE',
+                     'DIVERTING TO KIAH DUE RWY CLSD TWY CLSD TOWER FREQ OUT'):
+            self.assertFalse(c.routine_message(text),text)
+    def stored_story(self,key,registration,title,minutes_ago):
+        return dict(id=key,registration=registration,title=title,transmission='NEED GPU UPON ARRIVAL APU INOP',
+                    receivedAt=c.utc_string(self.now-timedelta(minutes=minutes_ago)))
+    def test_retire_duplicate_stories_keeps_first_per_aircraft_headline(self):
+        stories=[self.stored_story('a'*24,'N475UA','Lengthy Tarmac Delay at KORD',30),
+                 self.stored_story('b'*24,'N475UA','lengthy  tarmac delay at KORD',29),  # re-sent alert
+                 self.stored_story('c'*24,'C-FJGZ','APU Inoperative',20),
+                 self.stored_story('d'*24,'CFJGZ','APU Inoperative',10),  # same aircraft, other tail format
+                 self.stored_story('e'*24,'N475UA','Returned to gate at KORD',5),
+                 self.stored_story('f'*24,'N123AB','Lengthy Tarmac Delay at KORD',5)]
+        with self.db:
+            for story in stories:
+                self.db.execute('INSERT INTO cockpit_stories VALUES (?,?,?,?)',
+                                (story['id'],story['receivedAt'],story['registration'],json.dumps(story)))
+                self.db.execute('INSERT INTO cockpit_queue VALUES (?,?,?,?)',(story['id'],story['receivedAt'],'{}','published'))
+        self.assertEqual(c.retire_duplicate_stories(self.db),2)
+        self.assertEqual(c.retire_duplicate_stories(self.db),0)
+        self.assertEqual({row[0] for row in self.db.execute('SELECT id FROM cockpit_stories')},{'a'*24,'c'*24,'e'*24,'f'*24})
+        statuses=dict(self.db.execute('SELECT id,status FROM cockpit_queue').fetchall())
+        self.assertEqual((statuses['b'*24],statuses['d'*24],statuses['a'*24]),('duplicate','duplicate','published'))
+        self.assertTrue(c.duplicate_story(self.db,dict(registration='N475-UA',title='Lengthy tarmac delay at KORD')))
+        self.assertFalse(c.duplicate_story(self.db,dict(registration='N475UA',title='Bird strike on climb out')))
+    def test_same_aircraft_headline_is_not_published_twice(self):
+        rows=[self.row(),dict(self.row(),id=101,text='NEED GPU UPON ARRIVAL APU INOP PLEASE CONFIRM STAND')]
+        served=[]
+        def handler(req):
+            if req.method=='GET':
+                row=rows[min(len(served),len(rows)-1)];served.append(row['id'])
+                return httpx.Response(200,json=[row])
+            data=dict(publish=True,needs_review=False,category='Operations',title='Ground power requested',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
+            return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(data)}]}}]})
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                with patch.object(c,'TERMS',('NEED GPU',)),patch.object(c.asyncio,'sleep',return_value=None):
+                    first=await c.run(self.path,'air','gem',client)
+                    self.db.execute('DELETE FROM cockpit_cursor');self.db.commit()
+                    second=await c.run(self.path,'air','gem',client)
+            return first,second
+        first,second=asyncio.run(run())
+        self.assertEqual((first['published'],second['published'],second['duplicates']),(1,0,1))
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_stories').fetchone()[0],1)
+        # The duplicate's raw text is discarded like a published message's.
+        self.assertEqual(self.db.execute("SELECT payload FROM cockpit_queue WHERE status='duplicate'").fetchone(),('{}',))
+
 if __name__=='__main__':unittest.main()
