@@ -293,4 +293,34 @@ class IngestionTests(unittest.TestCase):
         chosen=[json.loads(payload)['text'] for _,payload in c.pending_messages(self.db)]
         self.assertEqual(chosen,['SMOKE IN AFT GALLEY','ITS OUR FIRST OFFICERS BIRTHDAY TODAY'])
 
+    def test_searches_never_reach_back_past_the_catch_up_window(self):
+        now=datetime(2026,10,5,12,0,tzinfo=timezone.utc)
+        floor=c.utc_string(now-timedelta(hours=c.CATCHUP_HOURS))
+        self.assertEqual(c.fresh_cursor(None,now),(floor,None,None))
+        stale=('2026-09-27T19:10:05Z','2026-09-28T19:10:05Z',123)  # a week-old backlog is skipped
+        self.assertEqual(c.fresh_cursor(stale,now),(floor,None,None))
+        recent=('2026-10-05T11:30:00Z','2026-10-05T11:50:00Z',456)
+        self.assertEqual(c.fresh_cursor(recent,now),recent)
+    def test_stale_pending_messages_expire_and_lose_their_text(self):
+        now=datetime.now(timezone.utc)
+        with self.db:
+            for key,hours,status in (('a'*24,13,'pending'),('b'*24,1,'pending'),('c'*24,30,'held')):
+                stamp=c.utc_string(now-timedelta(hours=hours))
+                self.db.execute('INSERT INTO cockpit_queue VALUES (?,?,?,?)',(key,stamp,json.dumps(dict(text='DIVERTING TO KIAH')),status))
+        self.assertEqual(c.expire_stale_pending(self.db,now),1)
+        rows=dict((key,(status,payload)) for key,status,payload in self.db.execute('SELECT id,status,payload FROM cockpit_queue'))
+        self.assertEqual(rows['a'*24],('expired','{}'))
+        self.assertEqual(rows['b'*24][0],'pending')
+        self.assertEqual(rows['c'*24][0],'held')
+        # Messages older than the freshness window never enter the queue.
+        before=self.db.execute('SELECT COUNT(*) FROM cockpit_queue').fetchone()[0]
+        self.queue('N9OLD','BIRD STRIKE ON CLIMB OUT',minutes_ago=13*60)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_queue').fetchone()[0],before)
+    def test_serious_wording_takes_every_other_slot(self):
+        for i in range(3):self.queue(f'N{i}SM',f'SMOKE IN AFT GALLEY {i}')
+        self.queue('N7BD','ITS OUR FIRST OFFICERS BIRTHDAY TODAY')
+        self.queue('N8BS','BIRD STRIKE ON CLIMB OUT')
+        chosen=[json.loads(payload)['text'] for _,payload in c.pending_messages(self.db)]
+        self.assertEqual(['SMOKE' in text for text in chosen],[True,False,True,False,True])
+
 if __name__=='__main__':unittest.main()

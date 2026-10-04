@@ -14,7 +14,8 @@ from .cockpit_ingestion import routine_message
 from .cockpit_tracking import load_targets, matches
 from .cockpit_importance import alert_worthy, importance_key, with_tier
 
-SHARED_STORY_MAX_AGE = timedelta(hours=72)
+# A shared alert is news: never about a message older than a day.
+SHARED_STORY_MAX_AGE = timedelta(hours=24)
 FLIGHT_STORY_MAX_AGE = timedelta(hours=2)
 
 

@@ -197,9 +197,9 @@ class StoryPushTests(unittest.TestCase):
                                  releases={('3.9.3',142)},now=self.now))
 
     def test_campaign_ranks_importance_not_category(self):
-        def story(key,title,text,interest,category):
+        def story(key,title,text,interest,category,at=None):
             return with_tier(dict(id=key*24,title=title,summary='An explanation.',transmission=text,
-                                  receivedAt=utc_string(self.now-timedelta(minutes=10)),registration='N123',
+                                  receivedAt=utc_string((at or self.now)-timedelta(minutes=10)),registration='N123',
                                   interestScore=interest,category=category,translations={}))
         diversion=story('1','Diverting to HER due to storms','DIVERTING TO HER DUE TS',95,'Diversion')
         engine=story('2','Engine failure, diverting','ENG 2 FAILURE DIVERTING TO KDEN',60,'Operations')
@@ -213,12 +213,16 @@ class StoryPushTests(unittest.TestCase):
         self.assertIsNone(campaign_for(self.db,quiet,*slot_for(later,'UTC'),later))
         # Next day, after a route-change alert, another kind goes first despite a lower score.
         tomorrow=self.now+timedelta(days=1)
-        first=story('5','Diverting to EDDV','DIVERTING TO EDDV',90,'Diversion')
+        first=story('5','Diverting to EDDV','DIVERTING TO EDDV',90,'Diversion',tomorrow)
         self.assertEqual(campaign_for(self.db,[first],*slot_for(tomorrow,'UTC'),tomorrow)['id'],first['id'])
         evening=tomorrow.replace(hour=19)
-        route=story('6','Diverting to MDZ','DIVERTING TO MDZ',92,'Diversion')
-        cabin=story('7','Volcanic ash smell reported','VOLCANIC ASH SMELL',66,'Weather')
+        route=story('6','Diverting to MDZ','DIVERTING TO MDZ',92,'Diversion',evening)
+        cabin=story('7','Volcanic ash smell reported','VOLCANIC ASH SMELL',66,'Weather',evening)
         self.assertEqual(campaign_for(self.db,[first,route,cabin],*slot_for(evening,'UTC'),evening)['id'],cabin['id'])
+        # An alert is news: a day-old story is never sent, however important.
+        day_after=tomorrow+timedelta(days=1)
+        old=story('8','Smoke in the cabin','SMOKE IN CABIN',90,'Cabin',day_after-timedelta(hours=25))
+        self.assertIsNone(campaign_for(self.db,[old],*slot_for(day_after,'UTC'),day_after))
 
     def test_stale_and_unqualified_stories_do_not_fill_quota(self):
         async def send(*args): self.fail('must not send')

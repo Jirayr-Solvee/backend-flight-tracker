@@ -43,6 +43,12 @@ class ImportanceTests(unittest.TestCase):
             for title, text in examples:
                 self.assertEqual(classify(story('x', title, text, 70))[0], kind, title)
 
+    def test_equipment_and_reassurance_wording_is_not_serious(self):
+        for text in ('LAV SMOKE DETECTOR INOP', 'SMOKE HOOD MISSING ROW 12', 'NO SMOKE OR FUMES IN CABIN',
+                     'FIRE EXTINGUISHER SEAL BROKEN', 'FIRE LOOP FAULT ENG 2 ON GROUND TEST'):
+            self.assertNotEqual(classify(story('s', 'Crew report', text, 70))[0], 'safety', text)
+        self.assertEqual(classify(story('s', 'Smoke in the cabin', 'SMOKE IN CABIN', 70))[0], 'safety')
+
     def test_negated_and_conditional_actions_do_not_count(self):
         for text in ('NOT DIVERTING, CONTINUING TO DEST', 'IF DIVERTING ADVISE OPS',
                      'NO LONGER DIVERTING', 'UNABLE TO RETURN TO KIAH'):

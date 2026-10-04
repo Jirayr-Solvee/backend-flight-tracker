@@ -30,7 +30,11 @@ TERMS = CORE_TERMS + tuple(term for group in ROTATING_TERMS for term in group)
 # next, so common route changes never crowd out rarer stories, nor vanish.
 TARGET_SHARE = {'route': .30, 'weather': .15, 'strike': .15, 'crew': .10, 'cabin': .10,
                 'cargo': .10, 'other': .05, 'ground': .05}
-FRESH_CANDIDATE_HOURS = 48
+# The feed is news: a search never reaches further back than CATCHUP_HOURS (a
+# backlog that old is skipped, not caught up), and a message older than
+# FRESH_CANDIDATE_HOURS is never reviewed or published.
+CATCHUP_HOURS = 6
+FRESH_CANDIDATE_HOURS = 12
 MODEL = 'gemini-2.5-flash'
 MAX_AI_PER_RUN = 20
 RESERVE_USD = .02  # Includes all seven cached translations; same monthly/day/window caps.
@@ -142,9 +146,26 @@ def record_review(db, row, key, stamp, reason):
     return True
 
 
+def fresh_cursor(cursor, now):
+    """A search window never starts more than CATCHUP_HOURS ago."""
+    floor=now-timedelta(hours=CATCHUP_HOURS)
+    since,until,before=cursor or (utc_string(floor),None,None)
+    if parse_time(since)<floor:return utc_string(floor),None,None
+    return since,until,before
+
+
+def expire_stale_pending(db, now):
+    """Unreviewed messages past the freshness window are not news: retire them
+    and drop their raw text now instead of keeping it for the full week."""
+    cutoff=utc_string(now-timedelta(hours=FRESH_CANDIDATE_HOURS))
+    with db:
+        return db.execute("UPDATE cockpit_queue SET status='expired',payload='{}' WHERE status='pending' AND received < ?",
+                          (cutoff,)).rowcount
+
+
 def queue_message(db,row,now,*,tracked=False):
     stamp=parse_time(row.get('timestamp')); text=row.get('text');tail=row.get('tail')
-    if not stamp or not now-timedelta(days=7)<=stamp<=now+timedelta(minutes=1):return
+    if not stamp or not now-timedelta(hours=FRESH_CANDIDATE_HOURS)<=stamp<=now+timedelta(minutes=1):return
     if not isinstance(text,str) or not 8<=len(text)<=1800:return
     if not isinstance(tail,str) or not re.fullmatch(r'[A-Za-z0-9-]{3,12}',tail):return
     text=re.sub(r'\s+',' ',text).strip()
@@ -232,10 +253,11 @@ def run_terms(now):
 
 
 def pending_messages(db, targets=(), now=None):
-    """Spend scarce reviews where the feed needs them: tracked flights and
-    serious events first, then the kind furthest below its target share of
-    the last day's stories. Within a kind, specific actions and fresh messages
-    first, and one message per aircraft while others wait."""
+    """Spend scarce reviews where the feed needs them. Every other slot goes
+    to tracked flights or serious wording (when waiting); the rest to the kind
+    furthest below its target share of the last day's stories. Only fresh
+    messages; within a kind, specific actions and the newest first, one per
+    aircraft while others wait."""
     if MAX_AI_PER_RUN <= 0:return []
     now=now or datetime.now(timezone.utc)
     fresh=utc_string(now-timedelta(hours=FRESH_CANDIDATE_HOURS))
@@ -246,9 +268,10 @@ def pending_messages(db, targets=(), now=None):
         message=json.loads(payload)
         if routine_message(message['text']):continue
         kind=classify({'transmission':message['text']})[0]
+        if message['receivedAt']<fresh:continue
         entry=(candidate_priority(message,targets),message['receivedAt'],key,payload,message['registration'])
         if entry[0]==100 or kind=='safety':urgent.append(entry)
-        elif message['receivedAt']>=fresh:by_kind[kind].append(entry)
+        else:by_kind[kind].append(entry)
     urgent.sort(reverse=True)
     for entries in by_kind.values():entries.sort(reverse=True)
     selected=[];registrations=set();picked=Counter()
@@ -256,12 +279,16 @@ def pending_messages(db, targets=(), now=None):
         index=next((i for i,entry in enumerate(entries) if entry[4] not in registrations),0)
         entry=entries.pop(index)
         selected.append((entry[2],entry[3]));registrations.add(entry[4])
-    while urgent and len(selected)<MAX_AI_PER_RUN:take(urgent)
-    while len(selected)<MAX_AI_PER_RUN and any(by_kind.values()):
-        total=sum(published.values())+sum(picked.values())+1
-        kind=max((name for name,entries in by_kind.items() if entries),
-                 key=lambda name:(TARGET_SHARE.get(name,.05)*total-published[name]-picked[name],KIND_WEIGHT.get(name,0)))
-        take(by_kind[kind]);picked[kind]+=1
+    urgent_turn=True
+    while len(selected)<MAX_AI_PER_RUN and (urgent or any(by_kind.values())):
+        if urgent and (urgent_turn or not any(by_kind.values())):
+            take(urgent)
+        else:
+            total=sum(published.values())+sum(picked.values())+1
+            kind=max((name for name,entries in by_kind.items() if entries),
+                     key=lambda name:(TARGET_SHARE.get(name,.05)*total-published[name]-picked[name],KIND_WEIGHT.get(name,0)))
+            take(by_kind[kind]);picked[kind]+=1
+        urgent_turn=not urgent_turn
     return selected
 
 
@@ -333,7 +360,7 @@ async def ingest_tracked(db, targets, air_key, client, metrics, started, now):
                 await asyncio.sleep(.65)
         key='tracked:'+reg
         cursor=db.execute('SELECT since,until_time,before_id FROM cockpit_cursor WHERE term=?',(key,)).fetchone()
-        since,until,before=cursor or (utc_string(now-timedelta(hours=24)),None,None)
+        since,until,before=fresh_cursor(cursor,now)
         until=until or utc_string(now)
         for _ in range(2):
             if calls>=8 or time.monotonic()-started>100:break
@@ -398,7 +425,7 @@ async def run(path,air_key,gem_key,client,targets=()):
             if time.monotonic()-started>180:
                 metrics['errors']+=1;break
             cursor=db.execute('SELECT since,until_time,before_id FROM cockpit_cursor WHERE term=?',(term,)).fetchone()
-            since,until,before=cursor or (utc_string(now-timedelta(hours=24)),None,None)
+            since,until,before=fresh_cursor(cursor,now)
             until=until or utc_string(now)
             for _ in range(2):
                 if not api_allowance(db,datetime.now(timezone.utc)):
@@ -431,6 +458,7 @@ async def run(path,air_key,gem_key,client,targets=()):
         metrics['suppressed']=suppress_routine_pending(db)
         metrics['retired_stories']=retire_routine_stories(db)
         metrics['retired_duplicates']=retire_duplicate_stories(db)
+        metrics['expired']=expire_stale_pending(db,now)
         pending=pending_messages(db,targets)
         for key,payload in pending:
             if time.monotonic()-started>330:break

@@ -48,7 +48,9 @@ _NEGATED = re.compile(r'\b(?:NOT|NO LONGER|IF|AVOID|UNABLE TO|NO NEED TO|NO PLAN
 _NOT_A_RETURN = re.compile(r'\bRETURN(?:ING|ED|S)? TO (?:THE )?(?:SERVICE|NORMAL|SCHEDULE)\b')
 # Serious on its own: smoke, fire or fumes, an engine failure or in-flight
 # shutdown, a pressurization emergency, a rejected takeoff.
-_SERIOUS = re.compile(r'\bSMOKE\b|\bFIRE\b|\bFUMES?\b|\bBURNING\b'
+_SERIOUS = re.compile(r'\bSMOKE\b(?!\s*(?:DET\w*|HOOD|TEST\w*|CHECK\w*|GOGGLES|MASKS?|BARRIER|SENSORS?))'
+                      r'|\bFIRE\b(?!\s*(?:EXT\w*|BOTTLES?|TEST\w*|LOOPS?|DET\w*|DRILL|DEP(?:T|ARTMENT)|TRUCKS?'
+                      r'|SERVICES?|STATION|PROTECTION))|\bFUMES?\b|\bBURNING\b'
                       r'|\bENG(?:INE)?\s*\d?\s*(?:FAIL(?:URE|ED)?|FIRE|FLAME ?OUT)\b|\bIFSD\b|\bIN ?FLIGHT SHUT ?DOWN\b'
                       r'|\bDEPRESSURI[SZ](?:ATION|ED)\b|\bEMERGENCY DESCENT\b|\bREJECTED (?:TAKE ?OFF|T/O)\b')
 # A diversion, return or strike with a technical cause is serious too.
@@ -62,7 +64,8 @@ _TECHNICAL = re.compile(r'\b(?:ENG(?:INE)?S?|HYD(?:RAULIC)?S?|PRESSURI[SZ]ATION|
                         r'|\bCRACK(?:ED)?\b|\bDAMAGED?\b|\bMALFUNCTION\b|\bFAIL(?:URE|ED)\b|\bVIBRATIONS?\b'
                         r'|\bTECH(?:NICAL)? (?:ISSUES?|PROBLEMS?)\b')
 # Reassurance, and possible or planned actions, never escalate.
-_NO_ISSUE = re.compile(r'\bNO (?:DAMAGE|ISSUES?|PROBLEMS?|ABNORMALIT(?:Y|IES))\b|\bALL (?:OK|NORMAL)\b'
+_NO_ISSUE = re.compile(r'\bNO (?:DAMAGE|ISSUES?|PROBLEMS?|ABNORMALIT(?:Y|IES))\b'
+                       r'|\bNO (?:SMOKE|FIRE|FUMES?)(?:\s*(?:OR|AND|/|,)\s*(?:SMOKE|FIRE|FUMES?))*\b|\bALL (?:OK|NORMAL)\b'
                        r'|\bNORMAL PARAMETERS\b|\bPARAMETROS NORMALES\b')
 _TENTATIVE = re.compile(r'\b(?:MAY|MIGHT|COULD|POSSIBLE|POSSIBLY|PLAN(?:NING|S)?|CONSIDER(?:ING)?|OFF CHANCE)\b'
                         r'(?:\s+\w+){0,3}?\s+(?:DIVERT\w*|DIVERSION|RETURN\w*)')
