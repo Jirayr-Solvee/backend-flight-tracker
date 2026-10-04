@@ -58,7 +58,7 @@ def candidates(path, now):
                     and not routine_message(story['transmission'])
                     and received and received <= now):
                 result.append(with_tier(story))
-        return sorted(result, key=importance_key, reverse=True)
+        return sorted(result, key=lambda story: importance_key(story, now), reverse=True)
 
 
 def fingerprint(story):
@@ -82,7 +82,7 @@ def campaign_for(db, stories, day, slot, now):
                      and fingerprint(s) not in used]
         # Most important first: tier, then editorial interest. A category not
         # already sent today only breaks an exact tie; recency breaks the rest.
-        available.sort(key=lambda s: (importance_key(s)[:2], s.get('category') not in today_categories,
+        available.sort(key=lambda s: (importance_key(s, now)[:2], s.get('category') not in today_categories,
                                       s['receivedAt'], s['id']), reverse=True)
         story = available[0] if available else None
         if story:

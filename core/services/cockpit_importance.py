@@ -7,12 +7,15 @@ reads the published headline and excerpt, so stories stored before tiers
 existed are ranked exactly like new ones.
 """
 import re
+from datetime import datetime, timezone
 
 TIERS = ('major', 'notable', 'background')
 TIER_RANK = {'major': 2, 'notable': 1, 'background': 0}
 # Shared alerts: a major event with a real story, or only the strongest notable ones.
 ALERT_FLOOR = {'major': 50, 'notable': 70}
 TOP_WINDOW_HOURS = 72
+# Within a tier, a day of age costs as much as 10 points of editorial interest.
+DECAY_POINTS_PER_DAY = 10
 
 # Regulatory tarmac-delay uplinks say "...AIRBORNE OR RETURNING TO GATE": a
 # delay notice, not a return.
@@ -54,11 +57,23 @@ def with_tier(story):
     return dict(story, tier=story_tier(story.get('title'), story.get('transmission')))
 
 
-def importance_key(story):
-    """Sort key: tier, then editorial interest, then recency."""
+def importance_key(story, now=None):
+    """Sort key: tier, then editorial interest (aged when `now` is given), then recency."""
     interest = story.get('interestScore')
-    return (TIER_RANK.get(story.get('tier'), 0), interest if type(interest) is int else 0,
+    interest = interest if type(interest) is int else 0
+    received = _parse(story.get('receivedAt'))
+    if now is not None and received is not None:
+        interest -= max(0.0, (now - received).total_seconds()) / 86400 * DECAY_POINTS_PER_DAY
+    return (TIER_RANK.get(story.get('tier'), 0), round(interest),
             story.get('receivedAt') or '', story.get('id') or '')
+
+
+def _parse(value):
+    try:
+        parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+    except (ValueError, TypeError):
+        return None
 
 
 def alert_worthy(story):

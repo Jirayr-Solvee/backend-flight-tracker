@@ -45,6 +45,15 @@ class ImportanceTests(unittest.TestCase):
         ranked = sorted([background, notable, major], key=importance_key, reverse=True)
         self.assertEqual([story['id'] for story in ranked], ['a', 'b', 'c'])
 
+    def test_fresher_story_wins_within_a_tier_but_never_across_tiers(self):
+        from datetime import datetime, timezone
+        now = datetime(2026, 10, 4, 18, 0, tzinfo=timezone.utc)
+        older = dict(tier='major', interestScore=75, receivedAt='2026-10-02T18:00:00Z', id='old')
+        today = dict(tier='major', interestScore=70, receivedAt='2026-10-04T09:00:00Z', id='new')
+        fresh_notable = dict(tier='notable', interestScore=95, receivedAt='2026-10-04T17:59:00Z', id='notable')
+        ranked = sorted([older, fresh_notable, today], key=lambda s: importance_key(s, now), reverse=True)
+        self.assertEqual([story['id'] for story in ranked], ['new', 'old', 'notable'])
+
     def test_alert_floor_by_tier(self):
         self.assertTrue(alert_worthy(dict(tier='major', interestScore=50)))
         self.assertFalse(alert_worthy(dict(tier='major', interestScore=49)))
