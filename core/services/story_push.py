@@ -12,8 +12,8 @@ from zoneinfo import ZoneInfo
 from .cockpit_stories import parse_time, utc_string
 from .cockpit_ingestion import routine_message
 from .cockpit_tracking import load_targets, matches
+from .cockpit_importance import alert_worthy, importance_key, with_tier
 
-MIN_SHARED_SCORE = 65
 SHARED_STORY_MAX_AGE = timedelta(hours=72)
 FLIGHT_STORY_MAX_AGE = timedelta(hours=2)
 
@@ -57,8 +57,8 @@ def candidates(path, now):
                     and isinstance(story.get('transmission'), str)
                     and not routine_message(story['transmission'])
                     and received and received <= now):
-                result.append(story)
-        return sorted(result, key=lambda x: (x['interestScore'], x['receivedAt'], x['id']), reverse=True)
+                result.append(with_tier(story))
+        return sorted(result, key=importance_key, reverse=True)
 
 
 def fingerprint(story):
@@ -77,13 +77,13 @@ def campaign_for(db, stories, day, slot, now):
         cutoff = int(now.timestamp()) - 90*86400
         used = {row[0] for row in db.execute('SELECT story_fingerprint FROM storypushcampaign WHERE created_at>?', (cutoff,))}
         today_categories = {row[0] for row in db.execute('SELECT category FROM storypushcampaign WHERE day=?', (day,))}
-        available = [s for s in stories if s['interestScore'] >= MIN_SHARED_SCORE
+        available = [s for s in stories if alert_worthy(s)
                      and now-parse_time(s['receivedAt']) <= SHARED_STORY_MAX_AGE
                      and fingerprint(s) not in used]
-        # Prefer an aircraft event and a category not already sent today.
-        rank = {'Diversion': 5, 'Cabin': 4, 'Operations': 3, 'Crew': 2, 'Weather': 1, 'Cargo': 0}
-        available.sort(key=lambda s: (s.get('category') not in today_categories,
-                                      rank.get(s.get('category'), 0), s['interestScore'], s['receivedAt']), reverse=True)
+        # Most important first: tier, then editorial interest. A category not
+        # already sent today only breaks an exact tie; recency breaks the rest.
+        available.sort(key=lambda s: (importance_key(s)[:2], s.get('category') not in today_categories,
+                                      s['receivedAt'], s['id']), reverse=True)
         story = available[0] if available else None
         if story:
             db.execute('INSERT INTO storypushcampaign VALUES (?,?,?,?,?,?)',

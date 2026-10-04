@@ -1,6 +1,8 @@
 """HTTP boundary tests, with legacy model initialization confined to scratch."""
+import json
 import os
 import tempfile
+from contextlib import closing
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,7 +17,7 @@ try:
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from core.routers.cockpit import router, get_current_user
-    from core.services.cockpit_stories import save_messages, utc_string
+    from core.services.cockpit_stories import open_store, save_messages, utc_string
 finally:
     os.chdir(_previous_cwd)
 
@@ -63,6 +65,30 @@ class CockpitAPITests(unittest.TestCase):
         self.assertEqual(len(response.json()['stories']),1)
         self.assertEqual(self.client.get('/cockpit/stories?registration=OE-OTHER').json()['stories'],[])
         self.assertEqual(self.client.get('/cockpit/stories?registration=%27%20OR%201=1').status_code,422)
+
+    def test_top_sort_ranks_importance_and_default_order_is_unchanged(self):
+        self.app.dependency_overrides[get_current_user] = lambda: object()
+        now=datetime.now(timezone.utc)
+        stories=[('a'*24,'Ground power requested','NEED GPU UPON ARRIVAL',95,1),
+                 ('b'*24,'Holding over Frankfurt','HOLDING DUE TRAFFIC',90,2),
+                 ('c'*24,'Flight diverts to Denver','DIVERTING TO KDEN',55,3),
+                 ('d'*24,'Earlier diversion','DIVERTING TO KIAH',99,80*60)]
+        with closing(open_store(self.path)) as db, db:
+            db.execute("INSERT INTO cockpit_metadata VALUES ('updated_at',?)",(utc_string(now),))
+            for key,title,text,interest,minutes in stories:
+                received=utc_string(now-timedelta(minutes=minutes))
+                story=dict(id=key,title=title,transmission=text,interestScore=interest,receivedAt=received,registration='N123AB')
+                db.execute('INSERT INTO cockpit_stories VALUES (?,?,?,?)',(key,received,'N123AB',json.dumps(story)))
+        # Older app versions: same newest-first page, with an additional tier field.
+        latest=self.client.get('/cockpit/stories').json()
+        self.assertEqual([story['id'] for story in latest['stories']],['a'*24,'b'*24,'c'*24,'d'*24])
+        self.assertEqual([story['tier'] for story in latest['stories']],['background','notable','major','major'])
+        # A major event outranks a higher-scored notable one; background and >72 h stay out.
+        top=self.client.get('/cockpit/stories?sort=top').json()
+        self.assertEqual([story['id'] for story in top['stories']],['c'*24,'b'*24])
+        self.assertIsNone(top['nextCursor'])
+        self.assertEqual(self.client.get('/cockpit/stories/'+'b'*24).json()['tier'],'notable')
+        self.assertEqual(self.client.get('/cockpit/stories?sort=popular').status_code,422)
 
     def test_corrupt_cache_does_not_leak_sql_or_traceback(self):
         self.app.dependency_overrides[get_current_user] = lambda: object()

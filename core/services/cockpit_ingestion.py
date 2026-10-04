@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from .cockpit_stories import open_store, parse_time, utc_string
 from .cockpit_tracking import matches, tail
+from .cockpit_importance import story_tier
 
 TERMS = ('DEVIATING', 'DIVERTING', 'HOLDING', 'RETURNING', 'TURBULENCE',
          'BIRTHDAY', 'RETIREMENT', 'CONGRATULATIONS', 'CHRISTMAS',
@@ -350,7 +351,8 @@ def validate_story(message,item):
     return dict(id=message['id'],title=item['title'],summary=item['summary'],category=item['category'], translations=item['translations'],
                 flight=message['flight'],registration=message['registration'],receivedAt=message['receivedAt'],
                 transmission=item['excerpt'],latitude=None,longitude=None,
-                interestScore=item['interest'],notificationEligible=item['interest'] >= 65)
+                interestScore=item['interest'],notificationEligible=item['interest'] >= 65,
+                tier=story_tier(item['title'],item['excerpt']))
 
 
 async def run(path,air_key,gem_key,client,targets=()):

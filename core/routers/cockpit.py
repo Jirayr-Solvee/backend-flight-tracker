@@ -9,6 +9,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from ..dependency import get_current_user
 from ..services.cockpit_stories import read_stories, decode_cursor, utc_string
+from ..services.cockpit_importance import with_tier
 from ..services.cockpit_tracking import load_targets
 
 router = APIRouter()
@@ -27,7 +28,7 @@ def story_detail(story_id: str, user=Depends(get_current_user)):
             row = db.execute('SELECT payload FROM cockpit_stories WHERE id=? AND received>=?',
                              (story_id, utc_string(datetime.now(timezone.utc)-timedelta(days=7)))).fetchone()
         if not row: raise HTTPException(404, 'Message no longer available')
-        return json.loads(row[0])
+        return with_tier(json.loads(row[0]))
     except (sqlite3.Error, ValueError, OSError):
         raise HTTPException(503, 'Aircraft messages are temporarily unavailable') from None
 
@@ -41,13 +42,15 @@ def check_cursor(cursor):
 def stories(registration: str | None = Query(None, min_length=3, max_length=12, pattern=r'^[A-Za-z0-9-]+$'),
             limit: int = Query(20,ge=1,le=50), category: Category | None = None,
             cursor: str | None = Query(None,max_length=512),
+            sort: Literal['latest','top'] = 'latest',
             user=Depends(get_current_user)):
+    # Older app versions never send sort and keep the chronological, paged feed.
     check_cursor(cursor)
     path = os.environ.get('SOFLY_COCKPIT_DB')
     if not path:
         raise HTTPException(503, 'Aircraft messages are not available yet')
     try:
-        result = read_stories(path, registration,limit=limit,category=category,cursor=cursor)
+        result = read_stories(path, registration,limit=limit,category=category,cursor=cursor,sort=sort)
     except (sqlite3.Error, ValueError, OSError):
         raise HTTPException(503, 'Aircraft messages are temporarily unavailable') from None
     if result is None:

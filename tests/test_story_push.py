@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 from core.services.story_push import eligible, slot_for, reserve, dispatch, payload, campaign_for, candidates
 from core.services.cockpit_stories import open_store, utc_string
+from core.services.cockpit_importance import with_tier
 
 
 class StoryPushTests(unittest.TestCase):
@@ -37,7 +38,7 @@ class StoryPushTests(unittest.TestCase):
         self.db.commit()
         self.stories = [dict(id=f'{i:024x}', title=f'Title {i}', summary='A supported explanation.',
             transmission=f'MESSAGE {i}', receivedAt=utc_string(self.now-timedelta(minutes=10)),
-            registration='N123', interestScore=90-i, notificationEligible=True, category='Operations',
+            registration='N123', interestScore=90-i, notificationEligible=True, category='Operations', tier='major',
             translations={'fr':dict(title='Un message',summary='Une explication.')} ) for i in range(6)]
         with open_store(self.feed) as db:
             db.execute("INSERT INTO cockpit_metadata VALUES ('updated_at',?)",(utc_string(self.now),))
@@ -194,6 +195,27 @@ class StoryPushTests(unittest.TestCase):
             asyncio.run(dispatch(self.database,self.feed,send,enabled=True,
                                  environment='production',qa_device_id='phone',
                                  releases={('3.9.3',142)},now=self.now))
+
+    def test_campaign_ranks_importance_not_category(self):
+        def story(key,title,text,interest,category):
+            return with_tier(dict(id=key*24,title=title,summary='An explanation.',transmission=text,
+                                  receivedAt=utc_string(self.now-timedelta(minutes=10)),registration='N123',
+                                  interestScore=interest,category=category,translations={}))
+        holding=story('1','Holding over Frankfurt','HOLDING DUE TRAFFIC',95,'Diversion')
+        strike=story('2','Bird strike on climb out','BIRD STRIKE ON CLIMB OUT',55,'Operations')
+        routine=story('3','Ground power requested','NEED GPU UPON ARRIVAL',100,'Cabin')
+        day,slot=slot_for(self.now,'UTC')
+        # A major event wins over a higher-scored notable one and a top-scored routine one.
+        self.assertEqual(campaign_for(self.db,[holding,strike,routine],day,slot,self.now)['id'],strike['id'])
+        # Only background or below-floor stories: the slot is skipped, not filled.
+        quiet=[routine,story('4','Holding briefly','HOLDING DUE TRAFFIC',65,'Operations')]
+        later=self.now.replace(hour=15)
+        self.assertIsNone(campaign_for(self.db,quiet,*slot_for(later,'UTC'),later))
+        # Equal importance: a category not sent today breaks the tie.
+        evening=self.now.replace(hour=19)
+        same=story('5','Bird strike on approach','BIRD STRIKE ON APPROACH',55,'Operations')
+        other=story('6','Lightning strike on descent','LIGHTNING STRIKE ON DESCENT',55,'Weather')
+        self.assertEqual(campaign_for(self.db,[same,other],*slot_for(evening,'UTC'),evening)['id'],other['id'])
 
     def test_stale_and_unqualified_stories_do_not_fill_quota(self):
         async def send(*args): self.fail('must not send')

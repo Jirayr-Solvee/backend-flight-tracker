@@ -12,7 +12,10 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .cockpit_importance import TOP_WINDOW_HOURS, importance_key, with_tier
+
 RETENTION = timedelta(days=7)
+SORTS = ('latest', 'top')
 
 
 def parse_time(value):
@@ -134,9 +137,10 @@ def decode_cursor(cursor):
         raise ValueError('Invalid message cursor') from None
 
 
-def read_stories(path, registration=None, now=None, flight=None, *, limit=50, category=None, cursor=None):
+def read_stories(path, registration=None, now=None, flight=None, *, limit=50, category=None, cursor=None, sort='latest'):
     boundary=decode_cursor(cursor)
     if not 1<=limit<=50:raise ValueError('Invalid page size')
+    if sort not in SORTS:raise ValueError('Invalid sort')
     now = now or datetime.now(timezone.utc)
     if not Path(path).is_file():
         return None
@@ -146,6 +150,9 @@ def read_stories(path, registration=None, now=None, flight=None, *, limit=50, ca
         updated = parse_time(meta[0]) if meta else None
         if updated is None or now - updated > timedelta(hours=2):
             return None
+        if sort == 'top' and not flight:
+            return {"stories": top_stories(connection, now, registration, category, limit),
+                    "updatedAt": utc_string(updated), "nextCursor": None}
         query = "SELECT id,received,payload FROM cockpit_stories WHERE received >= ? AND received <= ?"
         params = [utc_string(now - RETENTION), utc_string(now + timedelta(minutes=1))]
         if flight:
@@ -165,7 +172,7 @@ def read_stories(path, registration=None, now=None, flight=None, *, limit=50, ca
         stories=[]
         positions=[]
         for row in rows:
-            story=json.loads(row[2])
+            story=with_tier(json.loads(row[2]))
             if flight:
                 from .cockpit_tracking import matches
                 if not matches(story,flight):continue
@@ -178,3 +185,20 @@ def read_stories(path, registration=None, now=None, flight=None, *, limit=50, ca
         return {"stories": stories[:limit], "updatedAt": utc_string(updated), "nextCursor":next_cursor}
     finally:
         connection.close()
+
+
+def top_stories(connection, now, registration=None, category=None, limit=20):
+    """Major and notable stories from the last few days, most important first.
+    One bounded page: importance order has no stable cursor."""
+    query = "SELECT payload FROM cockpit_stories WHERE received >= ? AND received <= ?"
+    params = [utc_string(now - timedelta(hours=TOP_WINDOW_HOURS)), utc_string(now + timedelta(minutes=1))]
+    if registration:
+        query += " AND registration = ?"
+        params.append(registration.upper())
+    if category:
+        query += " AND json_extract(payload, '$.category') = ?"
+        params.append(category)
+    stories = [with_tier(json.loads(row[0])) for row in connection.execute(query, params)]
+    stories = [story for story in stories if story['tier'] != 'background']
+    stories.sort(key=importance_key, reverse=True)
+    return stories[:limit]
