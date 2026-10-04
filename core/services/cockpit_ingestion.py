@@ -5,18 +5,32 @@ import hashlib
 import json
 import re
 import time
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from .cockpit_stories import open_store, parse_time, utc_string
 from .cockpit_tracking import matches, tail
-from .cockpit_importance import assign_importance
+from .cockpit_importance import KIND_WEIGHT, assign_importance, classify, with_tier
 
-TERMS = ('DEVIATING', 'DIVERTING', 'HOLDING', 'RETURNING', 'TURBULENCE',
-         'BIRTHDAY', 'RETIREMENT', 'CONGRATULATIONS', 'CHRISTMAS',
-         'SPECIAL HANDLING', 'SMELL',
-         'OVEN OFF', 'IFE PANEL', 'CATERING', 'COFFEE', 'NEED GPU', 'APU INOP',
-         'GATE REQUEST', 'BIRD STRIKE', 'LIGHTNING STRIKE',
-         # These terms only enter the private, metadata-only review queue.
-         'MAYDAY', 'PAN PAN', 'HIJACK')
+# Searched every run: route changes, strikes, safety wording and the private
+# review terms (MAYDAY, PAN PAN and HIJACK only enter the metadata-only review
+# queue). The other groups alternate between runs; each term's cursor picks up
+# everything since its last search, so nothing is missed and the number of
+# provider requests per run stays flat.
+CORE_TERMS = ('DIVERTING', 'RETURNING', 'BIRD STRIKE', 'LIGHTNING STRIKE', 'SMOKE', 'FUMES', 'SMELL',
+              'MAYDAY', 'PAN PAN', 'HIJACK')
+ROTATING_TERMS = (
+    ('DEVIATING', 'HOLDING', 'TURBULENCE', 'GO AROUND', 'WIND SHEAR', 'LASER',
+     'BIRTHDAY', 'RETIREMENT', 'SPECIAL HANDLING', 'NEED GPU'),
+    ('MISSED APPROACH', 'ICING', 'VOLCANIC', 'CONGRATULATIONS', 'CHRISTMAS',
+     'OVEN OFF', 'IFE PANEL', 'CATERING', 'COFFEE', 'GATE REQUEST', 'APU INOP'),
+)
+TERMS = CORE_TERMS + tuple(term for group in ROTATING_TERMS for term in group)
+# Review slots are scarce (two per run): after tracked flights and serious
+# events, the kind furthest below its share of the last day's stories goes
+# next, so common route changes never crowd out rarer stories, nor vanish.
+TARGET_SHARE = {'route': .30, 'weather': .15, 'strike': .15, 'crew': .10, 'cabin': .10,
+                'cargo': .10, 'other': .05, 'ground': .05}
+FRESH_CANDIDATE_HOURS = 48
 MODEL = 'gemini-2.5-flash'
 MAX_AI_PER_RUN = 20
 RESERVE_USD = .02  # Includes all seven cached translations; same monthly/day/window caps.
@@ -210,33 +224,44 @@ def candidate_priority(message, targets=()):
     return 10
 
 
-def pending_messages(db, targets=()):
-    """Spend scarce reviews on specific actions before generic traffic."""
+def run_terms(now):
+    """Core terms and this run's rotating group."""
+    active = set(ROTATING_TERMS[(now.hour*6+now.minute//10)%len(ROTATING_TERMS)]) if ROTATING_TERMS else set()
+    rotating = {term for group in ROTATING_TERMS for term in group}
+    return tuple(term for term in TERMS if term not in rotating or term in active)
+
+
+def pending_messages(db, targets=(), now=None):
+    """Spend scarce reviews where the feed needs them: tracked flights and
+    serious events first, then the kind furthest below its target share of
+    the last day's stories. Within a kind, specific actions and fresh messages
+    first, and one message per aircraft while others wait."""
     if MAX_AI_PER_RUN <= 0:return []
-    candidates=[]
+    now=now or datetime.now(timezone.utc)
+    fresh=utc_string(now-timedelta(hours=FRESH_CANDIDATE_HOURS))
+    published=Counter(with_tier(json.loads(payload)).get('kind') for (payload,) in
+                      db.execute('SELECT payload FROM cockpit_stories WHERE received >= ?',(utc_string(now-timedelta(hours=24)),)))
+    urgent=[];by_kind=defaultdict(list)
     for key,payload in db.execute("SELECT id,payload FROM cockpit_queue WHERE status='pending' ORDER BY received DESC"):
         message=json.loads(payload)
         if routine_message(message['text']):continue
-        candidates.append((candidate_priority(message,targets),message['receivedAt'],key,payload,message['registration']))
-    candidates.sort(key=lambda item:(item[0],item[1],item[2]),reverse=True)
-    selected=[];priority_bands=set();selected_ids=set();registrations=set()
-    # The first two calls usually exhaust the window budget. One candidate per
-    # priority band keeps a busy operations theme from hiding a rarer story.
-    for priority,_,key,payload,registration in candidates:
-        if priority in priority_bands:continue
-        selected.append((key,payload));selected_ids.add(key)
-        priority_bands.add(priority);registrations.add(registration)
-        if len(selected)>=MAX_AI_PER_RUN:break
-    if len(selected)<MAX_AI_PER_RUN:
-        for _,_,key,payload,registration in candidates:
-            if key in selected_ids or registration in registrations:continue
-            selected.append((key,payload));selected_ids.add(key);registrations.add(registration)
-            if len(selected)>=MAX_AI_PER_RUN:break
-    if len(selected)<MAX_AI_PER_RUN:
-        for _,_,key,payload,_ in candidates:
-            if key in selected_ids:continue
-            selected.append((key,payload))
-            if len(selected)>=MAX_AI_PER_RUN:break
+        kind=classify({'transmission':message['text']})[0]
+        entry=(candidate_priority(message,targets),message['receivedAt'],key,payload,message['registration'])
+        if entry[0]==100 or kind=='safety':urgent.append(entry)
+        elif message['receivedAt']>=fresh:by_kind[kind].append(entry)
+    urgent.sort(reverse=True)
+    for entries in by_kind.values():entries.sort(reverse=True)
+    selected=[];registrations=set();picked=Counter()
+    def take(entries):
+        index=next((i for i,entry in enumerate(entries) if entry[4] not in registrations),0)
+        entry=entries.pop(index)
+        selected.append((entry[2],entry[3]));registrations.add(entry[4])
+    while urgent and len(selected)<MAX_AI_PER_RUN:take(urgent)
+    while len(selected)<MAX_AI_PER_RUN and any(by_kind.values()):
+        total=sum(published.values())+sum(picked.values())+1
+        kind=max((name for name,entries in by_kind.items() if entries),
+                 key=lambda name:(TARGET_SHARE.get(name,.05)*total-published[name]-picked[name],KIND_WEIGHT.get(name,0)))
+        take(by_kind[kind]);picked[kind]+=1
     return selected
 
 
@@ -369,7 +394,7 @@ async def run(path,air_key,gem_key,client,targets=()):
     assign_importance(db)
     try:
         await ingest_tracked(db,targets,air_key,client,metrics,started,now)
-        for term in TERMS:
+        for term in run_terms(now):
             if time.monotonic()-started>180:
                 metrics['errors']+=1;break
             cursor=db.execute('SELECT since,until_time,before_id FROM cockpit_cursor WHERE term=?',(term,)).fetchone()

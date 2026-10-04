@@ -108,7 +108,7 @@ class IngestionTests(unittest.TestCase):
             return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(data)}]}}]})
         async def run():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                with patch.object(c,'TERMS',('NEED GPU',)),patch.object(c.asyncio,'sleep',return_value=None):
+                with patch.object(c,'ROTATING_TERMS',()),patch.object(c,'TERMS',('NEED GPU',)),patch.object(c.asyncio,'sleep',return_value=None):
                     first=await c.run(self.path,'air','gem',client)
                     # Reset only cursor in test so duplicate is returned in-window again.
                     self.db.execute('DELETE FROM cockpit_cursor');self.db.commit()
@@ -129,7 +129,7 @@ class IngestionTests(unittest.TestCase):
     def test_429_does_not_advance_or_call_ai(self):
         async def run():
             async with httpx.AsyncClient(transport=httpx.MockTransport(lambda req:httpx.Response(429))) as client:
-                with patch.object(c,'TERMS',('x',)):
+                with patch.object(c,'ROTATING_TERMS',()),patch.object(c,'TERMS',('x',)):
                     result=await c.run(self.path,'air','gem',client)
                     self.assertEqual(result['errors'],1);self.assertEqual(result['ai_requests'],0)
         asyncio.run(run())
@@ -157,7 +157,7 @@ class IngestionTests(unittest.TestCase):
             return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(item)}]}}]})
         async def run():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                with patch.object(c,'TERMS',('SMELL',)),patch.object(c.asyncio,'sleep',return_value=None):
+                with patch.object(c,'ROTATING_TERMS',()),patch.object(c,'TERMS',('SMELL',)),patch.object(c.asyncio,'sleep',return_value=None):
                     return await c.run(self.path,'air','gem',client)
         result=asyncio.run(run())
         self.assertEqual(result['review'],1)
@@ -175,7 +175,7 @@ class IngestionTests(unittest.TestCase):
             return httpx.Response(200,json={'candidates':[{'finishReason':'MAX_TOKENS'}]})
         async def run():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                with patch.object(c,'TERMS',('NEED GPU',)),patch.object(c.asyncio,'sleep',return_value=None):
+                with patch.object(c,'ROTATING_TERMS',()),patch.object(c,'TERMS',('NEED GPU',)),patch.object(c.asyncio,'sleep',return_value=None):
                     result=await c.run(self.path,'air','gem',client)
                     self.assertEqual(result['errors'],1)
         asyncio.run(run())
@@ -188,7 +188,7 @@ class IngestionTests(unittest.TestCase):
             return httpx.Response(200,json=[dict(self.row(),id=i) for i in range(101,201) if first] if first else [dict(self.row(),id=i) for i in range(1,101)])
         async def run():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                with patch.object(c,'TERMS',('NEED GPU',)),patch.object(c,'MAX_AI_PER_RUN',0),patch.object(c.asyncio,'sleep',return_value=None):
+                with patch.object(c,'ROTATING_TERMS',()),patch.object(c,'TERMS',('NEED GPU',)),patch.object(c,'MAX_AI_PER_RUN',0),patch.object(c.asyncio,'sleep',return_value=None):
                     result=await c.run(self.path,'air','gem',client)
                     self.assertEqual(result['backlogged_terms'],1)
                     self.assertEqual(result['provider_requests'],2)
@@ -241,7 +241,7 @@ class IngestionTests(unittest.TestCase):
             return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(data)}]}}]})
         async def run():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                with patch.object(c,'TERMS',('NEED GPU',)),patch.object(c.asyncio,'sleep',return_value=None):
+                with patch.object(c,'ROTATING_TERMS',()),patch.object(c,'TERMS',('NEED GPU',)),patch.object(c.asyncio,'sleep',return_value=None):
                     first=await c.run(self.path,'air','gem',client)
                     self.db.execute('DELETE FROM cockpit_cursor');self.db.commit()
                     second=await c.run(self.path,'air','gem',client)
@@ -254,5 +254,43 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual((stored['kind'],stored['tier']),('ground','background'))
         # The duplicate's raw text is discarded like a published message's.
         self.assertEqual(self.db.execute("SELECT payload FROM cockpit_queue WHERE status='duplicate'").fetchone(),('{}',))
+
+    def test_rotation_keeps_core_terms_and_alternates_the_rest(self):
+        even=c.run_terms(datetime(2026,10,4,18,0,tzinfo=timezone.utc))
+        odd=c.run_terms(datetime(2026,10,4,18,10,tzinfo=timezone.utc))
+        self.assertNotEqual(set(even),set(odd))
+        for terms in (even,odd):
+            self.assertTrue(set(c.CORE_TERMS)<=set(terms))
+            self.assertLessEqual(len(terms),21)  # no more requests per run than before rotation
+        self.assertEqual(set(even)|set(odd),set(c.TERMS))
+        for previous in ('DEVIATING','DIVERTING','HOLDING','RETURNING','TURBULENCE','BIRTHDAY','RETIREMENT',
+                         'CONGRATULATIONS','CHRISTMAS','SPECIAL HANDLING','SMELL','OVEN OFF','IFE PANEL','CATERING',
+                         'COFFEE','NEED GPU','APU INOP','GATE REQUEST','BIRD STRIKE','LIGHTNING STRIKE','MAYDAY','PAN PAN','HIJACK'):
+            self.assertIn(previous,c.TERMS)
+        for added in ('GO AROUND','MISSED APPROACH','WIND SHEAR','ICING','VOLCANIC','LASER','SMOKE','FUMES'):
+            self.assertIn(added,c.TERMS)
+    def queue(self,tail,text,minutes_ago=5):
+        stamp=c.utc_string(datetime.now(timezone.utc)-timedelta(minutes=minutes_ago))
+        with self.db:c.queue_message(self.db,dict(self.row(),tail=tail,text=text,timestamp=stamp,createdAt=stamp),datetime.now(timezone.utc))
+    def test_review_slots_follow_kind_shares_after_a_route_heavy_day(self):
+        with self.db:
+            for i in range(6):
+                story=dict(id=f'{i:024x}',title=f'Aircraft diverting to K{i:03d}',transmission=f'DIVERTING TO K{i:03d}',
+                           interestScore=70,receivedAt=c.utc_string(self.now-timedelta(hours=2)),registration=f'N{i}RT')
+                self.db.execute('INSERT INTO cockpit_stories VALUES (?,?,?,?)',(story['id'],story['receivedAt'],story['registration'],json.dumps(story)))
+        self.queue('N1AA','DIVERTING TO KIAH DUE WX')
+        self.queue('N2AA','DIVERTING TO KAUS DUE FUEL')
+        self.queue('N3AA','BIRD STRIKE ON CLIMB OUT')
+        self.queue('N4AA','ITS OUR FIRST OFFICERS BIRTHDAY TODAY')
+        chosen=[json.loads(payload)['text'] for _,payload in c.pending_messages(self.db)]
+        # Rarer kinds take the scarce slots before another route change.
+        self.assertEqual(chosen[:2],['BIRD STRIKE ON CLIMB OUT','ITS OUR FIRST OFFICERS BIRTHDAY TODAY'])
+        self.assertEqual(len(chosen),4)
+    def test_serious_events_first_and_stale_candidates_wait(self):
+        self.queue('N1AA','ITS OUR FIRST OFFICERS BIRTHDAY TODAY')
+        self.queue('N2AA','SMOKE IN AFT GALLEY')
+        self.queue('N3AA','BIRD STRIKE ON CLIMB OUT',minutes_ago=60*60)  # 60 hours old
+        chosen=[json.loads(payload)['text'] for _,payload in c.pending_messages(self.db)]
+        self.assertEqual(chosen,['SMOKE IN AFT GALLEY','ITS OUR FIRST OFFICERS BIRTHDAY TODAY'])
 
 if __name__=='__main__':unittest.main()
