@@ -249,6 +249,9 @@ class IngestionTests(unittest.TestCase):
         first,second=asyncio.run(run())
         self.assertEqual((first['published'],second['published'],second['duplicates']),(1,0,1))
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_stories').fetchone()[0],1)
+        # The refresh stores the ranking that reads and alerts use.
+        stored=json.loads(self.db.execute('SELECT payload FROM cockpit_stories').fetchone()[0])
+        self.assertEqual((stored['kind'],stored['tier']),('ground','background'))
         # The duplicate's raw text is discarded like a published message's.
         self.assertEqual(self.db.execute("SELECT payload FROM cockpit_queue WHERE status='duplicate'").fetchone(),('{}',))
 

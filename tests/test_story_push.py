@@ -203,19 +203,22 @@ class StoryPushTests(unittest.TestCase):
                                   interestScore=interest,category=category,translations={}))
         diversion=story('1','Diverting to HER due to storms','DIVERTING TO HER DUE TS',95,'Diversion')
         engine=story('2','Engine failure, diverting','ENG 2 FAILURE DIVERTING TO KDEN',60,'Operations')
-        routine=story('3','Ground power requested','NEED GPU UPON ARRIVAL',100,'Cabin')
+        routine=story('3','Ground power requested','NEED GPU UPON ARRIVAL',60,'Cabin')
         day,slot=slot_for(self.now,'UTC')
-        # A major event wins over a higher-scored notable one and a top-scored routine one.
+        # A major event wins over a higher-scored notable one and a routine one.
         self.assertEqual(campaign_for(self.db,[diversion,engine,routine],day,slot,self.now)['id'],engine['id'])
         # Only background or below-floor stories: the slot is skipped, not filled.
-        quiet=[routine,story('4','Holding briefly','HOLDING DUE TRAFFIC',64,'Weather')]
+        quiet=[routine,story('4','Holding briefly','HOLDING DUE TRAFFIC',69,'Weather')]
         later=self.now.replace(hour=15)
         self.assertIsNone(campaign_for(self.db,quiet,*slot_for(later,'UTC'),later))
-        # Within a tier, a category not sent today goes first despite a lower score.
-        evening=self.now.replace(hour=19)
-        same=story('5','Diverting to EDDV','DIVERTING TO EDDV',90,'Operations')
-        other=story('6','Volcanic ash smell reported','VOLCANIC ASH SMELL',66,'Weather')
-        self.assertEqual(campaign_for(self.db,[same,other],*slot_for(evening,'UTC'),evening)['id'],other['id'])
+        # Next day, after a route-change alert, another kind goes first despite a lower score.
+        tomorrow=self.now+timedelta(days=1)
+        first=story('5','Diverting to EDDV','DIVERTING TO EDDV',90,'Diversion')
+        self.assertEqual(campaign_for(self.db,[first],*slot_for(tomorrow,'UTC'),tomorrow)['id'],first['id'])
+        evening=tomorrow.replace(hour=19)
+        route=story('6','Diverting to MDZ','DIVERTING TO MDZ',92,'Diversion')
+        cabin=story('7','Volcanic ash smell reported','VOLCANIC ASH SMELL',66,'Weather')
+        self.assertEqual(campaign_for(self.db,[first,route,cabin],*slot_for(evening,'UTC'),evening)['id'],cabin['id'])
 
     def test_stale_and_unqualified_stories_do_not_fill_quota(self):
         async def send(*args): self.fail('must not send')

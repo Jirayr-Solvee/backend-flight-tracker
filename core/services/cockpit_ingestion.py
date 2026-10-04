@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from .cockpit_stories import open_store, parse_time, utc_string
 from .cockpit_tracking import matches, tail
+from .cockpit_importance import assign_importance
 
 TERMS = ('DEVIATING', 'DIVERTING', 'HOLDING', 'RETURNING', 'TURBULENCE',
          'BIRTHDAY', 'RETIREMENT', 'CONGRATULATIONS', 'CHRISTMAS',
@@ -364,6 +365,8 @@ async def run(path,air_key,gem_key,client,targets=()):
         db.execute('DELETE FROM cockpit_review WHERE received < ?',(cutoff,))
         db.execute('DELETE FROM cockpit_content WHERE received < ?',(cutoff,))
         db.execute("DELETE FROM cockpit_budget WHERE bucket LIKE 'api-minute:%' AND bucket < ?",('api-minute:'+utc_string(now-timedelta(days=2))[:16],))
+    # Rank first too, so new ranking rules apply even when the provider fails.
+    assign_importance(db)
     try:
         await ingest_tracked(db,targets,air_key,client,metrics,started,now)
         for term in TERMS:
@@ -443,6 +446,7 @@ async def run(path,air_key,gem_key,client,targets=()):
                 reason='ai_'+type(exc).__name__
                 metrics[reason]=metrics.get(reason,0)+1
                 with db:db.execute("UPDATE cockpit_queue SET status='failed',payload='{}' WHERE id=?",(key,))
+        metrics['ranked']=assign_importance(db)
         metrics['backlogged_terms']=db.execute('SELECT COUNT(*) FROM cockpit_cursor WHERE until_time IS NOT NULL').fetchone()[0]
         metrics['pending']=db.execute("SELECT COUNT(*) FROM cockpit_queue WHERE status='pending'").fetchone()[0]
         metrics['review']=db.execute("SELECT COUNT(*) FROM cockpit_review WHERE status='pending'").fetchone()[0]

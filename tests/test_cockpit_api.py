@@ -69,7 +69,7 @@ class CockpitAPITests(unittest.TestCase):
     def test_top_sort_ranks_importance_and_default_order_is_unchanged(self):
         self.app.dependency_overrides[get_current_user] = lambda: object()
         now=datetime.now(timezone.utc)
-        stories=[('a'*24,'Ground power requested','NEED GPU UPON ARRIVAL',95,1),
+        stories=[('a'*24,'Ground power requested','NEED GPU UPON ARRIVAL',60,1),
                  ('b'*24,'Holding over Frankfurt','HOLDING DUE TRAFFIC',90,2),
                  ('c'*24,'Smoke in the cabin','SMOKE IN AFT GALLEY',65,3),
                  ('d'*24,'Earlier smoke report','SMOKE IN FWD GALLEY',99,80*60)]

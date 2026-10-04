@@ -76,17 +76,18 @@ def campaign_for(db, stories, day, slot, now):
             return next((story for story in stories if story['id'] == existing['story_id']), None)
         cutoff = int(now.timestamp()) - 90*86400
         used = {row[0] for row in db.execute('SELECT story_fingerprint FROM storypushcampaign WHERE created_at>?', (cutoff,))}
-        today_categories = {row[0] for row in db.execute('SELECT category FROM storypushcampaign WHERE day=?', (day,))}
         stories = [with_tier(s) for s in stories]
+        sent_today = {row[0] for row in db.execute('SELECT story_id FROM storypushcampaign WHERE day=?', (day,))}
+        kinds_today = {s.get('kind') for s in stories if s['id'] in sent_today}
         available = [s for s in stories if alert_worthy(s)
                      and now-parse_time(s['receivedAt']) <= SHARED_STORY_MAX_AGE
                      and fingerprint(s) not in used]
-        # Most important tier first; within a tier, a category not sent today
-        # goes first, so a day's alerts are not three of the same kind; then
-        # editorial interest and recency.
+        # Most important tier first; within a tier, a kind of event not sent
+        # today goes first, so a day's alerts are not three of the same thing;
+        # then importance and recency.
         def rank(s):
-            tier, interest = importance_key(s, now)[:2]
-            return (tier, s.get('category') not in today_categories, interest, s['receivedAt'], s['id'])
+            tier, score = importance_key(s, now)[:2]
+            return (tier, s.get('kind') not in kinds_today, score, s['receivedAt'], s['id'])
         available.sort(key=rank, reverse=True)
         story = available[0] if available else None
         if story:
