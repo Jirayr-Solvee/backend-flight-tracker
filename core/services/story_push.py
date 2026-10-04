@@ -77,13 +77,17 @@ def campaign_for(db, stories, day, slot, now):
         cutoff = int(now.timestamp()) - 90*86400
         used = {row[0] for row in db.execute('SELECT story_fingerprint FROM storypushcampaign WHERE created_at>?', (cutoff,))}
         today_categories = {row[0] for row in db.execute('SELECT category FROM storypushcampaign WHERE day=?', (day,))}
+        stories = [with_tier(s) for s in stories]
         available = [s for s in stories if alert_worthy(s)
                      and now-parse_time(s['receivedAt']) <= SHARED_STORY_MAX_AGE
                      and fingerprint(s) not in used]
-        # Most important first: tier, then editorial interest. A category not
-        # already sent today only breaks an exact tie; recency breaks the rest.
-        available.sort(key=lambda s: (importance_key(s, now)[:2], s.get('category') not in today_categories,
-                                      s['receivedAt'], s['id']), reverse=True)
+        # Most important tier first; within a tier, a category not sent today
+        # goes first, so a day's alerts are not three of the same kind; then
+        # editorial interest and recency.
+        def rank(s):
+            tier, interest = importance_key(s, now)[:2]
+            return (tier, s.get('category') not in today_categories, interest, s['receivedAt'], s['id'])
+        available.sort(key=rank, reverse=True)
         story = available[0] if available else None
         if story:
             db.execute('INSERT INTO storypushcampaign VALUES (?,?,?,?,?,?)',

@@ -71,14 +71,15 @@ class CockpitAPITests(unittest.TestCase):
         now=datetime.now(timezone.utc)
         stories=[('a'*24,'Ground power requested','NEED GPU UPON ARRIVAL',95,1),
                  ('b'*24,'Holding over Frankfurt','HOLDING DUE TRAFFIC',90,2),
-                 ('c'*24,'Flight diverts to Denver','DIVERTING TO KDEN',55,3),
-                 ('d'*24,'Earlier diversion','DIVERTING TO KIAH',99,80*60)]
+                 ('c'*24,'Smoke in the cabin','SMOKE IN AFT GALLEY',65,3),
+                 ('d'*24,'Earlier smoke report','SMOKE IN FWD GALLEY',99,80*60)]
         with closing(open_store(self.path)) as db, db:
             db.execute("INSERT INTO cockpit_metadata VALUES ('updated_at',?)",(utc_string(now),))
             for key,title,text,interest,minutes in stories:
                 received=utc_string(now-timedelta(minutes=minutes))
-                story=dict(id=key,title=title,transmission=text,interestScore=interest,receivedAt=received,registration='N123AB')
-                db.execute('INSERT INTO cockpit_stories VALUES (?,?,?,?)',(key,received,'N123AB',json.dumps(story)))
+                registration='N'+key[:3].upper()
+                story=dict(id=key,title=title,transmission=text,interestScore=interest,receivedAt=received,registration=registration)
+                db.execute('INSERT INTO cockpit_stories VALUES (?,?,?,?)',(key,received,registration,json.dumps(story)))
         # Older app versions: same newest-first page, with an additional tier field.
         latest=self.client.get('/cockpit/stories').json()
         self.assertEqual([story['id'] for story in latest['stories']],['a'*24,'b'*24,'c'*24,'d'*24])

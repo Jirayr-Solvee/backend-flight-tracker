@@ -12,7 +12,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .cockpit_importance import TOP_WINDOW_HOURS, importance_key, with_tier
+from .cockpit_importance import TOP_WINDOW_HOURS, diversify, importance_key, one_per_aircraft, with_tier
 
 RETENTION = timedelta(days=7)
 SORTS = ('latest', 'top')
@@ -201,4 +201,4 @@ def top_stories(connection, now, registration=None, category=None, limit=20):
     stories = [with_tier(json.loads(row[0])) for row in connection.execute(query, params)]
     stories = [story for story in stories if story['tier'] != 'background']
     stories.sort(key=lambda story: importance_key(story, now), reverse=True)
-    return stories[:limit]
+    return diversify(one_per_aircraft(stories))[:limit]

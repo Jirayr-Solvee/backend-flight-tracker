@@ -37,8 +37,8 @@ class StoryPushTests(unittest.TestCase):
             tuple(self.device[k] for k in ('device_id','user_id','app_version','build_number','capability','enabled','language','time_zone','environment','updated_at')))
         self.db.commit()
         self.stories = [dict(id=f'{i:024x}', title=f'Title {i}', summary='A supported explanation.',
-            transmission=f'MESSAGE {i}', receivedAt=utc_string(self.now-timedelta(minutes=10)),
-            registration='N123', interestScore=90-i, notificationEligible=True, category='Operations', tier='major',
+            transmission=f'SMOKE IN CABIN {i}', receivedAt=utc_string(self.now-timedelta(minutes=10)),
+            registration='N123', interestScore=90-i, notificationEligible=True, category='Operations',
             translations={'fr':dict(title='Un message',summary='Une explication.')} ) for i in range(6)]
         with open_store(self.feed) as db:
             db.execute("INSERT INTO cockpit_metadata VALUES ('updated_at',?)",(utc_string(self.now),))
@@ -201,20 +201,20 @@ class StoryPushTests(unittest.TestCase):
             return with_tier(dict(id=key*24,title=title,summary='An explanation.',transmission=text,
                                   receivedAt=utc_string(self.now-timedelta(minutes=10)),registration='N123',
                                   interestScore=interest,category=category,translations={}))
-        holding=story('1','Holding over Frankfurt','HOLDING DUE TRAFFIC',95,'Diversion')
-        strike=story('2','Bird strike on climb out','BIRD STRIKE ON CLIMB OUT',55,'Operations')
+        diversion=story('1','Diverting to HER due to storms','DIVERTING TO HER DUE TS',95,'Diversion')
+        engine=story('2','Engine failure, diverting','ENG 2 FAILURE DIVERTING TO KDEN',60,'Operations')
         routine=story('3','Ground power requested','NEED GPU UPON ARRIVAL',100,'Cabin')
         day,slot=slot_for(self.now,'UTC')
         # A major event wins over a higher-scored notable one and a top-scored routine one.
-        self.assertEqual(campaign_for(self.db,[holding,strike,routine],day,slot,self.now)['id'],strike['id'])
+        self.assertEqual(campaign_for(self.db,[diversion,engine,routine],day,slot,self.now)['id'],engine['id'])
         # Only background or below-floor stories: the slot is skipped, not filled.
-        quiet=[routine,story('4','Holding briefly','HOLDING DUE TRAFFIC',65,'Operations')]
+        quiet=[routine,story('4','Holding briefly','HOLDING DUE TRAFFIC',64,'Weather')]
         later=self.now.replace(hour=15)
         self.assertIsNone(campaign_for(self.db,quiet,*slot_for(later,'UTC'),later))
-        # Equal importance: a category not sent today breaks the tie.
+        # Within a tier, a category not sent today goes first despite a lower score.
         evening=self.now.replace(hour=19)
-        same=story('5','Bird strike on approach','BIRD STRIKE ON APPROACH',55,'Operations')
-        other=story('6','Lightning strike on descent','LIGHTNING STRIKE ON DESCENT',55,'Weather')
+        same=story('5','Diverting to EDDV','DIVERTING TO EDDV',90,'Operations')
+        other=story('6','Volcanic ash smell reported','VOLCANIC ASH SMELL',66,'Weather')
         self.assertEqual(campaign_for(self.db,[same,other],*slot_for(evening,'UTC'),evening)['id'],other['id'])
 
     def test_stale_and_unqualified_stories_do_not_fill_quota(self):
