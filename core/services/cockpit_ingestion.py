@@ -129,12 +129,50 @@ def story_identity(story):
     return (registration,title) if registration and title else None
 
 
+# Several messages about one event on one aircraft become one story: twin
+# tarmac-delay notices sent seconds apart, its later milestones, or a cargo
+# manifest sent as one line per animal.
+SAME_EVENT_WINDOW=timedelta(minutes=10)
+TARMAC_EVENT_WINDOW=timedelta(hours=6)
+TARMAC_START=re.compile(r'\bLTD TIMING BEGAN AT \w+ TIME (\d{2}):?(\d{2})Z')
+
+
+def story_registration(story):
+    return str(story.get('registration') or '').upper().replace('-','')
+
+
+def tarmac_event(story):
+    """Every update about one lengthy tarmac delay repeats when its timing began."""
+    match=TARMAC_START.search(str(story.get('transmission') or '').upper())
+    return match.group(1)+match.group(2) if match else None
+
+
+def same_event(story, other):
+    """Two stories, or a story and a queued message, about one event."""
+    if not story_registration(story) or story_registration(story)!=story_registration(other):return False
+    first,second=parse_time(story.get('receivedAt')),parse_time(other.get('receivedAt'))
+    if first is None or second is None:return False
+    gap=abs(first-second)
+    started=tarmac_event(story)
+    if started and started==tarmac_event(other) and gap<=TARMAC_EVENT_WINDOW:return True
+    return gap<=SAME_EVENT_WINDOW and (story.get('kind') or classify(story)[0])==(other.get('kind') or classify(other)[0])
+
+
 def duplicate_story(db, story):
+    """Already told: this aircraft's same headline, or the same event."""
+    registration=story_registration(story)
+    if not registration:return False
     identity=story_identity(story)
-    if identity is None:return False
-    for (payload,) in db.execute("SELECT payload FROM cockpit_stories WHERE REPLACE(registration,'-','')=?",(identity[0],)):
-        if story_identity(json.loads(payload))==identity:return True
+    for (payload,) in db.execute("SELECT payload FROM cockpit_stories WHERE REPLACE(registration,'-','')=?",(registration,)):
+        other=json.loads(payload)
+        if (identity is not None and story_identity(other)==identity) or same_event(story,other):return True
     return False
+
+
+def duplicate_message(db, message):
+    """Checked before review, so a known event never costs an AI call."""
+    return duplicate_story(db,dict(registration=message.get('registration'),receivedAt=message.get('receivedAt'),
+                                   transmission=message.get('text')))
 
 
 def record_review(db, row, key, stamp, reason):
@@ -303,13 +341,15 @@ def suppress_routine_pending(db):
 
 
 def retire_duplicate_stories(db):
-    """Keep the first story for each aircraft and headline; remove later copies."""
-    seen=set();ids=[]
+    """Keep the first story for each aircraft headline or event; remove later copies."""
+    kept=defaultdict(list);ids=[]
     for key,payload in db.execute('SELECT id,payload FROM cockpit_stories ORDER BY received,id'):
-        identity=story_identity(json.loads(payload))
-        if identity is None:continue
-        if identity in seen:ids.append((key,))
-        else:seen.add(identity)
+        story=json.loads(payload)
+        identity=story_identity(story)
+        earlier=kept[story_registration(story)]
+        if any((identity is not None and story_identity(other)==identity) or same_event(story,other) for other in earlier):
+            ids.append((key,))
+        else:earlier.append(story)
     with db:
         db.executemany('DELETE FROM cockpit_stories WHERE id=?',ids)
         db.executemany("UPDATE cockpit_queue SET status='duplicate' WHERE id=? AND status='published'",ids)
@@ -463,6 +503,10 @@ async def run(path,air_key,gem_key,client,targets=()):
         for key,payload in pending:
             if time.monotonic()-started>330:break
             message=json.loads(payload)
+            if duplicate_message(db,message):
+                metrics['duplicates']+=1
+                with db:db.execute("UPDATE cockpit_queue SET status='duplicate',payload='{}' WHERE id=?",(key,))
+                continue
             body={'contents':[{'parts':[{'text':PROMPT+'\n'+json.dumps({'message':message['text']})}]}],
                   'generationConfig':{'temperature':0,'maxOutputTokens':6144,'thinkingConfig':{'thinkingBudget':0},'responseMimeType':'application/json','responseSchema':SCHEMA}}
             # <=10000 input tokens +6144 output tokens, no thinking tokens.

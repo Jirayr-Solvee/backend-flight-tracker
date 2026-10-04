@@ -230,6 +230,59 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual((statuses['b'*24],statuses['d'*24],statuses['a'*24]),('duplicate','duplicate','published'))
         self.assertTrue(c.duplicate_story(self.db,dict(registration='N475-UA',title='Lengthy tarmac delay at KORD')))
         self.assertFalse(c.duplicate_story(self.db,dict(registration='N475UA',title='Bird strike on climb out')))
+    def tarmac(self,key,registration,title,minutes_ago,held=60,began='15:02',header=''):
+        text=(f'{header}LENGTHY TARMAC DELAY* OFF GATE FOR {held} MINS. LTD TIMING BEGAN AT OUT TIME {began}Z. '
+              '*********************** FLIGHT MUST BE AIRBORNE OR RETURNING TO GATE')
+        return dict(id=key,registration=registration,title=title,transmission=text,
+                    receivedAt=c.utc_string(self.now-timedelta(minutes=minutes_ago)))
+    def store(self,*stories):
+        with self.db:
+            for story in stories:
+                self.db.execute('INSERT INTO cockpit_stories VALUES (?,?,?,?)',
+                                (story['id'],story['receivedAt'],story['registration'],json.dumps(story)))
+                self.db.execute('INSERT INTO cockpit_queue VALUES (?,?,?,?)',(story['id'],story['receivedAt'],'{}','published'))
+    def test_one_story_per_event_on_an_aircraft(self):
+        cargo=lambda key,title,animal,seconds:dict(id=key,registration='ZK-OKV',title=title,
+            transmission=f'ALL OTHER LIVE ANIMAL 1 11 KG AVI 5 AKL 1 LIVE {animal} BULK',
+            receivedAt=c.utc_string(self.now-timedelta(minutes=50,seconds=-seconds)))
+        turbulence=lambda key,minutes_ago:dict(id=key,registration='HL8701',title=f'Turbulence reported {minutes_ago} min ago',
+            transmission=f'TURBULENCE INFO EDR LGT MEAN 0.12 PEAK 0.18 FL380 REPORT {key[:1]}',
+            receivedAt=c.utc_string(self.now-timedelta(minutes=minutes_ago)))
+        self.store(
+            self.tarmac('a'*24,'N852UA','UA4199/04 Experiences Lengthy Tarmac Delay at KORD',100),
+            self.tarmac('b'*24,'N852UA','Lengthy Tarmac Delay for UA4199 at KORD',99.8),         # twin notice
+            self.tarmac('c'*24,'N852UA','UA4199 Still Held at KORD',70,held=90,
+                        header='LTD ADVISORY UA4199/04 KORD KEWR SENT: 16:32:22Z *'),             # later milestone
+            self.tarmac('d'*24,'N852UA','Another Lengthy Tarmac Delay at KORD',20,began='17:40'), # a new delay
+            self.tarmac('e'*24,'N24729','Lengthy Tarmac Delay at KSBA',99.8),                    # other aircraft
+            cargo('f'*24,'Live Animal Cargo: 11kg Dog from AKL','DOG',0),
+            cargo('g'*24,'Live Cat Transported as Cargo from AKL','CAT',3),
+            cargo('h'*24,'Live Animals on Board: Two Dogs in Bulk Cargo','DOGS',6),
+            turbulence('i'*24,90),turbulence('j'*24,55))                                       # separate reports
+        self.assertEqual(c.retire_duplicate_stories(self.db),4)
+        self.assertEqual(c.retire_duplicate_stories(self.db),0)
+        self.assertEqual({row[0] for row in self.db.execute('SELECT id FROM cockpit_stories')},
+                         {'a'*24,'d'*24,'e'*24,'f'*24,'i'*24,'j'*24})
+        statuses=dict(self.db.execute('SELECT id,status FROM cockpit_queue').fetchall())
+        self.assertEqual({statuses[k*24] for k in 'bcgh'},{'duplicate'})
+        # The same start time on another day is another delay.
+        self.assertFalse(c.duplicate_story(self.db,self.tarmac('k'*24,'N852UA','Lengthy Tarmac Delay at KORD',-30*60)))
+        self.assertTrue(c.duplicate_story(self.db,self.tarmac('k'*24,'N-852UA','Tarmac delay update',40,held=120)))
+    def test_known_event_is_skipped_before_review(self):
+        self.store(self.tarmac('a'*24,'N123AB','Lengthy Tarmac Delay for UA4199 at KORD',6))
+        twin=dict(self.row(),text=self.tarmac('x','N123AB','',0)['transmission'])
+        posts=[]
+        def handler(req):
+            if req.method=='GET':return httpx.Response(200,json=[twin])
+            posts.append(req)
+            return httpx.Response(500)
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                with patch.object(c,'ROTATING_TERMS',()),patch.object(c,'TERMS',('TARMAC DELAY',)),patch.object(c.asyncio,'sleep',return_value=None):
+                    return await c.run(self.path,'air','gem',client)
+        metrics=asyncio.run(run())
+        self.assertEqual((metrics['ai_requests'],metrics['duplicates'],len(posts)),(0,1,0))
+        self.assertEqual(self.db.execute("SELECT status,payload FROM cockpit_queue WHERE id!=?",('a'*24,)).fetchall(),[('duplicate','{}')])
     def test_same_aircraft_headline_is_not_published_twice(self):
         rows=[self.row(),dict(self.row(),id=101,text='NEED GPU UPON ARRIVAL APU INOP PLEASE CONFIRM STAND')]
         served=[]
