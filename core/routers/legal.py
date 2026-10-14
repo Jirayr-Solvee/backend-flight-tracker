@@ -39,7 +39,7 @@ PRIVACY_POLICY_HTML = """<!doctype html>
 <body>
   <main>
     <h1>Sofly Privacy Policy</h1>
-    <p>Effective date: September 28, 2026</p>
+    <p>Effective date: October 15, 2026</p>
 
     <p>
       Sofly: Track Flight Status helps people search, save, and track flight
@@ -153,6 +153,26 @@ PRIVACY_POLICY_HTML = """<!doctype html>
       diagnostics collection. Undelivered diagnostics may remain temporarily
       in device-protected app storage for retry, for no more than seven days.
       Account deletion also removes associated notification-open diagnostics.
+    </p>
+
+    <h2>Shared flight links</h2>
+    <p>
+      If you share a flight, Sofly creates a private link (sofly.to/f/…) that
+      anyone you send it to can open without an account. The page shows only
+      that flight's information, such as flight number, airline, route, times,
+      gates, status and an estimated position, and never your name, email or
+      account details. We store which account created the link, for which
+      flight, when it was created or stopped and why, how many times the page
+      was viewed and when it was last viewed. We do not link viewers to
+      accounts. Like any website, our web server keeps standard access logs
+      (IP address, browser and time) without the link itself.
+    </p>
+    <p>
+      A link stops working about six hours after the flight lands, when you
+      tap Stop sharing, or when you delete the flight or your account. People
+      who open a link load the map from OpenFreeMap and the map software from
+      cdnjs (Cloudflare), which receive their IP address as part of normal web
+      requests.
     </p>
 
     <h2>How we use information</h2>

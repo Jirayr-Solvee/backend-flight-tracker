@@ -20,10 +20,21 @@ class LegalPageTests(unittest.TestCase):
 
     def test_sofly_privacy_discloses_retained_sign_in_details(self):
         text = " ".join(PRIVACY_POLICY_HTML.split())
-        self.assertIn("Effective date: September 28, 2026", text)
+        self.assertIn("Effective date: October 15, 2026", text)
         self.assertIn("Apple sign-in identifier", text)
         self.assertIn("name and email address provided during sign-in", text)
         self.assertIn("associate these details with your Sofly account", text)
+
+    def test_sofly_privacy_discloses_shared_flight_links(self):
+        text = " ".join(PRIVACY_POLICY_HTML.split())
+        self.assertIn("Shared flight links", text)
+        self.assertIn("never your name, email or account details", text)
+        self.assertIn("how many times the page was viewed and when it was last viewed", text)
+        self.assertIn("We do not link viewers to accounts", text)
+        self.assertIn("standard access logs (IP address, browser and time)", text)
+        self.assertIn("about six hours after the flight lands", text)
+        self.assertIn("OpenFreeMap", text)
+        self.assertIn("cdnjs (Cloudflare)", text)
 
     def test_sofly_privacy_discloses_forwarded_email_storage_and_ai_processing(self):
         text = " ".join(PRIVACY_POLICY_HTML.split())
