@@ -22,6 +22,7 @@ from .experiment import (
     ExperimentDiagnosticEvent,
 )
 from .flight import Airline, Airport, Arrival, Departure, Flight, FlightTimeNotice
+from .flight_share import FlightShare
 from .live_activity import (
     LiveActivityPushToStartDelivery,
     LiveActivityPushToStartRegistration,

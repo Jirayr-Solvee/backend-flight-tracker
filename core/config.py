@@ -107,5 +107,17 @@ class Settings(BaseSettings):
     ACTIVATION_JOURNEY_FORCE_STANDARD_PAYWALL: bool = False
     ACTIVATION_JOURNEY_OPERATIONAL_CONFIG_VERSION: str = "draft_1"
 
+    # Public flight-share links. nginx maps /f/<token> to /public/share/<token>.
+    # The page shell loads versioned website assets; bump with each asset release.
+    FLIGHT_SHARE_BASE_URL: str = "https://sofly.to/f/"
+    FLIGHT_SHARE_ASSET_VERSION: str = "1"
+
 
 settings = Settings()  # type: ignore
+
+# Pinned MapLibre build for the flight-share page. Re-verify both hashes with
+# `curl -s URL | openssl dgst -sha384 -binary | openssl base64 -A` on upgrade.
+MAPLIBRE_JS_URL = "https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/5.24.0/maplibre-gl.js"
+MAPLIBRE_JS_INTEGRITY = "sha384-5+cfbwT0iiub6VsQAdn6yz16nr6sDiQoHx6tm4O8OVYXHYOxcffFmCJBL0dgdvGp"
+MAPLIBRE_CSS_URL = "https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/5.24.0/maplibre-gl.css"
+MAPLIBRE_CSS_INTEGRITY = "sha384-uTttxo/aOKbdE5RlD/SPzSDoDmNvGlUYPjONi2MN/b7c9HPSvW07OIuyP7uL6jxK"

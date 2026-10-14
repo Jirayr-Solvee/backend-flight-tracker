@@ -19,6 +19,9 @@ class CredentialOperation(Enum):
     ACTIVITY_REGISTER = "activity_register"
     NOTIFICATION_CLEAR = "notification_clear"
     ACCOUNT_DELETE = "account_delete"
+    FLIGHT_SHARE_CREATE = "flight_share_create"
+    FLIGHT_SHARE_REVOKE = "flight_share_revoke"
+    FLIGHT_SHARE_READ = "flight_share_read"
 
 
 def rollback_and_log_failure(

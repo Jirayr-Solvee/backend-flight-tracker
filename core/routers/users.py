@@ -25,6 +25,7 @@ from ..security_logging import (
 )
 from ..services.apn.live_activity import LiveActivityService
 from ..services.ai_consent import record_verified_apple_email_identity
+from ..services.flight_share import revoke_user_shares
 from ..utils import create_jwt, verify_apple_identity_token
 
 router = APIRouter(route_class=CredentialSafeRoute)
@@ -543,6 +544,7 @@ def delete_user(
 
         user.subscriptions.clear()
         user.flights.clear()
+        revoke_user_shares(session, user.id, "account_deleted")
 
         session.exec(delete(AIConsentReceipt).where(AIConsentReceipt.user_id == user.id))
         session.exec(delete(UserAIConsent).where(UserAIConsent.user_id == user.id))

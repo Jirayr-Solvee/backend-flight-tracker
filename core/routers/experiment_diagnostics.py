@@ -57,7 +57,7 @@ EventName = Literal[
     "copilot_tapped", "copilot_opened", "copilot_telemetry_loaded",
     "delay_risk_loaded", "delay_risk_failed", "arrival_card_viewed", "arrival_card_action",
     "review_prompt_requested", "voice_search_action", "permission_result", "setting_changed",
-    "search_suggestion_selected", "account_action", "flight_import_action",
+    "search_suggestion_selected", "account_action", "flight_import_action", "flight_share_action",
     "paywall_alternative_plans_revealed", "paywall_products_loaded",
     "af_search", "search_completed", "search_failed", "no_search_results",
     "search_recovery_shown", "search_recovery_suggestion_selected",
@@ -250,6 +250,7 @@ class DiagnosticEvent(BaseModel):
             "search_suggestion_selected": ("suggestion_kind", "source"),
             "account_action": ("action", "outcome", "source"),
             "flight_import_action": ("action", "outcome", "source"),
+            "flight_share_action": ("action", "outcome", "source"),
             "flight_deletion_outcome": ("flight_id", "stage", "outcome"),
         }.get(self.event_name, ())
         if required and (
@@ -283,6 +284,15 @@ class DiagnosticEvent(BaseModel):
             or self.properties.outcome not in ("presented", "completed", "cancelled", "failed")
         ):
             raise ValueError("Forwarding share-sheet diagnostics are not verified flight import")
+        if self.event_name == "flight_share_action" and (
+            self.properties.action not in ("create", "copy", "share_sheet", "revoke")
+            or self.properties.outcome not in ("started", "succeeded", "failed", "presented", "completed", "cancelled")
+            or self.properties.reason not in (None, "not_found", "ended", "rate_limited", "unavailable",
+                                              "account_changed", "invalid_response")
+            or self.properties.source != "flight_detail"
+        ):
+            # The share URL and token are bearer secrets and never analytics values.
+            raise ValueError("Flight share diagnostics must use fixed action, outcome and reason codes")
         if self.event_name == "flight_deletion_outcome" and (self.properties.stage, self.properties.outcome) not in (
             ("local_save", "succeeded"), ("local_save", "failed"),
             ("backend_delete", "succeeded"), ("backend_delete", "failed"), ("backend_delete", "skipped"),

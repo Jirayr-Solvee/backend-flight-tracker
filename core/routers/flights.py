@@ -28,6 +28,7 @@ from ..models.user import User, UserFlightLink
 from ..services.flight.delay_risk import DelayRiskResponse, DelayRiskService
 from ..services.flight import FlightPersistence, FlightQueryHandler, FlightService
 from ..services.flight.api_client import AerodataboxUnavailableError
+from ..services.flight_share import revoke_flight_shares
 from ..services.gemini.service import GeminiService, ResolvedFunctionCall
 from ..services.ai_consent import AIConsentRequired, AIConsentUnavailable, POLICY_VERSION
 from ..services.search_failure import RETENTION_DAYS, SearchFailureService
@@ -344,6 +345,9 @@ def delete_flight_for_a_user(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Flight not found",
             )
+
+        # A removed flight must not stay public through an earlier share link.
+        revoke_flight_shares(session, user.id, flight_id, "flight_removed")
 
         device_ids = [device.id for device in user.devices]
         if device_ids:
