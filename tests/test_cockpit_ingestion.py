@@ -185,7 +185,9 @@ class IngestionTests(unittest.TestCase):
     def test_full_pages_persist_cursor(self):
         def handler(req):
             first='before_id' not in req.url.params
-            return httpx.Response(200,json=[dict(self.row(),id=i) for i in range(101,201) if first] if first else [dict(self.row(),id=i) for i in range(1,101)])
+            size=c.PROVIDER_PAGE_SIZE
+            self.assertEqual(int(req.url.params['limit']),size)
+            return httpx.Response(200,json=[dict(self.row(),id=i) for i in range(size+1,2*size+1)] if first else [dict(self.row(),id=i) for i in range(1,size+1)])
         async def run():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                 with patch.object(c,'ROTATING_TERMS',()),patch.object(c,'TERMS',('NEED GPU',)),patch.object(c,'MAX_AI_PER_RUN',0),patch.object(c.asyncio,'sleep',return_value=None):
@@ -194,6 +196,77 @@ class IngestionTests(unittest.TestCase):
                     self.assertEqual(result['provider_requests'],2)
         asyncio.run(run())
         self.assertEqual(self.db.execute('SELECT before_id FROM cockpit_cursor').fetchone()[0],1)
+
+    def test_failed_term_isolated_cursor_unchanged_and_queued_ai_can_progress(self):
+        def handler(req):
+            if req.method=='GET':
+                if req.url.params.get('text')=='bad':return httpx.Response(500,text='secret response')
+                return httpx.Response(200,json=[self.row()])
+            item=dict(publish=True,needs_review=False,category='Operations',title='Ground power',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,
+                      translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
+            return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(item)}]}}]})
+        async def execute():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                with patch.object(c,'run_terms',return_value=('bad','good')),patch.object(c.asyncio,'sleep',return_value=None):
+                    return await c.run(self.path,'secret-key','gem',client)
+        result=asyncio.run(execute())
+        self.assertEqual(result['provider_http_500'],1)
+        self.assertEqual(result['published'],1)
+        self.assertIsNone(self.db.execute("SELECT 1 FROM cockpit_cursor WHERE term='bad'").fetchone())
+        self.assertIsNotNone(self.db.execute("SELECT 1 FROM cockpit_cursor WHERE term='good'").fetchone())
+        self.assertIsNone(self.db.execute("SELECT 1 FROM cockpit_metadata WHERE key='updated_at'").fetchone())
+        self.assertNotIn('secret',json.dumps(result))
+
+    def test_provider_failure_circuit_bound_and_old_published_story_retained(self):
+        old=datetime.now(timezone.utc)-timedelta(days=40)
+        from core.services.cockpit_stories import save_messages,read_stories
+        save_messages(self.path,[dict(timestamp=c.utc_string(old),tail='N123AB',flightNumber='AA123',text='NEED GPU UPON ARRIVAL APU INOP')],old)
+        with self.db:self.db.execute('INSERT INTO cockpit_queue VALUES (?,?,?,?)',('raw-old',c.utc_string(old),'{}','pending'))
+        calls=[]
+        def handler(req):
+            calls.append(req)
+            raise httpx.ReadTimeout('private URL and key',request=req)
+        async def execute():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                with patch.object(c,'run_terms',return_value=('a','b','c','d')):
+                    return await c.run(self.path,'private-key','gem',client)
+        result=asyncio.run(execute())
+        self.assertEqual(len(calls),c.MAX_PROVIDER_FAILURES_PER_RUN)
+        self.assertEqual(result['provider_timeout'],3)
+        self.assertNotIn('private',json.dumps(result))
+        self.assertEqual(len(read_stories(self.path)['stories']),1)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM cockpit_queue').fetchone()[0],0)
+
+    def test_auth_and_rate_limit_stop_requests_without_ai_or_cursor_advance(self):
+        for status in (401,403,429):
+            with self.subTest(status=status):
+                calls=[]
+                def handler(req):calls.append(req);return httpx.Response(status)
+                async def execute():
+                    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                        with patch.object(c,'run_terms',return_value=('a','b')):
+                            return await c.run(self.path,'key','gem',client)
+                result=asyncio.run(execute())
+                self.assertEqual(len(calls),1)
+                self.assertEqual(result['provider_blocked'],1)
+                self.assertEqual(result['ai_requests'],0)
+                self.assertEqual(self.db.execute('SELECT count(*) FROM cockpit_cursor').fetchone()[0],0)
+
+    def test_invalid_page_is_atomic_and_next_term_still_runs(self):
+        calls=[]
+        def handler(req):
+            calls.append(req.url.params['text'])
+            rows=[self.row(),dict(self.row(),id=101,createdAt='invalid')] if len(calls)==1 else []
+            return httpx.Response(200,json=rows)
+        async def execute():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                with patch.object(c,'run_terms',return_value=('bad','good')),patch.object(c.asyncio,'sleep',return_value=None):
+                    return await c.run(self.path,'key','gem',client)
+        result=asyncio.run(execute())
+        self.assertEqual(result['provider_window'],1)
+        self.assertEqual(calls,['bad','good'])
+        self.assertEqual(self.db.execute('SELECT count(*) FROM cockpit_queue').fetchone()[0],0)
+        self.assertEqual(self.db.execute('SELECT term FROM cockpit_cursor').fetchall(),[('good',)])
 
     def test_fleet_advisories_and_airport_notices_are_not_aircraft_events(self):
         # Wording observed in the published feed, sent to many aircraft at once.

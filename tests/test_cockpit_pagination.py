@@ -37,7 +37,7 @@ class PaginationTests(unittest.TestCase):
             if not cursor:break
         self.assertEqual(len(results),37)
         self.assertTrue(all(s['category']=='Weather' for s in results))
-    def test_flight_scope_retention_and_empty(self):
+    def test_flight_scope_archive_pagination_and_empty(self):
         target=dict(registration='N123AB',aliases={'AA123'},start=self.now-timedelta(minutes=4),end=self.now)
         first=read_stories(self.path,flight=target,limit=3)
         second=read_stories(self.path,flight=target,limit=20,cursor=first['nextCursor'])
@@ -46,6 +46,10 @@ class PaginationTests(unittest.TestCase):
         self.assertEqual(read_stories(self.path,registration='OTHER')['stories'],[])
         self.assertIsNone(read_stories(self.path,registration='OTHER')['nextCursor'])
         self.assertNotIn('0200',[s['id'] for s in read_stories(self.path)['stories']])
+        page=read_stories(self.path)
+        while page['nextCursor']:page=read_stories(self.path,cursor=page['nextCursor'])
+        self.assertIn('0200',[s['id'] for s in page['stories']])
+        self.assertNotIn('0200',[s['id'] for s in read_stories(self.path,flight=target)['stories']])
     def test_bad_cursor(self):
         for cursor in ('garbage','e30','W10'):
             with self.assertRaises(ValueError):decode_cursor(cursor)

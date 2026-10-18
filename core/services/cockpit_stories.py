@@ -116,7 +116,8 @@ def save_messages(path, messages, now=None):
     connection = open_store(path)
     try:
         with connection:
-            connection.execute("DELETE FROM cockpit_stories WHERE received < ?", (utc_string(now - RETENTION),))
+            # Published, curated messages are an archive. Retention applies to
+            # unreviewed/raw ingestion data, not to messages already shown.
             for story in stories:
                 connection.execute("INSERT INTO cockpit_stories VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
                                    (story["id"], story["receivedAt"], story["registration"], json.dumps(story)))
@@ -148,13 +149,14 @@ def read_stories(path, registration=None, now=None, flight=None, *, limit=50, ca
     try:
         meta = connection.execute("SELECT value FROM cockpit_metadata WHERE key='updated_at'").fetchone()
         updated = parse_time(meta[0]) if meta else None
-        if updated is None or now - updated > timedelta(hours=2):
-            return None
+        freshness = {"updatedAt": utc_string(updated) if updated else None,
+                     "cacheState": "unknown" if updated is None else
+                     "stale" if now - updated > timedelta(hours=2) else "fresh"}
         if sort == 'top' and not flight:
             return {"stories": top_stories(connection, now, registration, category, limit),
-                    "updatedAt": utc_string(updated), "nextCursor": None}
-        query = "SELECT id,received,payload FROM cockpit_stories WHERE received >= ? AND received <= ?"
-        params = [utc_string(now - RETENTION), utc_string(now + timedelta(minutes=1))]
+                    **freshness, "nextCursor": None}
+        query = "SELECT id,received,payload FROM cockpit_stories WHERE received <= ?"
+        params = [utc_string(now + timedelta(minutes=1))]
         if flight:
             query += " AND received >= ? AND received <= ? AND REPLACE(registration, '-', '') = ?"
             from .cockpit_tracking import tail
@@ -182,23 +184,29 @@ def read_stories(path, registration=None, now=None, flight=None, *, limit=50, ca
         next_cursor=None
         if len(stories)>limit:
             next_cursor=base64.urlsafe_b64encode(json.dumps(positions[limit-1]).encode()).decode().rstrip('=')
-        return {"stories": stories[:limit], "updatedAt": utc_string(updated), "nextCursor":next_cursor}
+        return {"stories": stories[:limit], **freshness, "nextCursor":next_cursor}
     finally:
         connection.close()
 
 
 def top_stories(connection, now, registration=None, category=None, limit=20):
-    """Major and notable stories from the last few days, most important first.
-    One bounded page: importance order has no stable cursor."""
-    query = "SELECT payload FROM cockpit_stories WHERE received >= ? AND received <= ?"
-    params = [utc_string(now - timedelta(hours=TOP_WINDOW_HOURS)), utc_string(now + timedelta(minutes=1))]
+    """Prefer recent highlights; fall back to the archive instead of hiding it.
+    Inspect a bounded newest-first slice; Latest exposes the complete archive
+    through keyset pagination. Importance order has no stable cursor."""
+    query = "SELECT payload FROM cockpit_stories WHERE received <= ?"
+    params = [utc_string(now + timedelta(minutes=1))]
     if registration:
         query += " AND registration = ?"
         params.append(registration.upper())
     if category:
         query += " AND json_extract(payload, '$.category') = ?"
         params.append(category)
-    stories = [with_tier(json.loads(row[0])) for row in connection.execute(query, params)]
-    stories = [story for story in stories if story['tier'] != 'background']
+    stories = [with_tier(json.loads(row[0])) for row in connection.execute(
+        query + ' ORDER BY received DESC,id DESC LIMIT 500', params)]
+    highlights = [story for story in stories if story['tier'] != 'background']
+    recent = [story for story in highlights
+              if (stamp := parse_time(story.get('receivedAt'))) and
+              stamp >= now - timedelta(hours=TOP_WINDOW_HOURS)]
+    stories = recent or highlights or stories
     stories.sort(key=lambda story: importance_key(story, now), reverse=True)
     return diversify(one_per_aircraft(stories))[:limit]

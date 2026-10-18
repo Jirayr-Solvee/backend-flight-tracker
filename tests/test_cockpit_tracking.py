@@ -91,12 +91,31 @@ class TrackingTests(unittest.TestCase):
     def test_tracked_rate_limit_does_not_advance_cursor(self):
         async def execute():
             db=ingestion.init_store(self.cache)
+            metrics={'provider_requests':0}
             async with httpx.AsyncClient(transport=httpx.MockTransport(lambda req:httpx.Response(429))) as client:
-                with self.assertRaises(ValueError):
-                    await ingestion.ingest_tracked(db,self.targets,'key',client,{'provider_requests':0},ingestion.time.monotonic(),self.now)
+                await ingestion.ingest_tracked(db,self.targets,'key',client,metrics,ingestion.time.monotonic(),self.now)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM cockpit_cursor').fetchone()[0],0)
+            self.assertEqual(metrics['provider_http_429'],1)
+            self.assertEqual(metrics['provider_blocked'],1)
             db.close()
         asyncio.run(execute())
+
+    def test_tracked_500_does_not_block_global_feed_or_leak_provider_data(self):
+        requests=[]
+        def handler(req):
+            requests.append(req)
+            return httpx.Response(500,text='private provider details') if 'icao' in req.url.params else httpx.Response(200,json=[])
+        async def execute():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                with patch.object(ingestion,'run_terms',return_value=('DIVERTING',)),patch.object(ingestion.asyncio,'sleep',return_value=None):
+                    return await ingestion.run(self.cache,'secret-key','gem',client,self.targets)
+        result=asyncio.run(execute())
+        self.assertEqual(len(requests),2)
+        self.assertEqual(result['provider_http_500'],1)
+        self.assertNotIn('private',json.dumps(result))
+        db=sqlite3.connect(self.cache)
+        try:self.assertEqual(db.execute('SELECT term FROM cockpit_cursor').fetchall(),[('DIVERTING',)])
+        finally:db.close()
 
     def test_tracked_requests_bounded_and_next_run_rotates_aircraft(self):
         targets=[dict(self.targets[0],registration=f'N{i:04}AB') for i in range(10)]

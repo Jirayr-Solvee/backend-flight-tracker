@@ -49,12 +49,33 @@ class CockpitAPITests(unittest.TestCase):
         self.assertEqual(self.client.get('/cockpit/stories/'+'b'*24).status_code,404)
         self.assertEqual(self.client.get('/cockpit/stories/not-an-id').status_code,404)
 
-    def test_unconfigured_and_stale_not_misreported_as_empty(self):
+    def test_unconfigured_unavailable_but_stale_cache_is_readable(self):
         self.app.dependency_overrides[get_current_user] = lambda: object()
-        self.assertEqual(self.client.get('/cockpit/stories').status_code,503)
+        response=self.client.get('/cockpit/stories')
+        self.assertEqual(response.status_code,503)
         old=datetime.now(timezone.utc)-timedelta(hours=3)
         save_messages(self.path,[],old)
-        self.assertEqual(self.client.get('/cockpit/stories').status_code,503)
+        response=self.client.get('/cockpit/stories')
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(response.json()['cacheState'],'stale')
+        self.assertEqual(response.json()['updatedAt'],utc_string(old))
+
+    def test_stale_archive_list_top_and_detail_survive_missing_refresh_metadata(self):
+        self.app.dependency_overrides[get_current_user] = lambda: object()
+        old=datetime.now(timezone.utc)-timedelta(days=30)
+        save_messages(self.path,[dict(timestamp=utc_string(old),tail='OE-TEST',flightNumber='EC123',text='NEED GPU UPON ARRIVAL APU INOP')],old)
+        with closing(open_store(self.path)) as db,db:
+            db.execute("DELETE FROM cockpit_metadata WHERE key='updated_at'")
+        for query in ('','?sort=top'):
+            response=self.client.get('/cockpit/stories'+query)
+            self.assertEqual(response.status_code,200)
+            self.assertEqual(response.json()['cacheState'],'unknown')
+            self.assertIsNone(response.json()['updatedAt'])
+            self.assertEqual(len(response.json()['stories']),1)
+        story=response.json()['stories'][0]
+        self.assertEqual(self.client.get('/cockpit/stories/'+story['id']).status_code,200)
+        self.app.dependency_overrides.clear()
+        self.assertIn(self.client.get('/cockpit/stories/'+story['id']).status_code,(401,403))
 
     def test_success_empty_and_exact_filter(self):
         self.app.dependency_overrides[get_current_user] = lambda: object()

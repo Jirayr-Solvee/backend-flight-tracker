@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import time
+import httpx
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from .cockpit_stories import open_store, parse_time, utc_string
@@ -35,6 +36,9 @@ TARGET_SHARE = {'route': .30, 'weather': .15, 'strike': .15, 'crew': .10, 'cabin
 # FRESH_CANDIDATE_HOURS is never reviewed or published.
 CATCHUP_HOURS = 6
 FRESH_CANDIDATE_HOURS = 12
+PROVIDER_PAGE_SIZE = 20
+PROVIDER_TIMEOUT_SECONDS = 25
+MAX_PROVIDER_FAILURES_PER_RUN = 3
 MODEL = 'gemini-2.5-flash'
 MAX_AI_PER_RUN = 20
 RESERVE_USD = .02  # Includes all seven cached translations; same monthly/day/window caps.
@@ -163,7 +167,9 @@ def duplicate_story(db, story):
     registration=story_registration(story)
     if not registration:return False
     identity=story_identity(story)
-    for (payload,) in db.execute("SELECT payload FROM cockpit_stories WHERE REPLACE(registration,'-','')=?",(registration,)):
+    stamp=parse_time(story.get('receivedAt')) or datetime.now(timezone.utc)
+    for (payload,) in db.execute("SELECT payload FROM cockpit_stories WHERE REPLACE(registration,'-','')=? AND received>=? AND received<=?",
+                                (registration,utc_string(stamp-timedelta(days=7)),utc_string(stamp+timedelta(days=7)))):
         other=json.loads(payload)
         if (identity is not None and story_identity(other)==identity) or same_event(story,other):return True
     return False
@@ -340,10 +346,12 @@ def suppress_routine_pending(db):
     return len(ids)
 
 
-def retire_duplicate_stories(db):
+def retire_duplicate_stories(db, since=None):
     """Keep the first story for each aircraft headline or event; remove later copies."""
     kept=defaultdict(list);ids=[]
-    for key,payload in db.execute('SELECT id,payload FROM cockpit_stories ORDER BY received,id'):
+    for key,payload in db.execute('SELECT id,payload FROM cockpit_stories' +
+                                 (' WHERE received>=?' if since else '') + ' ORDER BY received,id',
+                                 (since,) if since else ()):
         story=json.loads(payload)
         identity=story_identity(story)
         earlier=kept[story_registration(story)]
@@ -356,15 +364,73 @@ def retire_duplicate_stories(db):
     return len(ids)
 
 
-def retire_routine_stories(db):
+def retire_routine_stories(db, since=None):
     """Remove previously published boilerplate using its saved source excerpt."""
     ids=[]
-    for key,payload in db.execute('SELECT id,payload FROM cockpit_stories'):
+    for key,payload in db.execute('SELECT id,payload FROM cockpit_stories' +
+                                 (' WHERE received>=?' if since else ''), (since,) if since else ()):
         if routine_message(json.loads(payload).get('transmission','')):ids.append((key,))
     with db:
         db.executemany('DELETE FROM cockpit_stories WHERE id=?',ids)
         db.executemany("UPDATE cockpit_queue SET status='suppressed' WHERE id=? AND status='published'",ids)
     return len(ids)
+
+
+class ProviderFailure(Exception):
+    """Bounded diagnostic code only; never retain a URL, key or response body."""
+    def __init__(self, reason, *, stop=False):
+        super().__init__(reason)
+        self.reason, self.stop = reason, stop
+
+
+def provider_failed(metrics, failure):
+    metrics['errors'] = metrics.get('errors', 0) + 1
+    metrics['provider_errors'] = metrics.get('provider_errors', 0) + 1
+    key = 'provider_' + failure.reason
+    metrics[key] = metrics.get(key, 0) + 1
+    if failure.stop:
+        metrics['provider_blocked'] = 1
+
+
+def provider_stopped(metrics):
+    return bool(metrics.get('provider_blocked') or
+                metrics.get('provider_errors', 0) >= MAX_PROVIDER_FAILURES_PER_RUN)
+
+
+async def provider_get(client, path, air_key, *, params=None):
+    try:
+        response = await client.get('https://api.airframes.io/v1/' + path,
+                                    params=params, headers={'Authorization':'Bearer ' + air_key},
+                                    timeout=PROVIDER_TIMEOUT_SECONDS)
+    except httpx.TimeoutException:
+        raise ProviderFailure('timeout') from None
+    except httpx.RequestError:
+        raise ProviderFailure('transport') from None
+    if response.status_code != 200:
+        raise ProviderFailure('http_' + str(response.status_code),
+                              stop=response.status_code in (401, 403, 429))
+    try:
+        return response.json()
+    except ValueError:
+        raise ProviderFailure('invalid_json') from None
+
+
+def validate_provider_page(rows, since, until, before):
+    if not isinstance(rows, list) or len(rows) > PROVIDER_PAGE_SIZE:
+        raise ProviderFailure('schema')
+    ids = []
+    for row in rows:
+        if not isinstance(row, dict) or type(row.get('id')) is not int or row['id'] < 1:
+            raise ProviderFailure('schema')
+        created = parse_time(row.get('createdAt'))
+        if not created or not parse_time(since) <= created <= parse_time(until):
+            raise ProviderFailure('window')
+        if before and row['id'] >= before:
+            raise ProviderFailure('cursor')
+        ids.append(row['id'])
+    if len(ids) != len(set(ids)):
+        raise ProviderFailure('duplicate_ids')
+    return ids
 
 
 async def ingest_tracked(db, targets, air_key, client, metrics, started, now):
@@ -376,7 +442,7 @@ async def ingest_tracked(db, targets, air_key, client, metrics, started, now):
         return row[0] if row else ''
     calls=0
     for reg in sorted(grouped, key=last_poll):
-        if calls>=8 or time.monotonic()-started>100:break
+        if calls>=8 or time.monotonic()-started>100 or provider_stopped(metrics):break
         flights=grouped[reg]
         # Missing provider mappings must not monopolize every later run.
         with db:db.execute('INSERT OR REPLACE INTO cockpit_metadata VALUES (?,?)',('tracked-attempt:'+reg,utc_string(now)))
@@ -389,10 +455,11 @@ async def ingest_tracked(db, targets, air_key, client, metrics, started, now):
             else:
                 if not api_allowance(db,datetime.now(timezone.utc)):break
                 calls+=1;metrics['provider_requests']+=1
-                response=await client.get('https://api.airframes.io/v1/airframes/tail/'+flights[0]['registration'],headers={'Authorization':'Bearer '+air_key})
-                if response.status_code==429:raise ValueError('provider_rate_limit')
-                if response.status_code==404:continue
-                response.raise_for_status();airframe=response.json()
+                try:
+                    airframe=await provider_get(client,'airframes/tail/'+flights[0]['registration'],air_key)
+                except ProviderFailure as failure:
+                    if failure.reason != 'http_404':provider_failed(metrics,failure)
+                    continue
                 if not isinstance(airframe,dict) or type(airframe.get('id')) is not int or tail(airframe.get('tail'))!=reg:
                     continue
                 params['airframe_ids']=str(airframe['id'])
@@ -403,26 +470,22 @@ async def ingest_tracked(db, targets, air_key, client, metrics, started, now):
         since,until,before=fresh_cursor(cursor,now)
         until=until or utc_string(now)
         for _ in range(2):
-            if calls>=8 or time.monotonic()-started>100:break
+            if calls>=8 or time.monotonic()-started>100 or provider_stopped(metrics):break
             if not api_allowance(db,datetime.now(timezone.utc)):break
-            query=dict(params,since=since,until=until,limit=100)
+            query=dict(params,since=since,until=until,limit=PROVIDER_PAGE_SIZE)
             if before:query['before_id']=before
             calls+=1;metrics['provider_requests']+=1
-            response=await client.get('https://api.airframes.io/v1/messages',params=query,headers={'Authorization':'Bearer '+air_key})
-            if response.status_code==429:raise ValueError('provider_rate_limit')
-            response.raise_for_status();rows=response.json()
-            if not isinstance(rows,list) or len(rows)>100:raise ValueError('provider_schema')
-            ids=[]
+            try:
+                rows=await provider_get(client,'messages',air_key,params=query)
+                ids=validate_provider_page(rows,since,until,before)
+            except ProviderFailure as failure:
+                provider_failed(metrics,failure)
+                break  # Keep this aircraft's cursor; other targets may still work.
             with db:
                 for row in rows:
-                    if not isinstance(row,dict) or type(row.get('id')) is not int:raise ValueError('provider_schema')
-                    created=parse_time(row.get('createdAt'))
-                    if not created or not parse_time(since)<=created<=parse_time(until):raise ValueError('provider_window')
-                    if before and row['id']>=before:raise ValueError('provider_cursor')
-                    ids.append(row['id'])
                     candidate=dict(receivedAt=row.get('timestamp'),registration=row.get('tail'),flight=row.get('flightNumber'))
                     if any(matches(candidate,f) for f in flights):queue_message(db,row,now,tracked=True)
-                if len(rows)==100:before=min(ids)
+                if len(rows)==PROVIDER_PAGE_SIZE:before=min(ids)
                 else:since=utc_string(parse_time(until)-timedelta(minutes=2));until=None;before=None
                 db.execute('INSERT OR REPLACE INTO cockpit_cursor VALUES (?,?,?,?)',(key,since,until,before))
                 db.execute('INSERT OR REPLACE INTO cockpit_metadata VALUES (?,?)',(key,utc_string(now)))
@@ -453,40 +516,45 @@ async def run(path,air_key,gem_key,client,targets=()):
     cutoff=utc_string(now-timedelta(days=7))
     with db:
         db.execute('DELETE FROM cockpit_queue WHERE received < ?',(cutoff,))
-        db.execute('DELETE FROM cockpit_stories WHERE received < ?',(cutoff,))
+        # Keep the curated published archive through provider outages and age.
         db.execute('DELETE FROM cockpit_review WHERE received < ?',(cutoff,))
         db.execute('DELETE FROM cockpit_content WHERE received < ?',(cutoff,))
         db.execute("DELETE FROM cockpit_budget WHERE bucket LIKE 'api-minute:%' AND bucket < ?",('api-minute:'+utc_string(now-timedelta(days=2))[:16],))
-    # Rank first too, so new ranking rules apply even when the provider fails.
-    assign_importance(db)
     try:
+        # Bound maintenance to the active week; archived stories keep their
+        # stored rank without loading an ever-growing archive into this worker.
+        assign_importance(db, since=cutoff)
         await ingest_tracked(db,targets,air_key,client,metrics,started,now)
-        for term in run_terms(now):
+        # Slow upstream responses must not starve the same trailing terms every
+        # run. Least recently attempted terms go first, including after failure.
+        attempts=dict(db.execute("SELECT key,value FROM cockpit_metadata WHERE key LIKE 'global-attempt:%'"))
+        terms=sorted(run_terms(now),key=lambda term:attempts.get('global-attempt:'+term,''))
+        for term in terms:
+            if provider_stopped(metrics):break
             if time.monotonic()-started>180:
                 metrics['errors']+=1;break
+            with db:db.execute('INSERT OR REPLACE INTO cockpit_metadata VALUES (?,?)',('global-attempt:'+term,utc_string(now)))
             cursor=db.execute('SELECT since,until_time,before_id FROM cockpit_cursor WHERE term=?',(term,)).fetchone()
             since,until,before=fresh_cursor(cursor,now)
             until=until or utc_string(now)
             for _ in range(2):
                 if not api_allowance(db,datetime.now(timezone.utc)):
                     metrics['errors']+=1;break
-                params=dict(text=term,since=since,until=until,limit=100)
+                if time.monotonic()-started>180:
+                    metrics['errors']+=1;break
+                params=dict(text=term,since=since,until=until,limit=PROVIDER_PAGE_SIZE)
                 if before:params['before_id']=before
                 metrics['provider_requests']+=1
-                response=await client.get('https://api.airframes.io/v1/messages',params=params,headers={'Authorization':'Bearer '+air_key})
-                if response.status_code==429:
-                    metrics['errors']+=1;return metrics
-                response.raise_for_status();rows=response.json()
-                if not isinstance(rows,list) or len(rows)>100:raise ValueError('provider_schema')
-                ids=[]
+                try:
+                    rows=await provider_get(client,'messages',air_key,params=params)
+                    ids=validate_provider_page(rows,since,until,before)
+                except ProviderFailure as failure:
+                    provider_failed(metrics,failure)
+                    break  # Do not advance a failed page or abort healthy terms.
                 with db:
                     for row in rows:
-                        if not isinstance(row,dict) or type(row.get('id')) is not int:raise ValueError('provider_schema')
-                        created=parse_time(row.get('createdAt'))
-                        if not created or not parse_time(since)<=created<=parse_time(until):raise ValueError('provider_window')
-                        if before and row['id']>=before:raise ValueError('provider_cursor')
-                        ids.append(row['id']);queue_message(db,row,now)
-                    if len(rows)==100:before=min(ids)
+                        queue_message(db,row,now)
+                    if len(rows)==PROVIDER_PAGE_SIZE:before=min(ids)
                     else:
                         since=utc_string(parse_time(until)-timedelta(minutes=2));until=None;before=None
                     db.execute('INSERT OR REPLACE INTO cockpit_cursor VALUES (?,?,?,?)',(term,since,until,before))
@@ -496,10 +564,10 @@ async def run(path,air_key,gem_key,client,targets=()):
         if metrics['errors']==0:
             with db:db.execute("INSERT OR REPLACE INTO cockpit_metadata VALUES ('updated_at',?)",(utc_string(datetime.now(timezone.utc)),))
         metrics['suppressed']=suppress_routine_pending(db)
-        metrics['retired_stories']=retire_routine_stories(db)
-        metrics['retired_duplicates']=retire_duplicate_stories(db)
+        metrics['retired_stories']=retire_routine_stories(db, since=cutoff)
+        metrics['retired_duplicates']=retire_duplicate_stories(db, since=cutoff)
         metrics['expired']=expire_stale_pending(db,now)
-        pending=pending_messages(db,targets)
+        pending=[] if metrics.get('provider_blocked') else pending_messages(db,targets)
         for key,payload in pending:
             if time.monotonic()-started>330:break
             message=json.loads(payload)
@@ -543,7 +611,7 @@ async def run(path,air_key,gem_key,client,targets=()):
                 reason='ai_'+type(exc).__name__
                 metrics[reason]=metrics.get(reason,0)+1
                 with db:db.execute("UPDATE cockpit_queue SET status='failed',payload='{}' WHERE id=?",(key,))
-        metrics['ranked']=assign_importance(db)
+        metrics['ranked']=assign_importance(db, since=cutoff)
         metrics['backlogged_terms']=db.execute('SELECT COUNT(*) FROM cockpit_cursor WHERE until_time IS NOT NULL').fetchone()[0]
         metrics['pending']=db.execute("SELECT COUNT(*) FROM cockpit_queue WHERE status='pending'").fetchone()[0]
         metrics['review']=db.execute("SELECT COUNT(*) FROM cockpit_review WHERE status='pending'").fetchone()[0]

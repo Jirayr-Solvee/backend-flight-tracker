@@ -42,16 +42,20 @@ class CockpitStoryTests(unittest.TestCase):
         result=curate_message(message(latitude=30, longitude=40), NOW)
         self.assertEqual(result['latitude'], 30)
 
-    def test_cache_deduplicates_expires_and_filters_exact_registration(self):
+    def test_cache_deduplicates_retains_archive_and_filters_exact_registration(self):
         with tempfile.TemporaryDirectory() as d:
             path=Path(d)/'messages.db'
             self.assertIsNone(read_stories(path, now=NOW))
             self.assertEqual(save_messages(path,[message(), message()],NOW),1)
             self.assertEqual(len(read_stories(path, 'oe-test', NOW)['stories']),1)
             self.assertEqual(read_stories(path, 'OE-OTHER', NOW)['stories'],[])
-            self.assertIsNone(read_stories(path, now=NOW+timedelta(hours=3)))
+            stale=read_stories(path, now=NOW+timedelta(hours=3))
+            self.assertEqual(len(stale['stories']),1)
+            self.assertEqual(stale['updatedAt'],utc_string(NOW))
+            self.assertEqual(stale['cacheState'],'stale')
             save_messages(path,[],NOW+timedelta(days=8))
-            self.assertEqual(read_stories(path,now=NOW+timedelta(days=8))['stories'],[])
+            self.assertEqual(len(read_stories(path,now=NOW+timedelta(days=8))['stories']),1)
+            self.assertEqual(len(read_stories(path,now=NOW+timedelta(days=60),sort='top')['stories']),1)
 
     def test_cabin_excerpt_preserves_uncertainty(self):
         result=curate_message(message('HI FWD GALLY HAD A SMELL WE TURMED THE OVEN OFF SMELL SEEMS TO BE GONE'), NOW)

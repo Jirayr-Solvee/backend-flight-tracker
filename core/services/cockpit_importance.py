@@ -147,10 +147,11 @@ def rank_stories(stories):
     return ranked
 
 
-def assign_importance(db):
+def assign_importance(db, since=None):
     """Rank every cached story and store kind, importance and tier on it.
     Returns how many stories changed."""
-    rows = db.execute('SELECT id, payload FROM cockpit_stories').fetchall()
+    rows = db.execute('SELECT id, payload FROM cockpit_stories' +
+                      (' WHERE received >= ?' if since else ''), (since,) if since else ()).fetchall()
     stories = [dict(json.loads(payload), id=key) for key, payload in rows]
     ranked = rank_stories(stories)
     updates = []

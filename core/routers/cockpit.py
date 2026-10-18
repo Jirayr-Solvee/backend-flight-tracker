@@ -25,8 +25,8 @@ def story_detail(story_id: str, user=Depends(get_current_user)):
     if not path: raise HTTPException(503, 'Aircraft messages are temporarily unavailable')
     try:
         with closing(sqlite3.connect('file:' + path + '?mode=ro', uri=True)) as db:
-            row = db.execute('SELECT payload FROM cockpit_stories WHERE id=? AND received>=?',
-                             (story_id, utc_string(datetime.now(timezone.utc)-timedelta(days=7)))).fetchone()
+            row = db.execute('SELECT payload FROM cockpit_stories WHERE id=? AND received<=?',
+                             (story_id, utc_string(datetime.now(timezone.utc)+timedelta(minutes=1)))).fetchone()
         if not row: raise HTTPException(404, 'Message no longer available')
         return with_tier(json.loads(row[0]))
     except (sqlite3.Error, ValueError, OSError):

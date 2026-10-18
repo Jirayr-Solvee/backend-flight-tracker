@@ -2,14 +2,23 @@
 
 The app reads authenticated `GET /cockpit/stories`, optionally filtered by exact
 registration. Reads never call Airframes or Gemini. Returns 20 published records
-per page by default (limit 1–50) from seven days. `category` filters before paging;
+per page by default (limit 1–50) from the retained published archive. `category` filters before paging;
 `cursor` is an opaque timestamp/ID keyset boundary from `nextCursor`. Equal-time
 records have deterministic ID ordering. Newer insertions do not shift subsequent
-pages; refresh from the first page to see them. Retention continues to apply to
-every request. A null `nextCursor` marks the end. Both global and owned-flight
+pages; refresh from the first page to see them. Published messages do not expire
+by age; unreviewed/private ingestion records retain their existing retention limits.
+A null `nextCursor` marks the end. Both global and owned-flight
 endpoints support the same parameters, and recheck authorization on every page.
-After two hours without successful provider ingestion,
-the endpoint returns 503 instead of pretending the cache is fresh.
+Provider outages never suppress an otherwise readable published cache. Responses
+preserve `updatedAt` (the last complete successful ingestion, null if unknown) and
+add `cacheState`: `fresh`, `stale` after two hours, or `unknown`. Existing clients
+can ignore the additive field and still display the original message timestamps.
+Top prefers highlights from the last 72 hours; if there are none, it falls back
+to older highlights, then available published messages. Ranking examines at most
+the newest 500 matching stories; Latest paginates the complete archive. Details
+remain accessible by ID irrespective of age. Auth, flight ownership/time-window
+matching, category filters and safety/deduplication rules still apply. Missing
+or corrupt storage is still a genuine 503, not a fabricated empty success.
 
 ## Worker
 
@@ -18,20 +27,28 @@ a 420-second timeout, 256 MB RAM limit, 25% of one CPU quota, low CPU priority,
 read-only system/home mounts, and writes only its private state directory.
 Systemd plus a file lock prevents overlapping workers.
 
-23 targeted substring searches cover weather actions, changes of plan, human
+Targeted substring searches cover weather actions, changes of plan, human
 moments, cabin and ground operations. Broad `THANK YOU`, `LIVE ANIMAL`, and
 `TEMPERATURE SENSITIVE` searches were removed after repeated boilerplate
 crowded the feed. `MAYDAY`, `PAN PAN`, and `HIJACK` searches populate only a
 private review queue; they never publish automatically. This is curated
-coverage, not a complete global feed. Up to two pages per term per run; frozen query
+coverage, not a complete global feed. Up to two 20-message pages per term per run; frozen query
 windows and pagination cursors persist. Full pages resume next run rather than
-silently advance. Initial lookback is 24 hours. Windows overlap by two minutes;
+silently advance. Catch-up is bounded to six hours. Windows overlap by two minutes;
 content/tail/date deduplication persists across terms and restarts.
 
-Normally 23 requests/run, at most 46: 3,312–6,624/day (6.62%–13.25% of Pro's
-50,000/day). Persisted worker limits are 100/minute, 600/hour, 8,000/day. They do
-not account for unrelated consumers of the same provider key. 429 stops the run
-without retries. Next run resumes without marking incomplete ingestion fresh.
+There are 20 or 21 global terms per run, with alternating groups and least-recently
+attempted terms first so slow responses cannot starve the same searches. At most
+two pages per term plus eight tracked-flight calls; existing run-time limits can
+defer some work. Persisted limits remain 100/minute, 600/hour and 8,000/day and do
+not account for other consumers of the same provider key. Provider calls allow
+25 seconds. A failed request preserves its page cursor and does not block other
+terms/aircraft. Three provider failures end provider work for that run; 401/403/429
+stop it immediately and skip AI. There are no immediate retry bursts. Other
+provider errors still allow safe pending candidates to be reviewed within the
+existing AI budget. `provider_http_<status>`, `provider_timeout`, and bounded schema
+error counters identify failures without logging keys, response bodies or aircraft
+queries. Partial or failed ingestion never advances the full-success timestamp.
 
 ## AI and safety
 
@@ -114,7 +131,9 @@ from other legs cannot appear just because the registration matches.
 - Ubuntu-owned `/var/lib/sofly-cockpit/stories.sqlite`: WAL cache, cursors,
   queue, and budget ledger; service umask 0027.
 - Queue bounded at 20,000 records. At capacity, page insertion/cursor update
-  rolls back rather than losing the page. Seven-day retention bounds records.
+  rolls back rather than losing the page. Seven-day retention bounds private/raw
+  records, not published stories. Routine ranking/deduplication maintenance scans
+  only the active week; the read API paginates archived stories without bulk loading.
 - `scripts/provision_cockpit_credentials.py` explicitly runs as root, reads the
   Airframes key from stdin and Gemini from existing server dotenv, writes 0600
   credentials atomically, and never prints values.
@@ -130,7 +149,7 @@ freshness independently of AI errors; inspect job metrics as well as API health.
 To stop future ingestion: `sudo systemctl disable --now sofly-cockpit-refresh.timer`.
 If a worker is currently running, stopping the timer does not stop that worker;
 stop its service separately when required. Existing cached records remain; they
-become unavailable via API after the freshness window. Do not delete the budget
+remain readable via API with stale freshness metadata. Do not delete the budget
 database to restart a worker: doing so erases the persisted spending safeguards.
 
 Deploy API changes using the repository's sequential fetcher/API readiness gates.
