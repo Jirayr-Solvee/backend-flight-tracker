@@ -4,6 +4,19 @@ The worker is disabled by default. Production enablement requires `SOFLY_STORY_P
 
 The app refreshes its device capability/version, language, time zone and permission/preference on launch/foreground and preference changes. A legacy registration clears capability. Settings allow turning story pushes off independently of flight alerts. Device metadata is removed with account deletion.
 
+Production subscription eligibility is read from the latest effective, linked,
+server-verified Production transaction per subscription chain and its authoritative
+Apple lifecycle state. The short `user.premium_valid_until` API-access lease is
+not used or extended by this worker: a subscriber need not reopen the app every
+12 hours to remain eligible for notifications. Zero-price trials retain access
+until expiry even after auto-renew is disabled. Refunds, revocations, expiration,
+billing failure without valid grace, upgraded transactions, wrong environments,
+and missing subscription evidence fail closed. Future-effective renewals do not
+grant access early. Valid recorded grace survives JWS re-signing/informational
+notifications, but a later authoritative expiration ends it. Current ownership,
+preferences, token and subscription state are rechecked after the send reservation
+and immediately before APNs. No global access lease or notification cap changes.
+
 Target two or three shared stories/day when suitable stories exist, not a guarantee. The worker checks every ten minutes and sends in local windows 10:00–11:59, 15:00–16:59, 19:00–20:59. No catch-up outside those windows. Three-hour minimum spacing and maximum three shared campaigns in any rolling 24 hours apply per subscriber; every eligible device on that account receives the same campaign. One story is frozen per local day and slot, so subscribers receive the same selection in their own daytime window. Cached stories must be from a recently refreshed feed, at most 72 hours old when selected, and have an editorial score of at least 65. Existing safe-publication and translation review rules remain mandatory. No extra AI calls or filler. Repeated normalized transmissions are suppressed across campaigns for 90 days.
 
 A published story explicitly matching a subscriber's saved flight can generate an additional alert within two hours of the transmission. Attribution requires the aircraft registration, flight number and flight time window to match; a general airport bulletin never qualifies. Flight-specific story alerts do not consume shared campaign slots. A subscriber does not receive the same story twice on one device, or as a flight extra after the shared campaign. Existing AeroDataBox flight status/gate/time alerts remain independent.

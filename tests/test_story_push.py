@@ -9,6 +9,7 @@ from unittest.mock import patch
 from core.services.story_push import eligible, slot_for, reserve, dispatch, payload, campaign_for, candidates
 from core.services.cockpit_stories import open_store, utc_string
 from core.services.cockpit_importance import with_tier
+from tests.story_push_fixtures import create_subscription_tables, add_subscription, add_lifecycle
 
 
 class StoryPushTests(unittest.TestCase):
@@ -31,6 +32,8 @@ class StoryPushTests(unittest.TestCase):
           CREATE TABLE device(id TEXT PRIMARY KEY,user_id TEXT,apn_token TEXT,apn_token_active INTEGER);
           CREATE TABLE storypushdevice(device_id TEXT PRIMARY KEY,user_id TEXT,app_version TEXT,build_number INTEGER,capability INTEGER,enabled INTEGER,language TEXT,time_zone TEXT,environment TEXT,updated_at INTEGER);
         ''')
+        create_subscription_tables(self.db)
+        add_subscription(self.db,int(self.now.timestamp()*1000))
         self.db.execute('INSERT INTO device VALUES (?,?,?,?)', ('phone','owner','test-token',1))
         self.db.execute('INSERT INTO user VALUES (?,?)',('owner',self.device['premium_valid_until']))
         self.db.execute('INSERT INTO storypushdevice VALUES (?,?,?,?,?,?,?,?,?,?)',
@@ -49,14 +52,16 @@ class StoryPushTests(unittest.TestCase):
         self.db.close(); self.tmp.cleanup()
 
     def test_exact_version_and_capability_fail_closed(self):
-        self.assertTrue(eligible(self.device,self.now,'3.9.3',142))
+        self.assertTrue(eligible(self.device,self.now,'3.9.3',142,subscription_access=True))
         for key,value in [('build_number',141),('build_number',143),('app_version','3.9.2'),
                           ('capability',0),('enabled',0),('apn_token_active',0),('apn_token',''),
                           ('owner_id','other'),('environment','testflight'),('environment','development'),
-                          ('updated_at',0),('premium_valid_until',0)]:
+                          ('updated_at',0)]:
             with self.subTest(key=key,value=value):
-                self.assertFalse(eligible(dict(self.device,**{key:value}),self.now,'3.9.3',142))
+                self.assertFalse(eligible(dict(self.device,**{key:value}),self.now,'3.9.3',142,subscription_access=True))
         self.assertFalse(eligible(self.device,self.now,'',0))
+        self.assertFalse(eligible(self.device,self.now,'3.9.3',142))
+        self.assertFalse(eligible(self.device,self.now,'3.9.3',142,subscription_access='true'))
 
     def test_daytime_slots_and_timezone(self):
         self.assertEqual(slot_for(self.now,'UTC'),('2026-09-28',0))
@@ -110,6 +115,62 @@ class StoryPushTests(unittest.TestCase):
         result=asyncio.run(dispatch('/missing','/missing',send))
         self.assertEqual(result['reserved'],0)
 
+    def test_expired_api_lease_does_not_suppress_verified_subscriber(self):
+        self.db.execute('UPDATE user SET premium_valid_until=0');self.db.commit()
+        calls=[]
+        async def send(*args):calls.append(args);return '200'
+        result=asyncio.run(dispatch(self.database,self.feed,send,enabled=True,
+            version='3.9.3',build=142,now=self.now))
+        self.assertEqual(result['accepted'],1)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(self.db.execute('SELECT premium_valid_until FROM user').fetchone()[0],0)
+
+    def test_fresh_api_lease_never_substitutes_for_verified_subscription(self):
+        self.db.execute('DELETE FROM "transaction"');self.db.commit()
+        async def send(*args):self.fail('cache alone cannot grant')
+        result=asyncio.run(dispatch(self.database,self.feed,send,enabled=True,
+            version='3.9.3',build=142,now=self.now))
+        self.assertEqual(result['eligible'],0)
+
+    def test_concurrent_changes_after_reservation_suppress_before_apns(self):
+        # A separate connection commits between reservation and the second
+        # entitlement/device check, as a webhook or preference update would.
+        for change in ('refund','unlink','disable','token','owner','expiration'):
+            with self.subTest(change=change):
+                def changed_reserve(db,device,story,now,**kwargs):
+                    delivery=reserve(db,device,story,now,**kwargs)
+                    with sqlite3.connect(self.database) as other:
+                        if change=='refund':other.execute('UPDATE "transaction" SET revoked_date=1')
+                        elif change=='unlink':other.execute('DELETE FROM usersubscriptionlink')
+                        elif change=='disable':other.execute('UPDATE storypushdevice SET enabled=0')
+                        elif change=='token':other.execute("UPDATE device SET apn_token='new-token'")
+                        elif change=='owner':other.execute("UPDATE device SET user_id='different-owner'")
+                        else:add_lifecycle(other,int(self.now.timestamp()*1000),event_kind='expiration',renewal_signed_date_ms=None)
+                    return delivery
+                async def send(*args):self.fail('must recheck committed change')
+                with patch('core.services.story_push.reserve',side_effect=changed_reserve):
+                    result=asyncio.run(dispatch(self.database,self.feed,send,enabled=True,
+                        version='3.9.3',build=142,now=self.now))
+                self.assertEqual(result['accepted'],0)
+                self.assertEqual(self.db.execute('SELECT status FROM storypushdelivery').fetchone()[0],'suppressed')
+                self.db.execute('DELETE FROM storypushdelivery')
+                self.db.execute('DELETE FROM appstoresubscriptionlifecycleevent')
+                self.db.execute('UPDATE "transaction" SET revoked_date=NULL')
+                self.db.execute("INSERT OR IGNORE INTO usersubscriptionlink VALUES ('owner','chain')")
+                self.db.execute('UPDATE storypushdevice SET enabled=1')
+                self.db.execute("UPDATE device SET apn_token='test-token',user_id='owner'")
+                self.db.commit()
+
+    def test_wall_clock_expiry_is_rechecked_after_reservation(self):
+        self.db.execute('UPDATE "transaction" SET expires_date=?',(int(self.now.timestamp()*1000)+1000,));self.db.commit()
+        async def send(*args):self.fail('subscription expired during run')
+        with patch('core.services.story_push.time') as clock:
+            clock.monotonic.side_effect=[100,100,102]
+            result=asyncio.run(dispatch(self.database,self.feed,send,enabled=True,
+                version='3.9.3',build=142,now=self.now))
+        self.assertEqual(result['accepted'],0)
+        self.assertEqual(self.db.execute('SELECT status FROM storypushdelivery').fetchone()[0],'suppressed')
+
     def test_dispatch_success_and_uncertain_send_never_retried(self):
         calls=[]
         async def send(*args): calls.append(args); return '200'
@@ -126,6 +187,7 @@ class StoryPushTests(unittest.TestCase):
 
     def test_dispatch_shared_story_to_two_subscribers_and_extra_flight_story(self):
         self.db.execute('INSERT INTO user VALUES (?,?)',('second',self.device['premium_valid_until']))
+        add_subscription(self.db,int(self.now.timestamp()*1000),user_id='second',chain='second',tx='second')
         self.db.execute('INSERT INTO device VALUES (?,?,?,?)',('tablet','second','tablet-token',1))
         self.db.execute('INSERT INTO storypushdevice VALUES (?,?,?,?,?,?,?,?,?,?)',
                         ('tablet','second','3.9.4',143,1,1,'en','UTC','production',int(self.now.timestamp())))
@@ -147,12 +209,12 @@ class StoryPushTests(unittest.TestCase):
 
     def test_expired_subscription_and_unmatched_flight_never_send(self):
         async def send(*args):self.fail('must not send')
-        self.db.execute('UPDATE user SET premium_valid_until=?',(int((self.now-timedelta(seconds=1)).timestamp()*1000),))
+        self.db.execute('UPDATE "transaction" SET expires_date=?',(int((self.now-timedelta(seconds=1)).timestamp()*1000),))
         self.db.commit()
         result=asyncio.run(dispatch(self.database,self.feed,send,enabled=True,
                                     releases={('3.9.3',142)},now=self.now))
         self.assertEqual(result['eligible'],0)
-        self.db.execute('UPDATE user SET premium_valid_until=?',(self.device['premium_valid_until'],))
+        self.db.execute('UPDATE "transaction" SET expires_date=?',(self.device['premium_valid_until'],))
         self.db.commit()
         with sqlite3.connect(self.feed) as db:
             story=dict(self.stories[1],flight='EK123')
