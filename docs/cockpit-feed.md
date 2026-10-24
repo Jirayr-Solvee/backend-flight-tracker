@@ -59,9 +59,11 @@ instructions are suppressed before AI. Exact duplicate message text from
 different aircraft is collapsed for the global feed within one day; saved-flight
 messages keep their own copy. Remaining candidates are ranked by saved-flight
 match, explicit diversion/return, aircraft hazard, cabin and operational issue,
-weather and human moment. One candidate per priority band is selected first so
-one busy theme cannot occupy both reviews in a window. New candidates may wait;
-no exhaustive coverage is promised.
+weather and human moment. Tracked flights or serious wording alternate with
+ordinary topics when both are waiting. Ordinary topic balance counts actual AI
+attempts over 24 hours, using published counts as a cold-start baseline. A topic
+repeatedly held for review cannot keep taking slots merely because it has no
+published stories. New candidates may wait; no exhaustive coverage is promised.
 On each refresh, previously published stories whose saved transmission excerpt
 matches those routine patterns are retired from the cache as well.
 
@@ -74,10 +76,24 @@ the bounded request price. Reservations are NOT refunded, even for failures;
 reserved amounts are not actual invoices. Price changes require review. This
 does not cap unrelated flight-search usage on the same Gemini account.
 
-Attempt status is written before sending. Process-interrupted attempts are not
-automatically replayed. Known failed responses are marked failed; no retry burst.
+Attempt status and all three budget debits are committed together before sending,
+across independent workers. Process-interrupted attempts, timeouts and transport
+errors are uncertain and never automatically replayed. Explicit HTTP 429, 500,
+502, 503 and 504 responses may retry in a later scheduler window, at most three
+total attempts per candidate. Backoff starts at ten minutes, doubles, includes
+stable jitter and honors bounded Retry-After values. Every retry spends another
+normal reservation; no monthly/day/window cap is increased or refunded. Retries
+never extend the twelve-hour publication freshness window. Persistent cooldowns
+stop the other slot from immediately hitting the same outage. Authentication or
+request-configuration failures are terminal for that candidate and pause further
+AI calls for at least one hour. Historical failures are not backfilled or replayed.
+Finite `ai_http_*`, `ai_timeout_unknown`, `ai_transport_unknown`, `ai_cooldown`,
+`ai_deferred`, `ai_kind_*` and `ai_tracked` counters identify outcomes without
+logging provider bodies, URLs, credentials or exception text. Attempt metadata
+contains only ID, kind, count, timestamps and bounded reason; it expires in seven days.
 AI responses require structured output, bounded strings, allowed categories,
-an exact source substring, publish=true, needs_review=false and interest>=30.
+an exact source substring, publish=true, needs_review=false, review_reason=none
+and interest>=30. Missing/conflicting review reasons cannot grant publication.
 Scores are editorial model estimates, not probabilities. They are retained as
 interestScore for later review. Notification eligibility is false; no push
 sender is present in this worker.
@@ -85,7 +101,13 @@ sender is present in this worker.
 Obvious contact payloads are excluded before AI. Messages with sensitive event
 terms create a metadata-only review record (provider ID, aircraft, timestamp,
 reason); their raw text is not cached. The model's `needs_review` outcomes also
-create review records without publishing. An operator can list candidates with
+create review records without publishing. New model records use bounded reasons
+for safety, medical/security, personal information, unclear meaning, alarming
+claims, other or unspecified. Existing `model_review` records cannot be assigned
+retrospective reasons. Bounded `held_*` counters distinguish these holds from
+ordinary model rejection and copy/translation validation failures. The diagnostic
+reason does not relax privacy, editorial or manual-review requirements.
+An operator can list candidates with
 `python scripts/review_cockpit_candidates.py`; viewing one requires running
 `sudo venv/bin/python3 scripts/review_cockpit_candidates.py --show ID` from the
 backend directory so

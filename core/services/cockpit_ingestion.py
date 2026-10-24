@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from .cockpit_stories import open_store, parse_time, utc_string
 from .cockpit_tracking import matches, tail
 from .cockpit_importance import KIND_WEIGHT, assign_importance, classify, with_tier
+from . import cockpit_ai
 
 # Searched every run: route changes, strikes, safety wording and the private
 # review terms (MAYDAY, PAN PAN and HIJACK only enter the metadata-only review
@@ -69,6 +70,7 @@ def init_store(path):
     db.execute("CREATE TABLE IF NOT EXISTS cockpit_review (id TEXT PRIMARY KEY, received TEXT NOT NULL, registration TEXT NOT NULL, provider_id INTEGER NOT NULL, reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending')")
     db.execute("CREATE INDEX IF NOT EXISTS cockpit_review_order ON cockpit_review(status,received DESC)")
     db.execute("CREATE TABLE IF NOT EXISTS cockpit_content (hash TEXT PRIMARY KEY, received TEXT NOT NULL)")
+    cockpit_ai.init_state(db)
     db.commit()
     return db
 
@@ -97,12 +99,16 @@ def api_allowance(db, now):
                         (now.strftime('api-day:%Y-%m-%d'),1,8000)])
 
 
-def ai_allowance(db, now):
+def ai_budget_entries(now):
     days = calendar.monthrange(now.year,now.month)[1]
     window=now.replace(minute=now.minute//10*10,second=0,microsecond=0)
-    return reserve(db, [(now.strftime('ai-month:%Y-%m'),RESERVE_USD,MONTHLY_USD),
+    return [(now.strftime('ai-month:%Y-%m'),RESERVE_USD,MONTHLY_USD),
                         (now.strftime('ai-day:%Y-%m-%d'),RESERVE_USD,MONTHLY_USD/days),
-                        (window.strftime('ai-window:%Y-%m-%dT%H:%M'),RESERVE_USD,.04)])
+                        (window.strftime('ai-window:%Y-%m-%dT%H:%M'),RESERVE_USD,.04)]
+
+
+def ai_allowance(db, now):
+    return reserve(db,ai_budget_entries(now))
 
 
 def routine_message(text):
@@ -252,6 +258,12 @@ excerpt (an exact contiguous substring of the message, <=280 characters), intere
 (integer 0-100 editorial score, not probability). Require review for safety,
 medical/security events, personal information, unclear meaning or potentially alarming
 claims. Only publish clearly supported, non-sensitive explanations. No notifications.
+Return review_reason as one of: none, safety, medical_security,
+personal_information, unclear_meaning, alarming_claim, other. If needs_review is
+true, select the primary reason; otherwise use none. This is a diagnostic label,
+not permission to relax any of the rules above. Routine or uninteresting content
+may be rejected with publish=false without requiring human review unless one of
+the review conditions above also applies.
 Also return translations: an object with ar (Arabic), de (German), es (Spanish),
 fr (French), it (Italian), pt-BR (Brazilian Portuguese), tr (Turkish).
 Each contains title and summary translated faithfully from the English title and
@@ -261,12 +273,13 @@ or change the original excerpt. Never add facts in any translation.
 
 SCHEMA = {'type':'OBJECT','properties':{
     'publish':{'type':'BOOLEAN'},'needs_review':{'type':'BOOLEAN'},
+    'review_reason':{'type':'STRING','enum':list(cockpit_ai.REVIEW_REASONS)},
     'category':{'type':'STRING','enum':list(CATEGORIES)},
     'title':{'type':'STRING'},'summary':{'type':'STRING'},'excerpt':{'type':'STRING'},
     'interest':{'type':'INTEGER'},
     'translations':{'type':'OBJECT','properties':{language:{'type':'OBJECT','properties':{
         'title':{'type':'STRING'},'summary':{'type':'STRING'}},'required':['title','summary']} for language in LANGUAGES},'required':list(LANGUAGES)}},
-    'required':['publish','needs_review','category','title','summary','excerpt','interest','translations']}
+    'required':['publish','needs_review','review_reason','category','title','summary','excerpt','interest','translations']}
 
 
 def valid_translations(value):
@@ -299,16 +312,26 @@ def run_terms(now):
 def pending_messages(db, targets=(), now=None):
     """Spend scarce reviews where the feed needs them. Every other slot goes
     to tracked flights or serious wording (when waiting); the rest to the kind
-    furthest below its target share of the last day's stories. Only fresh
+    furthest below its share of actual review attempts (with published history
+    as the cold-start baseline). Held topics must not consume slots forever
+    merely because they never publish. Only fresh
     messages; within a kind, specific actions and the newest first, one per
     aircraft while others wait."""
     if MAX_AI_PER_RUN <= 0:return []
     now=now or datetime.now(timezone.utc)
+    if cockpit_ai.cooling_down(db,now):return []
     fresh=utc_string(now-timedelta(hours=FRESH_CANDIDATE_HOURS))
     published=Counter(with_tier(json.loads(payload)).get('kind') for (payload,) in
                       db.execute('SELECT payload FROM cockpit_stories WHERE received >= ?',(utc_string(now-timedelta(hours=24)),)))
+    attempted=Counter(dict(db.execute('SELECT kind,SUM(attempts) FROM cockpit_ai_attempt WHERE attempted_at>=? GROUP BY kind',
+                                     (utc_string(now-timedelta(hours=24)),))))
+    considered=Counter({kind:max(published[kind],attempted[kind]) for kind in set(published)|set(attempted)})
     urgent=[];by_kind=defaultdict(list)
-    for key,payload in db.execute("SELECT id,payload FROM cockpit_queue WHERE status='pending' ORDER BY received DESC"):
+    for key,payload in db.execute('''SELECT q.id,q.payload FROM cockpit_queue q
+        LEFT JOIN cockpit_ai_attempt a ON a.id=q.id WHERE q.status='pending'
+        AND (a.attempts IS NULL OR a.attempts<?)
+        AND (a.next_attempt_at IS NULL OR a.next_attempt_at<=?) ORDER BY q.received DESC''',
+        (cockpit_ai.MAX_ATTEMPTS,utc_string(now))):
         message=json.loads(payload)
         if routine_message(message['text']):continue
         kind=classify({'transmission':message['text']})[0]
@@ -328,9 +351,9 @@ def pending_messages(db, targets=(), now=None):
         if urgent and (urgent_turn or not any(by_kind.values())):
             take(urgent)
         else:
-            total=sum(published.values())+sum(picked.values())+1
+            total=sum(considered.values())+sum(picked.values())+1
             kind=max((name for name,entries in by_kind.items() if entries),
-                     key=lambda name:(TARGET_SHARE.get(name,.05)*total-published[name]-picked[name],KIND_WEIGHT.get(name,0)))
+                     key=lambda name:(TARGET_SHARE.get(name,.05)*total-considered[name]-picked[name],KIND_WEIGHT.get(name,0)))
             take(by_kind[kind]);picked[kind]+=1
         urgent_turn=not urgent_turn
     return selected
@@ -495,14 +518,33 @@ async def ingest_tracked(db, targets, air_key, client, metrics, started, now):
     metrics['tracked_requests']=calls
 
 
-def validate_story(message,item):
-    if not isinstance(item,dict) or item.get('publish') is not True or item.get('needs_review') is not False:return None
-    if routine_message(message['text']):return None
-    if item.get('category') not in CATEGORIES or type(item.get('interest')) is not int or not 30<=item['interest']<=100:return None
+def review_reason(item):
+    value=item.get('review_reason') if isinstance(item,dict) else None
+    return value if value in cockpit_ai.REVIEW_REASONS and value!='none' else 'unspecified'
+
+
+def validation_reason(message,item):
+    """Finite diagnostic values only. No generated explanation or text in logs."""
+    if not isinstance(item,dict):return 'invalid_response'
+    if item.get('needs_review') is True:return 'model_review'
+    if item.get('needs_review') is not False:return 'invalid_review_flag'
+    if item.get('review_reason')!='none':return 'invalid_review_reason'
+    if item.get('publish') is False:return 'model_rejected'
+    if item.get('publish') is not True:return 'invalid_publish_flag'
+    if routine_message(message['text']):return 'routine'
+    if item.get('category') not in CATEGORIES:return 'invalid_category'
+    if type(item.get('interest')) is not int or not 0<=item['interest']<=100:return 'invalid_interest'
+    if item['interest']<30:return 'low_interest'
     for field, maximum in [('title',90),('summary',420),('excerpt',280)]:
-        if not isinstance(item.get(field),str) or not 1<=len(item[field])<=maximum or PRIVATE.search(item[field]):return None
-    if item['excerpt'] not in message['text']:return None
-    if not valid_translations(item.get('translations')):return None
+        if not isinstance(item.get(field),str) or not 1<=len(item[field])<=maximum:return 'invalid_copy'
+        if PRIVATE.search(item[field]):return 'private_copy'
+    if item['excerpt'] not in message['text']:return 'nonverbatim_excerpt'
+    if not valid_translations(item.get('translations')):return 'invalid_translations'
+    return None
+
+
+def validate_story(message,item):
+    if validation_reason(message,item) is not None:return None
     return dict(id=message['id'],title=item['title'],summary=item['summary'],category=item['category'], translations=item['translations'],
                 flight=message['flight'],registration=message['registration'],receivedAt=message['receivedAt'],
                 transmission=item['excerpt'],latitude=None,longitude=None,
@@ -519,6 +561,7 @@ async def run(path,air_key,gem_key,client,targets=()):
         # Keep the curated published archive through provider outages and age.
         db.execute('DELETE FROM cockpit_review WHERE received < ?',(cutoff,))
         db.execute('DELETE FROM cockpit_content WHERE received < ?',(cutoff,))
+        db.execute('DELETE FROM cockpit_ai_attempt WHERE received < ?',(cutoff,))
         db.execute("DELETE FROM cockpit_budget WHERE bucket LIKE 'api-minute:%' AND bucket < ?",('api-minute:'+utc_string(now-timedelta(days=2))[:16],))
     try:
         # Bound maintenance to the active week; archived stories keep their
@@ -568,6 +611,7 @@ async def run(path,air_key,gem_key,client,targets=()):
         metrics['retired_duplicates']=retire_duplicate_stories(db, since=cutoff)
         metrics['expired']=expire_stale_pending(db,now)
         pending=[] if metrics.get('provider_blocked') else pending_messages(db,targets)
+        if cockpit_ai.cooling_down(db,datetime.now(timezone.utc)):metrics['ai_cooldown']=1
         for key,payload in pending:
             if time.monotonic()-started>330:break
             message=json.loads(payload)
@@ -580,15 +624,19 @@ async def run(path,air_key,gem_key,client,targets=()):
             # <=10000 input tokens +6144 output tokens, no thinking tokens.
             # Conservatively reserve $0.02 including translated outputs.
             if len(json.dumps(body).encode())>10000:continue
-            if not ai_allowance(db,datetime.now(timezone.utc)):break
-            with db:db.execute("UPDATE cockpit_queue SET status='attempted' WHERE id=?",(key,))
+            attempt_now=datetime.now(timezone.utc)
+            kind=classify({'transmission':message['text']})[0]
+            if not cockpit_ai.claim(db,key,attempt_now,ai_budget_entries(attempt_now),kind,FRESH_CANDIDATE_HOURS):break
             metrics['ai_requests']+=1
+            metrics['ai_kind_'+kind]=metrics.get('ai_kind_'+kind,0)+1
+            if any(matches(message,flight) for flight in targets):metrics['ai_tracked']=metrics.get('ai_tracked',0)+1
             try:
                 response=await client.post('https://generativelanguage.googleapis.com/v1beta/models/'+MODEL+':generateContent',headers={'x-goog-api-key':gem_key},json=body)
                 response.raise_for_status();result=response.json();choice=result['candidates'][0]
                 if choice.get('finishReason')!='STOP':raise ValueError('incomplete')
                 item=json.loads(''.join(p.get('text','') for p in choice['content']['parts']))
                 story=validate_story(message,item)
+                reason=validation_reason(message,item)
                 with db:
                     if story and duplicate_story(db,story):
                         metrics['duplicates']+=1
@@ -600,17 +648,34 @@ async def run(path,air_key,gem_key,client,targets=()):
                     else:
                         metrics['held']+=1
                         if isinstance(item,dict) and item.get('needs_review') is True:
+                            reason='review_'+review_reason(item)
                             review_row={'id':message.get('providerId'),'tail':message['registration']}
-                            recorded=record_review(db,review_row,key,parse_time(message['receivedAt']),'model_review')
+                            recorded=record_review(db,review_row,key,parse_time(message['receivedAt']),'model_'+reason)
                         else:recorded=False
                         status='review' if recorded else 'held'
+                        metric='held_'+reason
+                        metrics[metric]=metrics.get(metric,0)+1
                     # Raw text is kept only while a message may still be retried.
                     db.execute('UPDATE cockpit_queue SET status=?,payload=? WHERE id=?',(status,'{}' if status in ('published','review','duplicate') else payload,key))
+                    db.execute('UPDATE cockpit_ai_attempt SET last_reason=? WHERE id=?',(reason or status,key))
+            except httpx.HTTPStatusError as exc:
+                metrics['errors']+=1
+                reason,deferred=cockpit_ai.http_failure(db,key,exc.response,datetime.now(timezone.utc),FRESH_CANDIDATE_HOURS)
+                metric='ai_'+reason;metrics[metric]=metrics.get(metric,0)+1
+                if deferred:metrics['ai_deferred']=metrics.get('ai_deferred',0)+1
+                if cockpit_ai.cooling_down(db,datetime.now(timezone.utc)):
+                    metrics['ai_cooldown']=1;break
             except Exception as exc:
                 metrics['errors']+=1
-                reason='ai_'+type(exc).__name__
+                # Timeouts/transport failures are ambiguous and never replayed.
+                reason=('timeout_unknown' if isinstance(exc,httpx.TimeoutException)
+                        else 'transport_unknown' if isinstance(exc,httpx.TransportError)
+                        else 'invalid_response')
+                reason='ai_'+reason
                 metrics[reason]=metrics.get(reason,0)+1
-                with db:db.execute("UPDATE cockpit_queue SET status='failed',payload='{}' WHERE id=?",(key,))
+                with db:
+                    db.execute("UPDATE cockpit_queue SET status='failed',payload='{}' WHERE id=?",(key,))
+                    db.execute('UPDATE cockpit_ai_attempt SET last_reason=? WHERE id=?',(reason,key))
         metrics['ranked']=assign_importance(db, since=cutoff)
         metrics['backlogged_terms']=db.execute('SELECT COUNT(*) FROM cockpit_cursor WHERE until_time IS NOT NULL').fetchone()[0]
         metrics['pending']=db.execute("SELECT COUNT(*) FROM cockpit_queue WHERE status='pending'").fetchone()[0]

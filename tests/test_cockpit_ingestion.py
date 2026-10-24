@@ -95,7 +95,7 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT status FROM cockpit_queue WHERE id=?",(old['id'],)).fetchone()[0],'suppressed')
     def test_publication_guards(self):
         msg=dict(id='x',text='NEED GPU UPON ARRIVAL APU INOP',flight=None,registration='N123AB',receivedAt=c.utc_string(self.now))
-        good=dict(publish=True,needs_review=False,category='Operations',title='Ground power requested',summary='The crew requests external power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
+        good=dict(publish=True,needs_review=False,review_reason='none',category='Operations',title='Ground power requested',summary='The crew requests external power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
         self.assertIsNotNone(c.validate_story(msg,good))
         for change in (dict(translations={}),dict(translations=None),dict(needs_review=True),dict(publish='true'),dict(excerpt='invented'),dict(interest=101),dict(summary='email me@example.com'),dict(category='Unknown')):
             self.assertIsNone(c.validate_story(msg,dict(good,**change)))
@@ -104,7 +104,7 @@ class IngestionTests(unittest.TestCase):
         def handler(req):
             calls.append(req.method)
             if req.method=='GET':return httpx.Response(200,json=[self.row()])
-            data=dict(publish=True,needs_review=False,category='Operations',title='Ground power',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
+            data=dict(publish=True,needs_review=False,review_reason='none',category='Operations',title='Ground power',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
             return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(data)}]}}]})
         async def run():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -152,7 +152,7 @@ class IngestionTests(unittest.TestCase):
     def test_model_review_has_no_public_story_or_raw_queue_payload(self):
         def handler(req):
             if req.method=='GET':return httpx.Response(200,json=[dict(self.row(),text='SMELL IN CABIN REPORTED')])
-            item=dict(publish=False,needs_review=True,category='Cabin',title='Review',summary='Review needed',
+            item=dict(publish=False,needs_review=True,review_reason='safety',category='Cabin',title='Review',summary='Review needed',
                       excerpt='SMELL',interest=80,translations={lang:{'title':'Review','summary':'Review needed'} for lang in c.LANGUAGES})
             return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(item)}]}}]})
         async def run():
@@ -202,7 +202,7 @@ class IngestionTests(unittest.TestCase):
             if req.method=='GET':
                 if req.url.params.get('text')=='bad':return httpx.Response(500,text='secret response')
                 return httpx.Response(200,json=[self.row()])
-            item=dict(publish=True,needs_review=False,category='Operations',title='Ground power',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,
+            item=dict(publish=True,needs_review=False,review_reason='none',category='Operations',title='Ground power',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,
                       translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
             return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(item)}]}}]})
         async def execute():
@@ -363,7 +363,7 @@ class IngestionTests(unittest.TestCase):
             if req.method=='GET':
                 row=rows[min(len(served),len(rows)-1)];served.append(row['id'])
                 return httpx.Response(200,json=[row])
-            data=dict(publish=True,needs_review=False,category='Operations',title='Ground power requested',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
+            data=dict(publish=True,needs_review=False,review_reason='none',category='Operations',title='Ground power requested',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
             return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(data)}]}}]})
         async def run():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
