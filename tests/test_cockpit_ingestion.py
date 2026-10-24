@@ -59,6 +59,55 @@ class IngestionTests(unittest.TestCase):
         self.assertFalse(c.routine_message('DIVERTING TO KIAH DUE SIGMET AT DESTINATION'))
         self.assertFalse(c.routine_message('BIRD STRIKE ON CLIMB OUT RETURNING TO KIAH'))
         self.assertFalse(c.routine_message('ITS OUR FIRST OFFICERS BIRTHDAY TODAY'))
+    def test_narrow_prefilters_and_mixed_report_controls(self):
+        samples={
+            'CODE.AB.A1B2C3D4E5F60789':'encoded_data',
+            'FPN/RP:DA:1234:AA/FB:ZZZZ':'structured_machine_record',
+            'PER/PR1,050,220,300,AB':'structured_machine_record',
+            'INTERSECTS WSI REGION FPG TYPE TURBULENCE VALID 250000Z-250600Z':'regional_weather_bulletin',
+            'FDE 123456 MSG 1234 SMOKE DETECTOR FDE 654321 MSG 4321':'coded_diagnostic_report',
+            'TWY A CLSD CRANES BIRD STRIKE HAZ':'airport_bulletin',
+            'TWY B CLSD BIRD STRIKE HAZ':'airport_bulletin',
+        }
+        metrics={}
+        for text,reason in samples.items():
+            with self.subTest(text=text):
+                self.assertEqual(c.prefilter_reason(text),reason)
+                with self.db:c.queue_message(self.db,dict(self.row(),text=text),self.now,tracked=True,metrics=metrics)
+                for report in (' WE ENCOUNTERED TURBULENCE',' NEED GPU',' SMOKE IN CABIN',
+                               ' DIVERTING TO KZZZ',' WE HAD A BIRD STRIKE'):
+                    self.assertIsNone(c.prefilter_reason(text+report))
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_queue').fetchone()[0],0)
+        self.assertEqual(sum(metrics.values()),len(samples))
+        for text in ('FPN/RP: CREW NOTE','INTERSECTS WSI TURBULENCE',
+                     'FDE 123456 MSG 1234 SMOKE DETECTOR',
+                     'BIRD STRIKE ON CLIMB OUT','DEVIATING FOR TURBULENCE','NEED GPU APU INOP'):
+            self.assertIsNone(c.prefilter_reason(text))
+
+    def test_new_filters_leave_archive_and_nonpending_records_unchanged(self):
+        text='CODE.AB.A1B2C3D4E5F60789'
+        with self.db:
+            for status in ('pending','held','review','attempted','published'):
+                payload=dict(id=status,registration='N123AB',receivedAt=c.utc_string(self.now),text=text)
+                self.db.execute('INSERT INTO cockpit_queue VALUES (?,?,?,?)',
+                    (status,payload['receivedAt'],json.dumps(payload),status))
+            self.db.execute('INSERT INTO cockpit_stories VALUES (?,?,?,?)',
+                ('published',c.utc_string(self.now),'N123AB',json.dumps(dict(transmission=text))))
+        self.assertEqual(c.pending_messages(self.db,now=self.now),[])
+        self.assertEqual(c.suppress_routine_pending(self.db),1)
+        self.assertEqual(c.suppress_routine_pending(self.db),0)
+        self.assertEqual(c.retire_routine_stories(self.db),0)
+        for status in ('held','review','attempted','published'):
+            self.assertEqual(self.db.execute('SELECT status FROM cockpit_queue WHERE id=?',(status,)).fetchone()[0],status)
+
+    def test_new_prefilters_do_not_bypass_sensitive_review_or_contact_filter(self):
+        metrics={}
+        for suffix in (' MAYDAY',' PLEASE EMAIL private@example.com'):
+            with self.db:c.queue_message(self.db,dict(self.row(),text='PER/PR1,123,456'+suffix),self.now,metrics=metrics)
+        self.assertEqual(metrics,{})
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_queue').fetchone()[0],0)
+        self.assertEqual(self.db.execute('SELECT reason FROM cockpit_review').fetchall(),[('sensitive_event',)])
+
     def test_sensitive_event_has_only_private_metadata(self):
         row=dict(self.row(),text='MAYDAY DIVERTING TO KIAH PLEASE PHONE 12345678901')
         with self.db:c.queue_message(self.db,row,datetime.now(timezone.utc))
@@ -95,7 +144,7 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT status FROM cockpit_queue WHERE id=?",(old['id'],)).fetchone()[0],'suppressed')
     def test_publication_guards(self):
         msg=dict(id='x',text='NEED GPU UPON ARRIVAL APU INOP',flight=None,registration='N123AB',receivedAt=c.utc_string(self.now))
-        good=dict(publish=True,needs_review=False,review_reason='none',category='Operations',title='Ground power requested',summary='The crew requests external power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
+        good=dict(publish=True,needs_review=False,review_reason='none',rejection_reason='none',category='Operations',title='Ground power requested',summary='The crew requests external power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
         self.assertIsNotNone(c.validate_story(msg,good))
         for change in (dict(translations={}),dict(translations=None),dict(needs_review=True),dict(publish='true'),dict(excerpt='invented'),dict(interest=101),dict(summary='email me@example.com'),dict(category='Unknown')):
             self.assertIsNone(c.validate_story(msg,dict(good,**change)))
@@ -104,7 +153,7 @@ class IngestionTests(unittest.TestCase):
         def handler(req):
             calls.append(req.method)
             if req.method=='GET':return httpx.Response(200,json=[self.row()])
-            data=dict(publish=True,needs_review=False,review_reason='none',category='Operations',title='Ground power',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
+            data=dict(publish=True,needs_review=False,review_reason='none',rejection_reason='none',category='Operations',title='Ground power',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
             return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(data)}]}}]})
         async def run():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -202,7 +251,7 @@ class IngestionTests(unittest.TestCase):
             if req.method=='GET':
                 if req.url.params.get('text')=='bad':return httpx.Response(500,text='secret response')
                 return httpx.Response(200,json=[self.row()])
-            item=dict(publish=True,needs_review=False,review_reason='none',category='Operations',title='Ground power',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,
+            item=dict(publish=True,needs_review=False,review_reason='none',rejection_reason='none',category='Operations',title='Ground power',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,
                       translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
             return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(item)}]}}]})
         async def execute():
@@ -363,7 +412,7 @@ class IngestionTests(unittest.TestCase):
             if req.method=='GET':
                 row=rows[min(len(served),len(rows)-1)];served.append(row['id'])
                 return httpx.Response(200,json=[row])
-            data=dict(publish=True,needs_review=False,review_reason='none',category='Operations',title='Ground power requested',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
+            data=dict(publish=True,needs_review=False,review_reason='none',rejection_reason='none',category='Operations',title='Ground power requested',summary='The crew requests ground power.',excerpt='NEED GPU',interest=50,translations={lang:{'title':'Ground power','summary':'External power requested.'} for lang in c.LANGUAGES})
             return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(data)}]}}]})
         async def run():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:

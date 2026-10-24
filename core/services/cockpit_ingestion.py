@@ -131,6 +131,46 @@ def routine_message(text):
     return False
 
 
+# These additions apply only before AI selection, never to archive retirement or
+# push eligibility. Mixed human reports stay available for the existing AI gates.
+HUMAN_REPORT = re.compile(
+    r'\b(?:WE|OUR|I|ENCOUNTERED|EXPERIENCED|OBSERVED|DEVIATING|REQUEST(?:ING|ED)?|NEED|'
+    r'CONFIRMED|REPORTED|HAD|STRUCK)\b|\b(?:SMOKE|FUMES|FIRE) IN\b', re.I)
+
+
+def prefilter_reason(text):
+    """Narrow machine-format exclusions, not a decoder or publication decision."""
+    value=text.upper().strip()
+    # Existing privacy/review handling takes precedence even in old pending data.
+    if PRIVATE.search(value) or SENSITIVE_EVENT.search(value):return None
+    if ACTUAL_ACTION.search(value) or HUMAN_REPORT.search(value):return None
+    if (len(value)>=20 and value.count('.')>=2 and re.fullmatch(r'[A-Z0-9.]+',value)
+            and re.search(r'[0-9A-F]{12,}$',value)):
+        return 'encoded_data'
+    if (re.match(r'^PER/PR\d',value) or
+            (value.startswith('FPN/RP:') and re.search(r'\d',value)
+             and value.count('/')+value.count(':')>=3)):
+        return 'structured_machine_record'
+    if (value.startswith('INTERSECTS WSI ') and ' FPG TYPE ' in value
+            and re.search(r'\bVALID \d{6}Z-\d{6}Z\b',value)):
+        return 'regional_weather_bulletin'
+    if (len(re.findall(r'\bFDE \d{6,}\b',value))>=2
+            and len(re.findall(r'\bMSG \d{4,}\b',value))>=2):
+        return 'coded_diagnostic_report'
+    notices=sum(bool(pattern.search(value)) for pattern in AIRPORT_NOTICE)
+    if re.search(r'\bCRANES\b',value) and not re.search(r'\bCRANE\b',value):notices+=1
+    if notices>=3:return 'airport_bulletin'
+    if notices>=2 and re.search(r'\b(?:BIRD|LIGHTNING) STRIKE HAZ\b',value):
+        return 'airport_bulletin'
+    return None
+
+
+def count_prefilter(metrics,reason):
+    if metrics is not None:
+        key='prefilter_'+reason
+        metrics[key]=metrics.get(key,0)+1
+
+
 def story_identity(story):
     """One story per aircraft and headline: re-sent alerts and standing notices
     differ in raw text but describe the same thing."""
@@ -213,7 +253,7 @@ def expire_stale_pending(db, now):
                           (cutoff,)).rowcount
 
 
-def queue_message(db,row,now,*,tracked=False):
+def queue_message(db,row,now,*,tracked=False,metrics=None):
     stamp=parse_time(row.get('timestamp')); text=row.get('text');tail=row.get('tail')
     if not stamp or not now-timedelta(hours=FRESH_CANDIDATE_HOURS)<=stamp<=now+timedelta(minutes=1):return
     if not isinstance(text,str) or not 8<=len(text)<=1800:return
@@ -226,6 +266,10 @@ def queue_message(db,row,now,*,tracked=False):
         return
     if CONTACT.search(text) or re.search(r'\+?\d[\d ()-]{8,}\d',text):return
     if PRIVATE.search(text) or routine_message(text):return
+    reason=prefilter_reason(text)
+    if reason:
+        count_prefilter(metrics,reason)
+        return
     flight=row.get('flightNumber')
     if not isinstance(flight,str) or not re.fullmatch(r'[A-Za-z0-9]{3,10}',flight):flight=None
     payload=dict(id=key,providerId=row.get('id'),registration=tail.upper(),flight=flight,
@@ -264,6 +308,11 @@ true, select the primary reason; otherwise use none. This is a diagnostic label,
 not permission to relax any of the rules above. Routine or uninteresting content
 may be rejected with publish=false without requiring human review unless one of
 the review conditions above also applies.
+Return rejection_reason as one of: none, encoded_data, bulletin,
+routine_telemetry, no_actual_event, low_interest, other. Use none when publishing
+or requiring review. Otherwise choose the primary rejection reason. Encoded or
+structured machine data must not be guessed into a story. This label is diagnostic
+only and never overrides privacy, safety, uncertainty or review requirements.
 Also return translations: an object with ar (Arabic), de (German), es (Spanish),
 fr (French), it (Italian), pt-BR (Brazilian Portuguese), tr (Turkish).
 Each contains title and summary translated faithfully from the English title and
@@ -274,12 +323,13 @@ or change the original excerpt. Never add facts in any translation.
 SCHEMA = {'type':'OBJECT','properties':{
     'publish':{'type':'BOOLEAN'},'needs_review':{'type':'BOOLEAN'},
     'review_reason':{'type':'STRING','enum':list(cockpit_ai.REVIEW_REASONS)},
+    'rejection_reason':{'type':'STRING','enum':list(cockpit_ai.REJECTION_REASONS)},
     'category':{'type':'STRING','enum':list(CATEGORIES)},
     'title':{'type':'STRING'},'summary':{'type':'STRING'},'excerpt':{'type':'STRING'},
     'interest':{'type':'INTEGER'},
     'translations':{'type':'OBJECT','properties':{language:{'type':'OBJECT','properties':{
         'title':{'type':'STRING'},'summary':{'type':'STRING'}},'required':['title','summary']} for language in LANGUAGES},'required':list(LANGUAGES)}},
-    'required':['publish','needs_review','review_reason','category','title','summary','excerpt','interest','translations']}
+    'required':['publish','needs_review','review_reason','rejection_reason','category','title','summary','excerpt','interest','translations']}
 
 
 def valid_translations(value):
@@ -333,7 +383,7 @@ def pending_messages(db, targets=(), now=None):
         AND (a.next_attempt_at IS NULL OR a.next_attempt_at<=?) ORDER BY q.received DESC''',
         (cockpit_ai.MAX_ATTEMPTS,utc_string(now))):
         message=json.loads(payload)
-        if routine_message(message['text']):continue
+        if routine_message(message['text']) or prefilter_reason(message['text']):continue
         kind=classify({'transmission':message['text']})[0]
         if message['receivedAt']<fresh:continue
         entry=(candidate_priority(message,targets),message['receivedAt'],key,payload,message['registration'])
@@ -359,13 +409,16 @@ def pending_messages(db, targets=(), now=None):
     return selected
 
 
-def suppress_routine_pending(db):
+def suppress_routine_pending(db,metrics=None):
     """Retire existing bulletin backlog without sending it to AI."""
     ids=[]
     for key,payload in db.execute("SELECT id,payload FROM cockpit_queue WHERE status='pending'"):
-        if routine_message(json.loads(payload)['text']):ids.append((key,))
+        text=json.loads(payload)['text']
+        if routine_message(text):ids.append((key,))
+        elif (reason:=prefilter_reason(text)):
+            ids.append((key,));count_prefilter(metrics,reason)
     with db:
-        db.executemany("UPDATE cockpit_queue SET status='suppressed',payload='{}' WHERE id=?",ids)
+        db.executemany("UPDATE cockpit_queue SET status='suppressed',payload='{}' WHERE id=? AND status='pending'",ids)
     return len(ids)
 
 
@@ -507,7 +560,7 @@ async def ingest_tracked(db, targets, air_key, client, metrics, started, now):
             with db:
                 for row in rows:
                     candidate=dict(receivedAt=row.get('timestamp'),registration=row.get('tail'),flight=row.get('flightNumber'))
-                    if any(matches(candidate,f) for f in flights):queue_message(db,row,now,tracked=True)
+                    if any(matches(candidate,f) for f in flights):queue_message(db,row,now,tracked=True,metrics=metrics)
                 if len(rows)==PROVIDER_PAGE_SIZE:before=min(ids)
                 else:since=utc_string(parse_time(until)-timedelta(minutes=2));until=None;before=None
                 db.execute('INSERT OR REPLACE INTO cockpit_cursor VALUES (?,?,?,?)',(key,since,until,before))
@@ -529,8 +582,12 @@ def validation_reason(message,item):
     if item.get('needs_review') is True:return 'model_review'
     if item.get('needs_review') is not False:return 'invalid_review_flag'
     if item.get('review_reason')!='none':return 'invalid_review_reason'
-    if item.get('publish') is False:return 'model_rejected'
+    rejection=item.get('rejection_reason')
+    if not isinstance(rejection,str) or rejection not in cockpit_ai.REJECTION_REASONS:return 'invalid_rejection_reason'
+    if item.get('publish') is False:
+        return 'model_rejected_'+rejection if rejection!='none' else 'invalid_rejection_reason'
     if item.get('publish') is not True:return 'invalid_publish_flag'
+    if rejection!='none':return 'invalid_rejection_reason'
     if routine_message(message['text']):return 'routine'
     if item.get('category') not in CATEGORIES:return 'invalid_category'
     if type(item.get('interest')) is not int or not 0<=item['interest']<=100:return 'invalid_interest'
@@ -596,7 +653,7 @@ async def run(path,air_key,gem_key,client,targets=()):
                     break  # Do not advance a failed page or abort healthy terms.
                 with db:
                     for row in rows:
-                        queue_message(db,row,now)
+                        queue_message(db,row,now,metrics=metrics)
                     if len(rows)==PROVIDER_PAGE_SIZE:before=min(ids)
                     else:
                         since=utc_string(parse_time(until)-timedelta(minutes=2));until=None;before=None
@@ -606,7 +663,7 @@ async def run(path,air_key,gem_key,client,targets=()):
         # Provider freshness is separate from AI outcomes/budget exhaustion.
         if metrics['errors']==0:
             with db:db.execute("INSERT OR REPLACE INTO cockpit_metadata VALUES ('updated_at',?)",(utc_string(datetime.now(timezone.utc)),))
-        metrics['suppressed']=suppress_routine_pending(db)
+        metrics['suppressed']=suppress_routine_pending(db,metrics)
         metrics['retired_stories']=retire_routine_stories(db, since=cutoff)
         metrics['retired_duplicates']=retire_duplicate_stories(db, since=cutoff)
         metrics['expired']=expire_stale_pending(db,now)

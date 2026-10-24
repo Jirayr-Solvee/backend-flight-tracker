@@ -10,6 +10,8 @@ TRANSIENT_HTTP = frozenset((429, 500, 502, 503, 504))
 KNOWN_HTTP = frozenset((400, 401, 402, 403, 404, 408, 409, 413, 422, 429, 500, 501, 502, 503, 504))
 REVIEW_REASONS = ('none', 'safety', 'medical_security', 'personal_information',
                   'unclear_meaning', 'alarming_claim', 'other')
+REJECTION_REASONS = ('none', 'encoded_data', 'bulletin', 'routine_telemetry',
+                     'no_actual_event', 'low_interest', 'other')
 KINDS = frozenset(('safety','strike','crew','cabin','cargo','weather','other','route','ground'))
 
 

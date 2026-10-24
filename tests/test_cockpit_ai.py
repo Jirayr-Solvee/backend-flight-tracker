@@ -133,7 +133,7 @@ class CockpitAITests(unittest.TestCase):
 
     def test_missing_or_conflicting_review_reason_cannot_publish(self):
         message=dict(id='x',text='NEED GPU',flight=None,registration='N123AB',receivedAt=c.utc_string(self.now))
-        item=dict(publish=True,needs_review=False,review_reason='none',category='Operations',title='Ground power',
+        item=dict(publish=True,needs_review=False,review_reason='none',rejection_reason='none',category='Operations',title='Ground power',
                   summary='Power requested.',excerpt='NEED GPU',interest=50,
                   translations={lang:dict(title='Power',summary='Power requested.') for lang in c.LANGUAGES})
         self.assertIsNotNone(c.validate_story(message,item))
@@ -143,6 +143,40 @@ class CockpitAITests(unittest.TestCase):
             reviewed=dict(item,needs_review=True,review_reason=reason)
             self.assertIsNone(c.validate_story(message,reviewed))
             self.assertIn(c.review_reason(reviewed),(*ai.REVIEW_REASONS,'unspecified'))
+
+    def test_rejection_labels_are_required_bounded_and_never_override_review(self):
+        message=dict(text='NEED GPU')
+        base=dict(publish=False,needs_review=False,review_reason='none')
+        for reason in ai.REJECTION_REASONS[1:]:
+            item=dict(base,rejection_reason=reason)
+            self.assertEqual(c.validation_reason(message,item),'model_rejected_'+reason)
+            self.assertEqual(c.validation_reason(message,dict(item,publish=True)),'invalid_rejection_reason')
+        for value in (None,'none','freeform secret@example.com',{},[],True):
+            item=dict(base,rejection_reason=value)
+            self.assertEqual(c.validation_reason(message,item),'invalid_rejection_reason')
+            self.assertEqual(c.validation_reason(message,dict(item,needs_review=True)),'model_review')
+        self.assertEqual(c.validation_reason(message,base),'invalid_rejection_reason')
+        self.assertIn('rejection_reason',c.SCHEMA['required'])
+
+    def test_rejection_label_persists_without_freeform_diagnostic(self):
+        self.queue()
+        item=dict(publish=False,needs_review=False,review_reason='none',rejection_reason='low_interest')
+        result=self.run_mock(lambda _:httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(item)}]}}]}))
+        self.assertEqual(result['held_model_rejected_low_interest'],1)
+        self.assertEqual(self.db.execute('SELECT last_reason FROM cockpit_ai_attempt').fetchone()[0],'model_rejected_low_interest')
+        self.assertEqual(result['published'],0)
+
+    def test_prefiltered_pending_never_claims_ai_or_debits_budget(self):
+        text='CODE.AB.A1B2C3D4E5F60789'
+        payload=dict(id='machine',text=text,registration='N123AB',receivedAt=c.utc_string(self.now))
+        with self.db:self.db.execute('INSERT INTO cockpit_queue VALUES (?,?,?,?)',
+            ('machine',payload['receivedAt'],json.dumps(payload),'pending'))
+        result=self.run_mock(lambda _:self.fail('unexpected AI spend'))
+        self.assertEqual(result['prefilter_encoded_data'],1)
+        self.assertEqual(result['ai_requests'],0)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_ai_attempt').fetchone()[0],0)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM cockpit_budget').fetchone()[0],0)
+        self.assertEqual(self.db.execute('SELECT status,payload FROM cockpit_queue').fetchone(),('suppressed','{}'))
 
     def run_mock(self,post):
         def handler(request):
