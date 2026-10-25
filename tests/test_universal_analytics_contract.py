@@ -1,4 +1,4 @@
-"""Synthetic schema-21 universal-flow compatibility, not launch/SDK proof.
+"""Synthetic schema-21/22 universal-flow compatibility, not launch/SDK proof.
 
 Existing captured cohorts remain readable and retryable. A new compact paywall
 is a presentation, not permission to fabricate an experiment or fallback arm.
@@ -198,6 +198,60 @@ class UniversalAnalyticsContractTests(unittest.TestCase):
         paywall = self.session.get(ExperimentDiagnosticEvent, str(events[3].event_id))
         self.assertEqual(json.loads(paywall.properties_json),
                          {"event_schema_version": 21, **self.universal_properties()})
+
+    def test_schema22_4999_annual_everywhere_preserves_frozen_v1_offers(self):
+        installation = uuid4()
+        standard = "com.zhirayr.Flighttracker.yearly.trial7d"
+        weekly = "com.zhirayr.Flighttracker.weekly"
+        old = [
+            self.event("paywall_viewed", installation, schema=21,
+                       presentation=uuid4(), properties=self.universal_properties()),
+            self.event("paywall_viewed", installation, schema=21, presentation=uuid4(), properties={
+                **self.universal_properties(), "source": "number_search", "paywall_surface": "other",
+                "offer_context": "standard_annual_offer", "assigned_product_id": standard,
+                "displayed_product_id": standard, "effective_offer": "standard",
+            }),
+        ]
+        self.send(*old)
+        old_rows = {str(event.event_id): self.session.get(
+            ExperimentDiagnosticEvent, str(event.event_id)).model_dump() for event in old}
+        events = []
+        for source in ("universal_onboarding", "number_search", "airport_search", "global_map", "profile", "copilot"):
+            selected = source != "profile"
+            properties = {
+                **self.universal_properties(), "source": source,
+                "config_version": "universal_onboarding_v2",
+                "paywall_surface": "selected_flight" if selected else "other",
+                "offer_context": "selected_flight_4999" if selected else "standard_annual_4999",
+                "assigned_product_id": YEARLY_PRODUCT, "displayed_product_id": YEARLY_PRODUCT,
+            }
+            presentation = uuid4()
+            events.append(self.event("paywall_viewed", installation, schema=22,
+                                     presentation=presentation, properties=properties))
+            events.append(self.event("subscription_product_selected", installation, schema=22,
+                                     presentation=presentation, properties={
+                                         **properties, "selection_method": "user",
+                                         "displayed_product_id": weekly, "product_id": weekly,
+                                     }))
+        self.assertEqual(self.send(*events)["accepted"], len(events))
+        self.assertEqual(self.send(*old, *events)["duplicates"], len(events) + len(old))
+        for event_id, old_row in old_rows.items():
+            self.assertEqual(self.session.get(ExperimentDiagnosticEvent, event_id).model_dump(), old_row)
+        self.assertTrue(all(rows == [] for rows in self.snapshot().values()))
+        for event in events:
+            row = self.session.get(ExperimentDiagnosticEvent, str(event.event_id))
+            self.assertIsNone(row.experiment_id)
+            properties = json.loads(row.properties_json)
+            self.assertEqual(properties, event.properties.model_dump(mode="json", exclude_none=True))
+            self.assertEqual(properties["event_schema_version"], 22)
+            self.assertEqual(properties["config_version"], "universal_onboarding_v2")
+            self.assertEqual(properties["assigned_product_id"], YEARLY_PRODUCT)
+            self.assertEqual(properties["offer_context"],
+                             "standard_annual_4999" if properties["source"] == "profile" else "selected_flight_4999")
+            self.assertEqual(properties["paywall_surface"],
+                             "other" if properties["source"] == "profile" else "selected_flight")
+            self.assertEqual(properties["displayed_product_id"],
+                             weekly if event.event_name == "subscription_product_selected" else YEARLY_PRODUCT)
 
     def test_same_installation_legacy_history_is_unchanged_by_universal_capture(self):
         context = self.historical_legacy()

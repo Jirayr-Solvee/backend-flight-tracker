@@ -63,6 +63,26 @@ class DelayRiskService:
             api_client.get_airport_delay(airport_iata=departure_airport_iata),
             api_client.get_airport_delay(airport_iata=arrival_airport_iata),
         )
+        return DelayRiskService.compose(
+            flight=flight,
+            flight_delay_stats=flight_delay_stats,
+            departure_airport_delay=departure_airport_delay,
+            arrival_airport_delay=arrival_airport_delay,
+        )
+
+    @staticmethod
+    def compose(
+        flight: Any,
+        flight_delay_stats: Any,
+        departure_airport_delay: Any,
+        arrival_airport_delay: Any,
+    ) -> DelayRiskResponse:
+        """Score already-fetched provider payloads. Pure: no I/O.
+
+        `flight` needs only `id`, `status` and, on `departure` and `arrival`,
+        the scheduled/revised/predicted/runway UTC times. The paid endpoint and
+        the onboarding preview share this scoring exactly.
+        """
         flight_delay_stats = DelayRiskService._as_dict(flight_delay_stats)
         departure_airport_delay = DelayRiskService._as_dict(departure_airport_delay)
         arrival_airport_delay = DelayRiskService._as_dict(arrival_airport_delay)

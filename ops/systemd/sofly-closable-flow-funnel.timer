@@ -1,0 +1,11 @@
+[Unit]
+Description=Derive the closable-flow funnel ledger daily, long before the 90-day diagnostics purge
+
+[Timer]
+OnCalendar=*-*-* 03:20:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=sofly-closable-flow-funnel.service
+
+[Install]
+WantedBy=timers.target

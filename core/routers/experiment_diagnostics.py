@@ -17,7 +17,8 @@ from ..models.experiment import ExperimentDiagnosticEvent, current_time_ms
 from ..models.transaction import Transaction
 from ..models.user import User, UserSubscriptionLink
 from .subscriptions import ExperimentContext
-from ..activation_journey_contract import ActivationJourneyContext
+from .. import closable_flow_policy as closable_flow
+from ..activation_journey_contract import ActivationJourneyContext, CLOSABLE_FLOW_ID
 from ..models.activation_journey import ActivationJourneyDiagnosticContext
 from ..services.activation_journey import record_journey_diagnostic, validate_journey, reserve_legacy_installation
 from ..services.notification_analytics import seal_copy, open_copy
@@ -32,6 +33,17 @@ SETTING_VALUES = {
     "history_sort": frozenset(("date_ascending", "date_descending", "airline_ascending", "airline_descending",
                                 "departure_ascending", "departure_descending", "arrival_ascending", "arrival_descending")),
 }
+# Onboarding delay preview (closable_flow_2026_10 test arm, schema 28). The
+# paid flight-detail card keeps its own source and loose historical payload.
+DELAY_PREVIEW_SOURCE = "onboarding_preview"
+DELAY_PREVIEW_LEVELS = frozenset(("low", "medium", "high"))
+DELAY_PREVIEW_CACHE_OUTCOMES = frozenset(("computed", "flight_cache", "stored"))
+DELAY_PREVIEW_LOAD_SCOPES = frozenset(("initial_presentation", "after_fallback"))
+DELAY_PREVIEW_FAILURE_REASONS = frozenset((
+    "insufficient_data", "limit_reached", "not_eligible", "invalid_flight", "flight_not_eligible", "disabled",
+    "capacity", "provider_unavailable", "pending_timeout", "timeout", "cancelled", "network", "unauthorized",
+    "server_error", "decoding",
+))
 EventName = Literal[
     "app_launched", "app_became_active", "app_became_inactive",
     "apns_registered", "apns_registration_failed", "push_received", "push_opened",
@@ -122,12 +134,17 @@ class DiagnosticProperties(BaseModel):
     suggestion_count: Annotated[int, Field(ge=0, le=1000)] | None = None
     step: Annotated[int, Field(ge=0, le=100)] | None = None
     total_steps: Annotated[int, Field(ge=0, le=100)] | None = None
-    effective_onboarding: Literal["search_first", "goals"] | None = None
-    effective_paywall: Literal["standard", "flight_detail"] | None = None
-    effective_offer: Literal["standard", "flight_detail_treatment"] | None = None
+    effective_onboarding: Literal["search_first", "goals", "own_flight_preview"] | None = None
+    effective_paywall: Literal["standard", "flight_detail", "hard", "closable_one_screen", "hard_one_screen", "soft_one_screen"] | None = None
+    effective_offer: Literal["standard", "flight_detail_treatment", "annual_weekly", "annual_weekly_lifetime"] | None = None
     goals_status: Literal["not_asked", "required", "confirmed"] | None = None
     paywall_surface: Literal["selected_flight", "skip_flight", "airport", "other"] | None = None
-    operational_override: Literal["none", "forced_standard", "configuration_fallback"] | None = None
+    operational_override: Literal["none", "forced_standard", "configuration_fallback",
+                                  "forced_control", "lifetime_disabled"] | None = None
+    # Schema 28 (closable_flow_2026_10): the randomized arm, and whether the
+    # Lifetime row was actually on screen for this presentation.
+    arm: Literal["control_hard_paywall", "closable_own_flight", "matched_hard_paywall", "matched_soft_paywall"] | None = None
+    lifetime_offered: bool | None = None
     selection_eligible: bool | None = None
     # Schema 20 extends the operational projection, never arbitrary analytics
     # dictionaries. Human labels, queries, routes, callsigns and payload bodies
@@ -211,12 +228,20 @@ class DiagnosticEvent(BaseModel):
                 raise ValueError("Journey events require capture-time schema 18 and valid timing")
             if self.event_name in ("flight_detail_paywall_experiment_exposed", "flight_detail_paywall_experiment_enrolled"):
                 raise ValueError("Legacy cohort events cannot enroll a new journey")
-            if self.properties.paywall_surface == "skip_flight" and (
+            if self.journey.experiment_id == CLOSABLE_FLOW_ID:
+                self.validate_closable_flow()
+            elif self.properties.paywall_surface == "skip_flight" and (
                 self.properties.effective_offer != "standard" or self.properties.effective_paywall != "standard"
             ):
                 raise ValueError("Skip-flight uses the standard offer and paywall")
             if self.journey.goals_status == "not_asked" and self.properties.goals_status not in (None, "not_asked"):
                 raise ValueError("A search-first journey cannot claim asked or confirmed goals")
+        if self.properties.arm is not None and (
+            self.journey is None or self.journey.experiment_id != CLOSABLE_FLOW_ID
+            or self.properties.arm != self.journey.variant
+            or not (self.journey.randomized or self.journey.assignment_source == "local_debug_preview")
+        ):
+            raise ValueError("Arm is the frozen randomized closable-flow variant only")
         if self.event_name in ("activation_journey_enrolled", "activation_journey_selected_flight"):
             if self.journey is None:
                 raise ValueError("Canonical journey milestones require journey context")
@@ -241,6 +266,18 @@ class DiagnosticEvent(BaseModel):
             "verified", "cancelled", "pending", "unverified", "error",
         ):
             raise ValueError("Invalid checkout terminal outcome")
+        experience_actions = closable_flow.EXPERIENCE_ACTIONS.get(self.properties.screen)
+        if self.event_name == "experience_action" and experience_actions is not None and (
+            self.properties.action not in experience_actions
+            or (self.properties.screen == "paywall" and self.properties.experience_presentation_id is None)
+            or (self.properties.screen == "pending_flight" and self.properties.flight_identity is None)
+        ):
+            # Closable-flow retry panel and pending-flight card: fixed codes only.
+            raise ValueError("Paywall retry and pending-flight actions use fixed codes and their identity")
+        if self.event_name in ("delay_risk_loaded", "delay_risk_failed") and (
+            self.properties.source == DELAY_PREVIEW_SOURCE
+        ):
+            self.validate_delay_preview()
         # These new schema-20 event names have no historical loose payload to
         # preserve. Require their minimal operational meaning, not free text.
         required = {
@@ -300,6 +337,65 @@ class DiagnosticEvent(BaseModel):
             raise ValueError("Flight deletion diagnostics require a fixed persistence stage and outcome")
         return self
 
+    def validate_delay_preview(self):
+        properties = self.properties
+        if (properties.event_schema_version or 0) < closable_flow.MIN_EVENT_SCHEMA or properties.flight_identity is None:
+            raise ValueError("Onboarding delay preview events require schema 28 and a flight identity")
+        if self.event_name == "delay_risk_loaded":
+            if (
+                properties.level not in DELAY_PREVIEW_LEVELS
+                or properties.confidence not in DELAY_PREVIEW_LEVELS
+                or properties.score is None
+                or properties.outcome not in DELAY_PREVIEW_CACHE_OUTCOMES
+                or properties.load_scope not in DELAY_PREVIEW_LOAD_SCOPES
+                or properties.reason is not None
+            ):
+                raise ValueError("Onboarding delay preview results use fixed level, cache and load codes")
+        elif (
+            properties.reason not in DELAY_PREVIEW_FAILURE_REASONS
+            or properties.load_scope not in (None, "initial_presentation")
+            or properties.level is not None
+            or properties.score is not None
+        ):
+            raise ValueError("Onboarding delay preview failures use fixed reason codes")
+
+    def validate_closable_flow(self):
+        journey, properties = self.journey, self.properties
+        if journey.measurement_revision >= 5 and (properties.event_schema_version or 0) < 29:
+            raise ValueError("Matched paywall events require capture-time schema 29")
+        if (properties.event_schema_version or 0) < closable_flow.MIN_EVENT_SCHEMA:
+            raise ValueError("Closable-flow journey events require capture-time schema 28")
+        if self.event_name == "activation_journey_enrolled":
+            raise ValueError("Closable-flow enrollment uses its canonical exposure event")
+        if self.event_name == "activation_experiment_exposed":
+            # One canonical exposure per installation assignment. Disabled and
+            # fallback installs were never assigned, so they are never exposed.
+            if not (journey.randomized or (journey.assignment_source == "local_debug_preview"
+                                           and self.analytics_environment == "development")):
+                raise ValueError("Only randomized closable-flow assignments are exposed")
+            if self.event_id != journey.enrollment_event_id or self.occurred_at_ms != journey.enrolled_at_ms:
+                raise ValueError("Canonical exposure ID and capture time must match the enrollment")
+            if properties.exposure_scope != closable_flow.EXPOSURE_SCOPE:
+                raise ValueError("Closable-flow exposure is once per installation assignment")
+            if properties.measurement_revision not in (None, journey.measurement_revision) or (
+                properties.assignment_source not in (None, journey.assignment_source)
+            ):
+                raise ValueError("Exposure properties must match the frozen assignment")
+        if properties.paywall_surface == "skip_flight":
+            # Skip has no paywall in the test arm; control (or a forced-control
+            # presentation) keeps the 3.9.6 hard paywall. Lifetime can only be
+            # offered under a Lifetime revision, never added to another.
+            offers = {closable_flow.ANNUAL_WEEKLY}
+            if closable_flow.offers_lifetime(journey.measurement_revision):
+                offers.add(closable_flow.ANNUAL_WEEKLY_LIFETIME)
+            if journey.measurement_revision >= 5:
+                if properties.effective_paywall not in ("hard_one_screen", "soft_one_screen") or properties.effective_offer not in offers:
+                    raise ValueError("Matched-flow skip must keep its shared checkout and offer scope")
+            elif (journey.variant != closable_flow.CONTROL and properties.operational_override != "forced_control") or (
+                properties.effective_paywall != "hard" or properties.effective_offer not in offers
+            ):
+                raise ValueError("Closable-flow skip-flight paywall is control's hard paywall only")
+
 
 class DiagnosticBatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -308,7 +404,11 @@ class DiagnosticBatch(BaseModel):
 
 def _row(event: DiagnosticEvent, user: User) -> ExperimentDiagnosticEvent:
     properties = event.properties.model_dump(mode="json", exclude_none=True)
-    if event.notification_content is not None:
+    # The departure-offer reminder names the user's own flight and departure
+    # time; its copy stays on the phone. The fixed copy ID is enough to report it.
+    if event.notification_content is not None and (
+        event.properties.notification_type != closable_flow.DEPARTURE_REMINDER_NOTIFICATION
+    ):
         encrypted, digest = seal_copy(event.notification_content.model_dump())
         properties["_notification_copy_ciphertext"] = encrypted
         properties["_notification_copy_digest"] = digest

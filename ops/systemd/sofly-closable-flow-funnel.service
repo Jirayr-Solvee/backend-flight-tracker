@@ -1,0 +1,19 @@
+[Unit]
+Description=Derive the non-purged closable-flow funnel ledger
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/backend-flight-tracker
+# Reads the application's .env from the working directory; prints counts only.
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/backend-flight-tracker/venv/bin/python3 -m scripts.refresh_closable_flow_funnel_facts
+TimeoutStartSec=300
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/backend-flight-tracker

@@ -125,6 +125,16 @@ def user_has_active_subscription(user: User) -> bool:
     return user.premium_valid_until > now_ts
 
 
+def lifetime_premium_valid_until() -> int:
+    """Server lease for a verified Lifetime purchase, not an invented Apple expiry.
+
+    It must not lapse between app launches. REFUND/REVOKE notifications refresh
+    the entitlement from the revoked transaction and clear it immediately.
+    """
+    lease = max(timedelta(hours=settings.MAX_PREMIUM_HOURS), timedelta(days=settings.LIFETIME_PREMIUM_LEASE_DAYS))
+    return int((datetime.now(timezone.utc) + lease).timestamp() * 1000)
+
+
 def calculate_premium_valid_until(
     transaction_expiration_ms: int | None,
 ) -> int | None:

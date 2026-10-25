@@ -10,6 +10,8 @@ from .activation_journey import (
     ActivationJourneyAttribution, ActivationJourneyGoalSelection, ActivationJourneyGoalReceipt,
 )
 from .apple_ads import AppleAdsAttribution, AppleAdsSpendDaily, AppStoreRevenueEvent
+from .closable_flow import ClosableFlowFunnelFact
+from .delay_preview import DelayPreviewBudget, DelayPreviewCache, DelayPreviewClaim
 from .device import Device
 from .story_push import StoryPushDevice, StoryPushDelivery, StoryPushCampaign
 from .experiment import (

@@ -66,7 +66,7 @@ def main(events_path, coverage_path):
     from core.models.experiment import ExperimentDiagnosticEvent
     from core.models.transaction import Transaction
     from core.models.user import User
-    from core.routers.activation_journey import assignment
+    from core.routers.activation_journey import assignment, closable_flow_assignment
     from core.routers.experiment_diagnostics import DiagnosticEvent, EventName, router
     from core.utils import create_jwt
 
@@ -90,6 +90,7 @@ def main(events_path, coverage_path):
     # comparisons must use the UUID value while HTTP retains original bytes.
     universal_ids = {str(UUID(value)) for value in coverage.get("universal_event_ids", [])}
     historical_ids = {str(UUID(value)) for value in coverage.get("historical_replay_event_ids", [])}
+    historical_universal_ids = {str(UUID(value)) for value in coverage.get("historical_universal_event_ids", [])}
     by_id = {str(event.event_id): event for event in events}
     checks = {
         "all_exact_swift_rows_strict_dto": bool(events) and len(events) == len(fragments),
@@ -100,9 +101,20 @@ def main(events_path, coverage_path):
             and coverage["backend_allowlisted_names"] == len(names),
         "capture_schema_matches_manifest": schema_counts == declared_schema_counts,
         "current_capture_schema_is_present": str(coverage["schema"]) in schema_counts,
+        "universal_pricing_schema_is_known": coverage["schema"] in (21, 22, 23, 24, 30),
         "fixture_captured_ids_are_unique": len(by_id) == len(events),
         "scenario_ids_match_fixture": universal_ids <= by_id.keys() and historical_ids <= by_id.keys()
-            and not universal_ids & historical_ids,
+            and historical_universal_ids <= by_id.keys()
+            and not universal_ids & historical_ids and not universal_ids & historical_universal_ids
+            and not historical_ids & historical_universal_ids,
+        "universal_current_scenarios_are_present": bool(universal_ids) and (
+            coverage["schema"] == 21 or {
+                (by_id[event_id].properties.source, by_id[event_id].properties.paywall_surface)
+                for event_id in universal_ids if event_id in by_id
+            } == {("universal_onboarding", "selected_flight"), ("number_search", "selected_flight"),
+                  ("airport_search", "selected_flight"), ("global_map", "selected_flight"),
+                  ("copilot", "selected_flight"), ("profile", "other")}
+        ),
         "universal_capture_has_no_experiment_or_qa": all(
             by_id[event_id].experiment is None and by_id[event_id].journey is None
             and by_id[event_id].properties.event_schema_version == coverage["schema"]
@@ -110,20 +122,62 @@ def main(events_path, coverage_path):
             and by_id[event_id].properties.effective_offer != "flight_detail_treatment"
             for event_id in universal_ids if event_id in by_id
         ),
-        "universal_offer_scope_stays_selected_onboarding_only": all(
+        "universal_offer_matches_capture_schema": all(
             (
-                by_id[event_id].properties.paywall_surface == "selected_flight"
-                and by_id[event_id].properties.source == "universal_onboarding"
+                coverage["schema"] == 30
+                and by_id[event_id].properties.config_version == "universal_onboarding_v5"
                 and by_id[event_id].properties.effective_onboarding == "search_first"
-                and by_id[event_id].properties.offer_context == "selected_flight_4999"
+                and by_id[event_id].properties.effective_paywall == "hard"
+                and by_id[event_id].properties.assigned_product_id == "com.zhirayr.Flighttracker.yearly.trial7d.6999"
+                and by_id[event_id].properties.effective_offer == "annual_weekly"
+                and (
+                    (by_id[event_id].properties.paywall_surface == "selected_flight"
+                     and by_id[event_id].properties.source in (
+                         "universal_onboarding", "number_search", "airport_search", "global_map", "copilot")
+                     and by_id[event_id].properties.offer_context == "selected_flight_6999")
+                    or (by_id[event_id].properties.paywall_surface == "other"
+                        and by_id[event_id].properties.source == "profile"
+                        and by_id[event_id].properties.offer_context == "standard_annual_6999")
+                )
+            ) or (
+                coverage["schema"] in (22, 23, 24)
+                and by_id[event_id].properties.config_version == "universal_onboarding_v2"
+                and by_id[event_id].properties.effective_onboarding == "search_first"
                 and by_id[event_id].properties.assigned_product_id == "com.zhirayr.Flighttracker.yearly.trial7d.4999"
                 and by_id[event_id].properties.effective_offer is None
+                and (
+                    (
+                        by_id[event_id].properties.paywall_surface == "selected_flight"
+                        and by_id[event_id].properties.source in (
+                            "universal_onboarding", "number_search", "airport_search", "global_map", "copilot")
+                        and by_id[event_id].properties.offer_context == "selected_flight_4999"
+                    ) or (
+                        by_id[event_id].properties.paywall_surface == "other"
+                        and by_id[event_id].properties.source == "profile"
+                        and by_id[event_id].properties.offer_context == "standard_annual_4999"
+                    )
+                )
             ) or (
-                by_id[event_id].properties.paywall_surface == "other"
-                and by_id[event_id].properties.source in ("number_search", "airport_search", "global_map")
-                and by_id[event_id].properties.offer_context == "standard_annual_offer"
-                and by_id[event_id].properties.assigned_product_id == "com.zhirayr.Flighttracker.yearly.trial7d"
-                and by_id[event_id].properties.effective_offer == "standard"
+                # Captured schema-21/v1 bytes retain the former selected/generic
+                # split. Never reinterpret them using the current v2 offer.
+                coverage["schema"] == 21
+                and by_id[event_id].properties.config_version == "universal_onboarding_v1"
+                and (
+                    (
+                        by_id[event_id].properties.paywall_surface == "selected_flight"
+                        and by_id[event_id].properties.source == "universal_onboarding"
+                        and by_id[event_id].properties.effective_onboarding == "search_first"
+                        and by_id[event_id].properties.offer_context == "selected_flight_4999"
+                        and by_id[event_id].properties.assigned_product_id == "com.zhirayr.Flighttracker.yearly.trial7d.4999"
+                        and by_id[event_id].properties.effective_offer is None
+                    ) or (
+                        by_id[event_id].properties.paywall_surface == "other"
+                        and by_id[event_id].properties.source in ("number_search", "airport_search", "global_map")
+                        and by_id[event_id].properties.offer_context == "standard_annual_offer"
+                        and by_id[event_id].properties.assigned_product_id == "com.zhirayr.Flighttracker.yearly.trial7d"
+                        and by_id[event_id].properties.effective_offer == "standard"
+                    )
+                )
             )
             for event_id in universal_ids if event_id in by_id
         ),
@@ -131,6 +185,32 @@ def main(events_path, coverage_path):
             by_id[event_id].properties.event_schema_version == 20
             and (by_id[event_id].experiment is not None or by_id[event_id].journey is not None)
             for event_id in historical_ids if event_id in by_id
+        ),
+        "historical_universal_keeps_schema21_v1_offers": "historical_universal_event_ids" not in coverage or (
+            len(historical_universal_ids) == 2
+            and {by_id[event_id].properties.paywall_surface
+                 for event_id in historical_universal_ids if event_id in by_id} == {"selected_flight", "other"}
+            and all(
+                by_id[event_id].experiment is None and by_id[event_id].journey is None
+                and by_id[event_id].properties.event_schema_version == 21
+                and by_id[event_id].properties.config_version == "universal_onboarding_v1"
+                and by_id[event_id].properties.source == "historical_pending_checkout"
+                and by_id[event_id].properties.layout == "compact_flight_detail"
+                and (
+                    (
+                        by_id[event_id].properties.paywall_surface == "selected_flight"
+                        and by_id[event_id].properties.offer_context == "selected_flight_4999"
+                        and by_id[event_id].properties.assigned_product_id == "com.zhirayr.Flighttracker.yearly.trial7d.4999"
+                        and by_id[event_id].properties.effective_offer is None
+                    ) or (
+                        by_id[event_id].properties.paywall_surface == "other"
+                        and by_id[event_id].properties.offer_context == "standard_annual_offer"
+                        and by_id[event_id].properties.assigned_product_id == "com.zhirayr.Flighttracker.yearly.trial7d"
+                        and by_id[event_id].properties.effective_offer in (None, "standard")
+                    )
+                )
+                for event_id in historical_universal_ids if event_id in by_id
+            )
         ),
     }
 
@@ -164,8 +244,15 @@ def main(events_path, coverage_path):
                      patch.object(settings, "ACTIVATION_JOURNEY_SEARCH_FIRST_PERCENT", 100 if context.variant == "search_first_standard" else 0), \
                      patch.object(settings, "ACTIVATION_JOURNEY_FLIGHT_DETAIL_VARIANT", context.variant if context.variant != "search_first_standard" else "goals_flight_detail"), \
                      patch.object(settings, "ACTIVATION_JOURNEY_CONFIG_VERSION", context.config_version), \
-                     patch("core.services.activation_journey.current_time_ms", return_value=context.enrolled_at_ms + 1000):
-                    checks[f"group_{group_number}_actual_server_proposal_matches"] = assignment(request, user, session)["journey"] == context
+                     patch("core.services.activation_journey.current_time_ms", return_value=context.enrolled_at_ms + 1000), \
+                     patch.object(settings, "CLOSABLE_FLOW_NONPRODUCTION_ENROLLMENT_ENABLED", context.eligible), \
+                     patch.object(settings, "CLOSABLE_FLOW_PRODUCTION_ENROLLMENT_ENABLED", False), \
+                     patch.object(settings, "CLOSABLE_FLOW_FORCE_CONTROL_DELIVERY", False), \
+                     patch.object(settings, "CLOSABLE_FLOW_MEASUREMENT_REVISION", context.measurement_revision), \
+                     patch.object(settings, "CLOSABLE_FLOW_LIFETIME_ENABLED", context.measurement_revision == 2), \
+                     patch.object(settings, "CLOSABLE_FLOW_NONPRODUCTION_TEST_PERCENT", 100 if context.variant == "closable_own_flight" else 0):
+                    assign = closable_flow_assignment if context.experiment_id == "closable_flow_2026_10" else assignment
+                    checks[f"group_{group_number}_actual_server_proposal_matches"] = assign(request, user, session)["journey"] == context
 
         app = FastAPI()
         app.include_router(router, prefix="/subscriptions")
@@ -207,6 +294,7 @@ def main(events_path, coverage_path):
         "all_passed": all(checks.values()), "schema": coverage["schema"],
         "schema_counts": schema_counts,
         "universal_fixture_rows": len(universal_ids), "historical_replay_fixture_rows": len(historical_ids),
+        "historical_universal_fixture_rows": len(historical_universal_ids),
         "swift_enum_cases": coverage["enum_cases"], "fixture_rows": len(events),
         "supported_event_names": len(names), "authenticated_http_accepted": accepted,
         "exact_http_retries_deduplicated": retried, "isolated_context_groups": len(groups),

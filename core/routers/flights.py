@@ -2,9 +2,11 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from typing import Annotated, Any
 
-from fastapi import (APIRouter, BackgroundTasks, Depends, Header, HTTPException,
+from fastapi import (APIRouter, BackgroundTasks, Body, Depends, Header, HTTPException,
                      Query, status)
+from fastapi.responses import JSONResponse
 from sqlmodel import Session, select
 
 from ..background_tasks import create_webhook_for_flight
@@ -25,6 +27,7 @@ from ..models.flight import (
 )
 from ..models.live_activity import LiveActivityRegistration
 from ..models.user import User, UserFlightLink
+from ..services.flight.delay_preview import DelayPreviewEnvelope, request_delay_preview
 from ..services.flight.delay_risk import DelayRiskResponse, DelayRiskService
 from ..services.flight import FlightPersistence, FlightQueryHandler, FlightService
 from ..services.flight.api_client import AerodataboxUnavailableError
@@ -468,6 +471,65 @@ async def get_flight_delay_risk(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error",
         )
+
+
+def _latency_bucket(started_at: float) -> str:
+    elapsed = time.perf_counter() - started_at
+    if elapsed < 1:
+        return "lt1s"
+    if elapsed < 3:
+        return "1to3s"
+    if elapsed < 8:
+        return "3to8s"
+    return "gt8s"
+
+
+@router.post(
+    "/delay-preview",
+    response_model=None,
+    responses={
+        200: {"model": DelayPreviewEnvelope, "description": "ready or insufficient_data"},
+        202: {"model": DelayPreviewEnvelope, "description": "pending; retry after retry_after_ms"},
+        403: {"description": "delay_preview_not_eligible"},
+        422: {"description": "delay_preview_invalid_flight or delay_preview_flight_not_eligible"},
+        429: {"description": "delay_preview_limit_reached"},
+        503: {"description": "delay_preview_disabled, delay_preview_capacity or delay_preview_unavailable"},
+    },
+)
+async def create_delay_preview(
+    payload: Annotated[dict[str, Any], Body(description="DelayPreviewRequest: installation_id, flight_identity, optional flight_id, flight")],
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Onboarding delay preview for the closable-flow test arm.
+
+    No subscription or tracked flight is needed, and nothing is tracked or
+    granted. One prediction per account and installation, ever; identifiers
+    travel only in the JSON body, never in the URL or the logs.
+    """
+    started_at = time.perf_counter()
+    try:
+        result = await request_delay_preview(session=session, user=user, payload=payload)
+    except Exception as error:
+        try:
+            session.rollback()
+        except Exception:
+            logger.error("delay_preview_failed stage=%s", "rollback", exc_info=False)
+        # The exception class only: messages can carry SQL parameters or URLs.
+        logger.error("delay_preview_failed stage=%s error=%s", "handler", type(error).__name__, exc_info=False)
+        logger.info(
+            "delay_preview outcome=%s cache=%s provider_calls=%d latency_bucket=%s",
+            "error", "none", 0, _latency_bucket(started_at),
+        )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "Internal server error"},
+        )
+    logger.info(
+        "delay_preview outcome=%s cache=%s provider_calls=%d latency_bucket=%s",
+        result.outcome, result.cache, result.provider_calls, _latency_bucket(started_at),
+    )
+    return JSONResponse(status_code=result.status_code, content=result.body, headers=result.headers)
 
 
 @router.get(

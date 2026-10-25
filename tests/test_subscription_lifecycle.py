@@ -44,6 +44,7 @@ for key, value in {
 
 from sqlmodel import Session, SQLModel, create_engine, select
 
+from core.config import settings
 from core.models.experiment import ExperimentConversion, ExperimentExposure
 from core.models.subscription import Subscription
 from core.models.subscription_lifecycle import AppStoreSubscriptionLifecycleEvent
@@ -367,6 +368,127 @@ class SubscriptionLifecycleTests(unittest.TestCase):
             return register_transaction(CreateTransactionRequest(jws_payload="verified-fixture"),
                                         self.session.get(User, "user-1"), self.session)
 
+    def lifetime(self, *, signed_date=2_000, revoked_date=None):
+        transaction = self.transaction(signed_date=signed_date, revoked_date=revoked_date)
+        transaction.productId = "com.zhirayr.Flighttracker.lifetime"
+        transaction.type = "Non-Consumable"
+        transaction.expiresDate = None
+        transaction.transactionReason = "PURCHASE"
+        transaction.price = 99_990
+        transaction.currency = "USD"
+        return transaction
+
+    def test_lifetime_purchase_restore_and_replay_keep_one_paid_fact_and_bounded_lease(self):
+        from core.models.apple_ads import current_time_ms
+        self.session.add(User(id="user-1"))
+        self.session.commit()
+        before = current_time_ms()
+        for _ in range(3):
+            self.register(self.lifetime())
+        user = self.session.get(User, "user-1")
+        # A long server lease, so access never depends on app launches, but
+        # still bounded: refunds clear it through the webhook.
+        lease_ms = settings.LIFETIME_PREMIUM_LEASE_DAYS * 24 * 60 * 60 * 1000
+        self.assertGreaterEqual(user.premium_valid_until, before + lease_ms)
+        self.assertLessEqual(user.premium_valid_until, current_time_ms() + lease_ms)
+        transaction = self.session.get(Transaction, "transaction-1")
+        self.assertEqual(transaction.type, "Non-Consumable")
+        self.assertIsNone(transaction.expires_date)
+        events = self.session.exec(select(AppStoreRevenueEvent)).all()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].price_milliunits, 99_990)
+        self.assertFalse(events[0].starts_trial)
+        # A lapsed cache can be refreshed from the same verified receipt.
+        user.premium_valid_until = 1
+        self.session.add(user)
+        self.session.commit()
+        self.register(self.lifetime())
+        self.assertGreater(user.premium_valid_until, before)
+
+    def test_lifetime_creates_subscription_key_for_attribution_and_grants_gated_access(self):
+        from core.utils import user_has_active_subscription
+        self.session.add(User(id="user-1"))
+        self.session.commit()
+        self.register(self.lifetime())
+        transaction = self.session.get(Transaction, "transaction-1")
+        # ActivationJourneyAttribution is keyed by transaction.subscription_id.
+        self.assertIsNotNone(self.session.get(Subscription, transaction.subscription_id))
+        self.assertEqual(transaction.subscription_id, "original-1")
+        user = self.session.get(User, "user-1")
+        self.assertIn(transaction.subscription_id, [subscription.id for subscription in user.subscriptions])
+        self.assertTrue(user_has_active_subscription(user))
+        # Unlike a subscription, the Lifetime lease outlives MAX_PREMIUM_HOURS.
+        from core.models.apple_ads import current_time_ms
+        self.assertGreater(user.premium_valid_until, current_time_ms() + settings.MAX_PREMIUM_HOURS * 60 * 60 * 1000)
+
+    def test_lifetime_requires_exact_product_and_verified_nonconsumable_type(self):
+        self.session.add(User(id="user-1"))
+        self.session.commit()
+        for index, (product, product_type) in enumerate([
+            ("com.zhirayr.Flighttracker.lifetime", None),
+            ("com.zhirayr.Flighttracker.lifetime", "Consumable"),
+            ("com.zhirayr.Flighttracker.lifetime", "Auto-Renewable Subscription"),
+            ("com.zhirayr.Flighttracker.lifetime.v2", None),
+            ("com.zhirayr.Flighttracker.lifetime.v2", "Consumable"),
+            ("com.zhirayr.Flighttracker.lifetime.v2", "Auto-Renewable Subscription"),
+            ("unknown.lifetime", "Non-Consumable"),
+        ]):
+            transaction = self.lifetime(signed_date=2_000 + index)
+            transaction.productId = product
+            transaction.type = product_type
+            self.register(transaction)
+            self.assertIsNone(self.session.get(User, "user-1").premium_valid_until)
+        malformed = self.lifetime(signed_date=9_000)
+        malformed.expiresDate = 10_000_000_000_000
+        self.register(malformed)
+        self.assertIsNone(self.session.get(User, "user-1").premium_valid_until)
+
+    def test_lifetime_refund_clears_all_restored_accounts_and_stale_receipt_cannot_restore(self):
+        self.session.add(User(id="user-1"))
+        self.session.commit()
+        self.register(self.lifetime())
+        restored = User(id="restored-user")
+        self.session.add(restored)
+        self.session.commit()
+        with patch("core.routers.subscriptions.AppStoreService.process_transaction", return_value=self.lifetime()):
+            register_transaction(CreateTransactionRequest(jws_payload="verified-fixture"), restored, self.session)
+        self.assertIsNotNone(restored.premium_valid_until)
+        refund = self.notification(uuid="lifetime-refund", notification_type="REFUND", status=5)
+        refund.data.signedRenewalInfo = None
+        self.notify(refund, self.lifetime(signed_date=5_000, revoked_date=4_000), None)
+        for account in ["user-1", "restored-user"]:
+            self.session.refresh(self.session.get(User, account))
+            self.assertIsNone(self.session.get(User, account).premium_valid_until)
+        for signature in [2_000, 5_000]:
+            self.register(self.lifetime(signed_date=signature))
+            self.assertIsNone(self.session.get(User, "user-1").premium_valid_until)
+            self.assertEqual(self.session.get(Transaction, "transaction-1").revoked_date, 4_000)
+            self.assertEqual(self.session.get(AppStoreRevenueEvent, "transaction-1").revoked_date_ms, 4_000)
+
+    def test_lifetime_refund_does_not_revoke_separate_active_subscription(self):
+        self.session.add(User(id="user-1"))
+        self.session.commit()
+        self.register(self.lifetime())
+        weekly = self.transaction(transaction_id="weekly-1")
+        weekly.originalTransactionId = "weekly-original"
+        weekly.productId = "com.zhirayr.Flighttracker.weekly"
+        weekly.type = "Auto-Renewable Subscription"
+        self.register(weekly)
+        refund = self.notification(uuid="lifetime-refund", notification_type="REFUND", status=5)
+        refund.data.signedRenewalInfo = None
+        self.notify(refund, self.lifetime(signed_date=5_000, revoked_date=4_000), None)
+        self.assertIsNotNone(self.session.get(User, "user-1").premium_valid_until)
+
+    def test_refunded_subscription_does_not_mask_lifetime(self):
+        self.session.add(User(id="user-1"))
+        self.session.commit()
+        self.register(self.lifetime())
+        weekly = self.transaction(transaction_id="weekly-1", revoked_date=4_000)
+        weekly.originalTransactionId = "weekly-original"
+        weekly.type = "Auto-Renewable Subscription"
+        self.register(weekly)
+        self.assertIsNotNone(self.session.get(User, "user-1").premium_valid_until)
+
     def notify(self, notification, transaction, renewal):
         with (
             patch("core.routers.webhook.AppStoreService.process_notification", return_value=notification),
@@ -521,6 +643,14 @@ class SubscriptionLifecycleTests(unittest.TestCase):
         self.assertEqual(arm["events"]["renewal"], 1)
         self.assertEqual(arm["events"]["refund"], 1)
         self.assertEqual(arm["affected_subscriptions"]["refund"], 1)
+
+
+class ReplacementLifetimeLifecycleTests(SubscriptionLifecycleTests):
+    """Run the same replay, refund, restore and type checks for the new SKU."""
+    def lifetime(self, *, signed_date=2_000, revoked_date=None):
+        transaction = super().lifetime(signed_date=signed_date, revoked_date=revoked_date)
+        transaction.productId = "com.zhirayr.Flighttracker.lifetime.v2"
+        return transaction
 
 
 if __name__ == "__main__":

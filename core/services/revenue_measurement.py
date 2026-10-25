@@ -5,10 +5,11 @@ from sqlalchemy.dialects.sqlite import insert
 from sqlmodel import Session, select
 
 from ..models.apple_ads import AppStoreRevenueEvent, current_time_ms
-from ..models.transaction import Transaction
+from ..models.transaction import Transaction, TransactionType
 from ..models.subscription_lifecycle import AppStoreSubscriptionLifecycleEvent
 from ..models.user import User, UserSubscriptionLink
-from ..utils import calculate_premium_valid_until
+from ..closable_flow_policy import LIFETIME_PRODUCT_IDS
+from ..utils import calculate_premium_valid_until, lifetime_premium_valid_until
 
 
 def enum_value(value: Any) -> str | None:
@@ -34,6 +35,7 @@ def upsert_verified_transaction(*, session: Session, decoded_jws: Any,
         "product_id": decoded_jws.productId, "purchase_date": decoded_jws.purchaseDate,
         "original_purchase_date": decoded_jws.originalPurchaseDate, "signed_date": decoded_jws.signedDate,
         "expires_date": decoded_jws.expiresDate, "transaction_reason": enum_value(decoded_jws.transactionReason),
+        "type": enum_value(getattr(decoded_jws, "type", None)),
         "price": decoded_jws.price, "currency": decoded_jws.currency, "is_upgraded": decoded_jws.isUpgraded,
         "environment": enum_value(decoded_jws.environment), "revoked_date": decoded_jws.revocationDate,
         "app_account_token": str(decoded_jws.appAccountToken) if getattr(decoded_jws, "appAccountToken", None) else fallback_user_id,
@@ -61,7 +63,7 @@ def refresh_current_entitlement(*, session: Session, user: User) -> None:
             latest[transaction.subscription_id] = transaction
     candidates = []
     for subscription_id, transaction in latest.items():
-        if transaction.revoked_date:
+        if transaction.revoked_date is not None:
             continue
         lifecycle = session.exec(select(AppStoreSubscriptionLifecycleEvent).where(
             AppStoreSubscriptionLifecycleEvent.original_transaction_id == subscription_id,
@@ -93,7 +95,13 @@ def refresh_current_entitlement(*, session: Session, user: User) -> None:
         expiry = transaction.expires_date
         if lifecycle and lifecycle.grace_period_expires_date_ms:
             expiry = max(expiry or 0, lifecycle.grace_period_expires_date_ms)
-        until = calculate_premium_valid_until(expiry)
+        verified_lifetime = (transaction.product_id in LIFETIME_PRODUCT_IDS
+                             and transaction.type == TransactionType.NON_CONSUMABLE.value
+                             and transaction.expires_date is None)
+        if (transaction.product_id in LIFETIME_PRODUCT_IDS
+                or transaction.type == TransactionType.NON_CONSUMABLE.value) and not verified_lifetime:
+            continue
+        until = lifetime_premium_valid_until() if verified_lifetime else calculate_premium_valid_until(expiry)
         if until is not None:
             candidates.append(until)
     user.premium_valid_until = max(candidates) if candidates else None

@@ -1,7 +1,10 @@
 from enum import Enum
 from typing import Literal
 
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .closable_flow_policy import settings_error as closable_flow_settings_error
 
 
 class JWSEnvironment(str, Enum):
@@ -63,6 +66,9 @@ class Settings(BaseSettings):
     JWS_ENV: JWSEnvironment
 
     MAX_PREMIUM_HOURS: int
+    # A verified Lifetime purchase has no Apple expiry. Its server lease must not
+    # depend on app launches; REFUND/REVOKE notifications clear it immediately.
+    LIFETIME_PREMIUM_LEASE_DAYS: int = Field(default=365, ge=1, le=3650)
 
     APPLE_ISSUER: str
     APPLE_KEYS_URL: str
@@ -107,10 +113,60 @@ class Settings(BaseSettings):
     ACTIVATION_JOURNEY_FORCE_STANDARD_PAYWALL: bool = False
     ACTIVATION_JOURNEY_OPERATIONAL_CONFIG_VERSION: str = "draft_1"
 
+    # Closable own-flight flow test (closable_flow_2026_10). Every switch defaults
+    # off and needs a restart; bump the operational version on any change.
+    # Revisions come only from the shared registry and are never reused: turning
+    # Lifetime on means LIFETIME_ENABLED plus the next Lifetime revision together.
+    CLOSABLE_FLOW_PRODUCTION_ENROLLMENT_ENABLED: bool = False
+    CLOSABLE_FLOW_NONPRODUCTION_ENROLLMENT_ENABLED: bool = False
+    # Test-arm share: closable_own_flight in revisions 1–4, matched_soft_paywall
+    # in 5–6. Matched revisions require 50 in both environments. Never change
+    # allocation during a revision. Nonproduction covers TestFlight/App Review.
+    CLOSABLE_FLOW_TEST_PERCENT: int = Field(default=50, ge=0, le=100)
+    CLOSABLE_FLOW_NONPRODUCTION_TEST_PERCENT: int = Field(default=50, ge=0, le=100)
+    CLOSABLE_FLOW_MEASUREMENT_REVISION: int = 1
+    # Explicit rollout selects 5 (annual/weekly) or 6 (+Lifetime) only after
+    # the matching app is verified. Keeping defaults off avoids silent rollout.
+    # Kill switch: no new enrollment, and future test-arm presentations use the
+    # control experience. Assigned arms never change.
+    CLOSABLE_FLOW_FORCE_CONTROL_DELIVERY: bool = False
+    # Lifetime delivery in both arms (owner decision 2026-10-21). Emergency off
+    # under a Lifetime revision requires stopping enrollment (kill switch or both
+    # enrollment flags off); resume only with the next registry revision.
+    CLOSABLE_FLOW_LIFETIME_ENABLED: bool = False
+    CLOSABLE_FLOW_OPERATIONAL_CONFIG_VERSION: str = Field(
+        default="1", min_length=1, max_length=40, pattern=r"^[A-Za-z0-9_.-]+$",
+    )
+
+    # Onboarding delay preview (closable_flow_2026_10 test arm): one real
+    # prediction per account and installation. Off until the deploy is
+    # verified. Caps bound uncached builds (each up to 3 provider calls);
+    # cache hits are free. Changing a value requires a restart.
+    DELAY_PREVIEW_ENABLED: bool = False
+    DELAY_PREVIEW_DAILY_BUILD_CAP: int = Field(default=150, ge=0, le=5000)
+    DELAY_PREVIEW_MINUTE_BUILD_CAP: int = Field(default=6, ge=0, le=60)
+
     # Public flight-share links. nginx maps /f/<token> to /public/share/<token>.
     # The page shell loads versioned website assets; bump with each asset release.
     FLIGHT_SHARE_BASE_URL: str = "https://sofly.to/f/"
     FLIGHT_SHARE_ASSET_VERSION: str = "1"
+
+    @model_validator(mode="after")
+    def closable_flow_registry(self):
+        # Fail at startup (and so at the readiness check) rather than enrolling
+        # anyone into an unknown or Lifetime revision without its switch.
+        error = closable_flow_settings_error(
+            revision=self.CLOSABLE_FLOW_MEASUREMENT_REVISION,
+            lifetime_enabled=self.CLOSABLE_FLOW_LIFETIME_ENABLED,
+            test_percent=self.CLOSABLE_FLOW_TEST_PERCENT,
+            nonproduction_test_percent=self.CLOSABLE_FLOW_NONPRODUCTION_TEST_PERCENT,
+            enrollment_enabled=(self.CLOSABLE_FLOW_PRODUCTION_ENROLLMENT_ENABLED
+                                or self.CLOSABLE_FLOW_NONPRODUCTION_ENROLLMENT_ENABLED)
+                               and not self.CLOSABLE_FLOW_FORCE_CONTROL_DELIVERY,
+        )
+        if error:
+            raise ValueError(f"Invalid closable-flow configuration: {error}")
+        return self
 
 
 settings = Settings()  # type: ignore

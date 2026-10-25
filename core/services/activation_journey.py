@@ -9,8 +9,10 @@ from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy import func, or_, update
 from sqlmodel import Session, select
 
+from .. import closable_flow_policy as closable_flow
 from ..activation_journey_contract import (
-    ActivationJourneyAssignmentRequest, ActivationJourneyContext, JOURNEY_ID, JOURNEY_SCOPES, canonical_context,
+    ActivationJourneyAssignmentRequest, ActivationJourneyContext, CLOSABLE_FLOW_ID, EXPERIMENTS, JOURNEY_ID,
+    JOURNEY_SCOPES, canonical_context,
 )
 from ..config import settings
 from ..models.activation_journey import (
@@ -26,6 +28,22 @@ DAY_MS = 86_400_000
 
 def enrollment_id(context):
     return context.exposure_id + ":v1"
+
+
+def identity_key(experiment_id, installation_id):
+    return f"{experiment_id}:{installation_id}:v1"
+
+
+def _refuse_other_experiment(session, experiment_id, installation_id):
+    """An installation belongs to at most one full-journey experiment."""
+    for other in EXPERIMENTS:
+        if other == experiment_id:
+            continue
+        key = identity_key(other, installation_id)
+        if any(session.get(model, key, populate_existing=True) is not None for model in (
+            ActivationJourneyIdentity, ActivationJourneyAssignment, ActivationJourneyEnrollment,
+        )):
+            raise HTTPException(status_code=409, detail="Installation already belongs to another journey experiment")
 
 
 def _conflict():
@@ -59,7 +77,9 @@ def reserve_legacy_installation(*, session, user, installation_id):
     This reservation is not a legacy cohort or a new enrollment. Existing old
     protocol ownership and source records retain their original semantics.
     """
-    identity = f"{JOURNEY_ID}:{installation_id}:v1"
+    if session.get(ActivationJourneyIdentity, identity_key(CLOSABLE_FLOW_ID, installation_id), populate_existing=True):
+        raise HTTPException(status_code=409, detail="Journey installation cannot enter a legacy cohort")
+    identity = identity_key(JOURNEY_ID, installation_id)
     session.exec(insert(ActivationJourneyIdentity).values(
         id=identity, user_id=user.id, protocol="legacy",
     ).on_conflict_do_nothing())
@@ -108,28 +128,60 @@ def _assignment_response(context):
             "operational_config_version": settings.ACTIVATION_JOURNEY_OPERATIONAL_CONFIG_VERSION}
 
 
-def assign_journey(*, session: Session, user, data: ActivationJourneyAssignmentRequest):
-    identity = f"{JOURNEY_ID}:{data.installation_id}:v1"
-    reserve_identity(session=session, user=user, identity=identity)
+def _closable_assignment_response(context):
+    # The frozen context plus the *current* switches. Overrides apply to future
+    # presentations only; they never change the assigned arm or revision.
+    return {"journey": context, "enrollment_enabled": context.eligible,
+            "force_control_delivery": settings.CLOSABLE_FLOW_FORCE_CONTROL_DELIVERY,
+            "lifetime_delivery_enabled": bool(settings.CLOSABLE_FLOW_LIFETIME_ENABLED
+                                              and closable_flow.offers_lifetime(context.measurement_revision)),
+            "operational_config_version": settings.CLOSABLE_FLOW_OPERATIONAL_CONFIG_VERSION}
+
+
+def _existing_assignment(*, session, user, identity, data):
+    """Replays return the first frozen proposal, never a newly computed arm."""
     frozen = session.get(ActivationJourneyIdentity, identity, populate_existing=True).frozen_context_json
     if frozen:
         context = ActivationJourneyContext.model_validate_json(frozen)
         if not _request_matches_context(data, context):
             _conflict()
-        return _assignment_response(context)
+        return context
     existing_entry = session.get(ActivationJourneyEnrollment, identity, populate_existing=True)
     if existing_entry:
         _owner(existing_entry, user)
         context = ActivationJourneyContext.model_validate_json(existing_entry.context_json)
         if not _request_matches_context(data, context):
             _conflict()
-        return _assignment_response(context)
+        return context
     existing = session.get(ActivationJourneyAssignment, identity, populate_existing=True)
     if existing:
         _owner(existing, user)
-        if existing.request_json != data.model_dump_json():
+        if ActivationJourneyAssignmentRequest.model_validate_json(existing.request_json) != data:
             _conflict()
-        context = ActivationJourneyContext.model_validate_json(existing.context_json)
+        return ActivationJourneyContext.model_validate_json(existing.context_json)
+    return None
+
+
+def _store_first_proposal(*, session, user, identity, data, context, now):
+    # Atomic first proposal wins across workers/config changes. Replays return
+    # that proposal, never a newly computed arm or new capture timestamp.
+    session.exec(insert(ActivationJourneyAssignment).values(
+        id=identity, installation_id=str(data.installation_id), user_id=user.id,
+        context_json=canonical_context(context), request_json=data.model_dump_json(), created_at_ms=now,
+    ).on_conflict_do_nothing())
+    stored = session.get(ActivationJourneyAssignment, identity, populate_existing=True)
+    _owner(stored, user)
+    if ActivationJourneyAssignmentRequest.model_validate_json(stored.request_json) != data:
+        _conflict()
+    return ActivationJourneyContext.model_validate_json(stored.context_json)
+
+
+def assign_journey(*, session: Session, user, data: ActivationJourneyAssignmentRequest):
+    identity = identity_key(JOURNEY_ID, data.installation_id)
+    _refuse_other_experiment(session, JOURNEY_ID, data.installation_id)
+    reserve_identity(session=session, user=user, identity=identity)
+    context = _existing_assignment(session=session, user=user, identity=identity, data=data)
+    if context is not None:
         return _assignment_response(context)
     if _known_legacy_installation(session, str(data.installation_id)):
         raise HTTPException(status_code=409, detail="Existing onboarding installation cannot enter new protocol")
@@ -156,18 +208,71 @@ def assign_journey(*, session: Session, user, data: ActivationJourneyAssignmentR
         intended_paywall=intended_paywall,
         goals_status=goals_status,
     )
-    # Atomic first proposal wins across workers/config changes. Replays return
-    # that proposal, never a newly computed arm or new capture timestamp.
-    session.exec(insert(ActivationJourneyAssignment).values(
-        id=identity, installation_id=str(data.installation_id), user_id=user.id,
-        context_json=canonical_context(context), request_json=data.model_dump_json(), created_at_ms=now,
-    ).on_conflict_do_nothing())
-    stored = session.get(ActivationJourneyAssignment, identity, populate_existing=True)
-    _owner(stored, user)
-    if stored.request_json != data.model_dump_json():
-        _conflict()
-    context = ActivationJourneyContext.model_validate_json(stored.context_json)
+    context = _store_first_proposal(session=session, user=user, identity=identity, data=data, context=context, now=now)
     return _assignment_response(context)
+
+
+def closable_flow_settings_error():
+    return closable_flow.settings_error(
+        revision=settings.CLOSABLE_FLOW_MEASUREMENT_REVISION,
+        lifetime_enabled=settings.CLOSABLE_FLOW_LIFETIME_ENABLED,
+        test_percent=settings.CLOSABLE_FLOW_TEST_PERCENT,
+        nonproduction_test_percent=settings.CLOSABLE_FLOW_NONPRODUCTION_TEST_PERCENT,
+        enrollment_enabled=(settings.CLOSABLE_FLOW_PRODUCTION_ENROLLMENT_ENABLED
+                            or settings.CLOSABLE_FLOW_NONPRODUCTION_ENROLLMENT_ENABLED)
+                           and not settings.CLOSABLE_FLOW_FORCE_CONTROL_DELIVERY,
+    )
+
+
+def assign_closable_flow(*, session: Session, user, data: ActivationJourneyAssignmentRequest):
+    """Assignment and operational refresh for closable_flow_2026_10.
+
+    Idempotent: replays return the frozen context with the current switches.
+    New installs are randomized only while enrollment is on for their
+    environment and the kill switch is off; otherwise they get control,
+    not randomized (`server_disabled`).
+    """
+    if closable_flow_settings_error():
+        # Startup validation should make this unreachable; fail closed anyway.
+        raise HTTPException(status_code=503, detail="Closable-flow configuration unavailable")
+    identity = identity_key(CLOSABLE_FLOW_ID, data.installation_id)
+    _refuse_other_experiment(session, CLOSABLE_FLOW_ID, data.installation_id)
+    reserve_identity(session=session, user=user, identity=identity)
+    context = _existing_assignment(session=session, user=user, identity=identity, data=data)
+    if context is not None:
+        return _closable_assignment_response(context)
+    if _known_legacy_installation(session, str(data.installation_id)):
+        raise HTTPException(status_code=409, detail="Existing onboarding installation cannot enter new protocol")
+    now = current_time_ms()
+    if not now - DAY_MS <= data.enrolled_at_ms <= now + 300_000:
+        raise HTTPException(status_code=422, detail="New assignment timestamp is outside the allowed window")
+    production = data.analytics_environment == "production"
+    enabled = (settings.CLOSABLE_FLOW_PRODUCTION_ENROLLMENT_ENABLED if production
+               else settings.CLOSABLE_FLOW_NONPRODUCTION_ENROLLMENT_ENABLED) and not settings.CLOSABLE_FLOW_FORCE_CONTROL_DELIVERY
+    # The nonproduction share never affects a production assignment.
+    percent = settings.CLOSABLE_FLOW_TEST_PERCENT if production else settings.CLOSABLE_FLOW_NONPRODUCTION_TEST_PERCENT
+    revision = settings.CLOSABLE_FLOW_MEASUREMENT_REVISION
+    # Never deliver a new arm to an older binary. Existing assignments above
+    # remain untouched. Incompatible new clients get a nonrandomized fallback.
+    if revision >= 5 and data.supports_matched_paywall is not True:
+        revision, enabled = 1, False
+    variant = (closable_flow.assigned_variant(data.installation_id, percent, revision) if enabled
+               else closable_flow.fallback_variant(revision))
+    intended_onboarding, intended_paywall, goals_status = closable_flow.SCOPES[variant]
+    context = ActivationJourneyContext(
+        experiment_id=CLOSABLE_FLOW_ID, measurement_revision=revision, variant=variant,
+        eligible=enabled, randomized=enabled, installation_id=data.installation_id,
+        exposure_id=f"{CLOSABLE_FLOW_ID}:{data.installation_id}", enrollment_event_id=data.enrollment_event_id,
+        enrolled_at_ms=data.enrolled_at_ms, app_version=data.app_version, build_number=data.build_number,
+        analytics_environment=data.analytics_environment,
+        assignment_source="server_assignment" if enabled else "server_disabled",
+        config_version=closable_flow.config_version(revision),
+        intended_onboarding=intended_onboarding,
+        intended_paywall=intended_paywall,
+        goals_status=goals_status,
+    )
+    context = _store_first_proposal(session=session, user=user, identity=identity, data=data, context=context, now=now)
+    return _closable_assignment_response(context)
 
 
 def validate_journey(*, session: Session, user, context: ActivationJourneyContext, require_enrollment=False):
@@ -203,6 +308,7 @@ def validate_journey(*, session: Session, user, context: ActivationJourneyContex
 
 
 def enroll_journey(*, session: Session, user, context: ActivationJourneyContext):
+    _refuse_other_experiment(session, context.experiment_id, context.installation_id)
     reserve_identity(session=session, user=user, identity=enrollment_id(context), context=context)
     existing = validate_journey(session=session, user=user, context=context)
     if existing:
@@ -219,7 +325,8 @@ def enroll_journey(*, session: Session, user, context: ActivationJourneyContext)
     if not now - 90 * DAY_MS <= context.enrolled_at_ms <= now + 300_000:
         raise HTTPException(status_code=422, detail="Enrollment timestamp is outside the allowed window")
     values = dict(
-        id=enrollment_id(context), experiment_id=JOURNEY_ID, measurement_revision=1,
+        id=enrollment_id(context), experiment_id=context.experiment_id,
+        measurement_revision=context.measurement_revision,
         installation_id=str(context.installation_id), user_id=user.id, variant=context.variant,
         eligible=context.eligible, randomized=context.randomized, app_version=context.app_version,
         build_number=context.build_number, analytics_environment=context.analytics_environment,
@@ -313,7 +420,13 @@ def record_journey_diagnostic(*, session, user, event):
     identity = enrollment_id(context)
     reserve_identity(session=session, user=user, identity=identity, context=context)
     validate_journey(session=session, user=user, context=context)
-    if event.event_name == "activation_journey_enrolled":
+    if context.experiment_id == CLOSABLE_FLOW_ID:
+        # The canonical exposure enrolls a randomized install. A non-randomized
+        # context has no exposure: its first accepted event of any name creates
+        # the (excluded) enrollment row, idempotently.
+        if event.event_name == "activation_experiment_exposed" or not context.randomized:
+            enroll_journey(session=session, user=user, context=context)
+    elif event.event_name == "activation_journey_enrolled":
         enroll_journey(session=session, user=user, context=context)
     session.exec(insert(ActivationJourneyDiagnosticContext).values(
         id=str(event.event_id), enrollment_id=identity, user_id=user.id,

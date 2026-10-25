@@ -13,6 +13,7 @@ from ..models import get_session
 from ..models.device import Device
 from ..models.story_push import StoryPushDevice, StoryPushDelivery
 from ..models.ai_consent import AIConsentReceipt, UserAIConsent, UserAIEmailIdentity
+from ..models.delay_preview import DelayPreviewClaim
 from ..models.flight import Flight, FlightRead
 from ..models.live_activity import (
     LiveActivityPushToStartDelivery,
@@ -549,6 +550,9 @@ def delete_user(
         session.exec(delete(AIConsentReceipt).where(AIConsentReceipt.user_id == user.id))
         session.exec(delete(UserAIConsent).where(UserAIConsent.user_id == user.id))
         session.exec(delete(UserAIEmailIdentity).where(UserAIEmailIdentity.user_id == user.id))
+        # The onboarding delay preview claim links the account to a hashed
+        # flight identity and an installation; it ends with the account.
+        session.exec(delete(DelayPreviewClaim).where(DelayPreviewClaim.user_id == user.id))
 
         session.flush()
         session.delete(user)
