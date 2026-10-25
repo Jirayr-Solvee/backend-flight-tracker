@@ -260,9 +260,10 @@ async def _execute_search_with_date_fallback(
 @router.get("/live-positions", response_model=list[GlobalFlightPositionRead])
 async def get_global_live_flight_positions(
     limit: int = Query(5000, ge=1, le=20000),
+    regional: bool = Query(False),
     user: User = Depends(get_current_user),
 ):
-    return await FlightService.get_global_flight_positions(limit=limit)
+    return await FlightService.get_global_flight_positions(limit=limit, regional=regional)
 
 
 @router.get("/live-positions/resolve", response_model=FlightRead)

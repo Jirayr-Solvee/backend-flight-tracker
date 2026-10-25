@@ -150,19 +150,26 @@ class FlightService:
     }
 
     @staticmethod
-    async def get_global_flight_positions(limit: int | None = None) -> list[GlobalFlightPositionRead]:
+    async def get_global_flight_positions(limit: int | None = None, *, regional: bool = False) -> list[GlobalFlightPositionRead]:
         now = datetime.now(timezone.utc)
         positions = await FlightService._get_cached_global_positions(now=now)
 
-        response_limit = settings.GLOBAL_FLIGHT_POSITIONS_RESPONSE_LIMIT
+        # Opt-in candidate pool for on-device home/viewport ranking. No user's
+        # airport or location is sent to this endpoint. Legacy clients retain
+        # their compact feed; the new UI still displays at most 20/continent.
+        response_limit = 5000 if regional else settings.GLOBAL_FLIGHT_POSITIONS_RESPONSE_LIMIT
         if limit is not None:
             response_limit = min(limit, response_limit)
 
-        positions = FlightService._filter_global_positions_on_route(positions, now=now)
+        if regional:
+            positions = [p for p in positions if FlightService._global_position_is_on_route(
+                position=p, now_timestamp=int(now.timestamp()), major_airlines_only=False)]
+        else:
+            positions = FlightService._filter_global_positions_on_route(positions, now=now)
 
         return FlightService._sample_global_positions_by_continent(
             positions=positions,
-            per_continent_limit=settings.GLOBAL_FLIGHT_POSITIONS_PER_CONTINENT_LIMIT,
+            per_continent_limit=1000 if regional else settings.GLOBAL_FLIGHT_POSITIONS_PER_CONTINENT_LIMIT,
             overall_limit=response_limit,
         )
 
