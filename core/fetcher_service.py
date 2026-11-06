@@ -44,6 +44,9 @@ class AerodataboxFetcherService:
         )
 
         self.balance: int = 0
+        self.balance_lock = asyncio.Lock()
+        self.webhook_lock = asyncio.Lock()
+        self.webhook_bad_request_until: dict[str, float] = {}
         self.latest_webhook_flight_number: str | None = None
         self.latest_webhook_id: str | None = None
         self.cache: dict[str, tuple[float, Any]] = {}
@@ -240,7 +243,7 @@ class AerodataboxFetcherService:
             "maxDeliveryRetries": 1,
         }
 
-        async with self.limiter:
+        async with self.webhook_lock:
             try:
                 if flight_full_number == self.latest_webhook_flight_number:
                     return {
@@ -249,8 +252,18 @@ class AerodataboxFetcherService:
                         "createdOnUtc": "maybe a moment ago ;)",
                     }
 
-                response = await self.client.post(url=url, json=payload)
+                retry_at = self.webhook_bad_request_until.get(flight_full_number, 0)
+                if retry_at > time.monotonic():
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST)
+
+                await self.refill_subscription_balance()
+                async with self.limiter:
+                    response = await self.client.post(url=url, json=payload)
                 if response.status_code != 200:
+                    if response.status_code == 400:
+                        # A permanent provider rejection must not be retried by
+                        # the ten-minute reconciliation loop on every pass.
+                        self.webhook_bad_request_until[flight_full_number] = time.monotonic() + 3600
                     logger.warning(
                         f"Aerodatabox responded with status code={response.status_code} while creating a webhook sub for flight_full_number={flight_full_number}"
                     )
@@ -260,6 +273,7 @@ class AerodataboxFetcherService:
                 if respnose_data:
                     webhook_id = respnose_data.get("id")
                     if webhook_id:
+                        self.webhook_bad_request_until.pop(flight_full_number, None)
                         self.latest_webhook_id = webhook_id
                         self.latest_webhook_flight_number = flight_full_number
 
@@ -301,9 +315,6 @@ class AerodataboxFetcherService:
                 )
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    async def is_subscription_balance_low(self) -> bool:
-        return self.balance <= settings.BALANCE_REFILL_THRESHOLD
-
     async def get_balance(self) -> int:
         async with self.limiter:
             try:
@@ -330,18 +341,25 @@ class AerodataboxFetcherService:
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     async def refill_subscription_balance(self):
-        async with self.limiter:
+        async with self.balance_lock:
+            if self.balance > settings.BALANCE_REFILL_THRESHOLD:
+                return
             try:
                 url = f"{self.base_url}/api/v1/aedbx/aerodatabox/subscriptions/balance/refill"
-                response = await self.client.post(
-                    url=url, json={"credits": settings.BALANCE_REFILL_AMMOUNT}
-                )
+                async with self.limiter:
+                    response = await self.client.post(
+                        url=url, json={"credits": settings.BALANCE_REFILL_AMMOUNT}
+                    )
 
                 if response.status_code != 200:
                     logger.warning(
                         f"Aerodatabox responded with status code={response.status_code} while re-filling subscription balance"
                     )
                     raise HTTPException(status_code=response.status_code)
+
+                # A successful refill has to advance the local balance. Without
+                # this, every subsequent webhook attempt refills again.
+                self.balance += settings.BALANCE_REFILL_AMMOUNT
 
             except HTTPException:
                 raise
@@ -450,11 +468,6 @@ async def get_route_daily_statistics(
 
 @app.post("/create-webhook")
 async def create_webhook(flight_full_number: str = Query(...)):
-    is_credit_low = await aerodatabox_fetcher_service.is_subscription_balance_low()
-
-    if is_credit_low:
-        await aerodatabox_fetcher_service.refill_subscription_balance()
-
     return await aerodatabox_fetcher_service.create_webhook(
         flight_full_number=flight_full_number
     )
@@ -469,4 +482,5 @@ async def delete_webhook(subscription_id: str = Query(...)):
 
 @app.put("/confirm-webhook-notification")
 async def confirm_webhook_notification():
-    aerodatabox_fetcher_service.balance = aerodatabox_fetcher_service.balance - 1
+    async with aerodatabox_fetcher_service.balance_lock:
+        aerodatabox_fetcher_service.balance -= 1
