@@ -1,4 +1,5 @@
 import asyncio
+import math
 import logging
 from typing import Any
 from urllib.parse import quote
@@ -425,7 +426,7 @@ class ADSBExchangeClient:
             return None
 
         on_ground = cls._is_on_ground(item)
-        if on_ground:
+        if on_ground or item.get("type") == "adsb_icao_nt" or (cls._string_value(item.get("category")) or "").upper() in {"C1", "C2", "C3"}:
             return None
 
         altitude_feet = cls._altitude_feet(item.get("alt_geom"))
@@ -438,11 +439,14 @@ class ADSBExchangeClient:
         vertical_speed_fpm = cls._vertical_speed_fpm(item)
         callsign = cls._string_value(item.get("flight"))
 
+        from .aircraft_metadata import aircraft_metadata
+
         return GlobalFlightPositionRead(
             id=icao24.lower(),
             icao24=icao24.lower(),
             callsign=callsign,
             display_code=callsign or icao24.upper(),
+            **aircraft_metadata(item),
             origin_country=None,
             time_position=cls._seen_timestamp(now_ms, item.get("seen_pos")),
             last_contact=cls._seen_timestamp(now_ms, item.get("seen")),
@@ -492,7 +496,8 @@ class ADSBExchangeClient:
             return None
 
         try:
-            return float(value)
+            number = float(value)
+            return number if math.isfinite(number) else None
         except (TypeError, ValueError):
             return None
 
@@ -523,7 +528,7 @@ class ADSBExchangeClient:
 
         seen = cls._float_value(seen_seconds)
         if seen is None:
-            return int(now_ms / 1000)
+            return None  # Missing age is unknown, not a newly observed position.
 
         return int((now_ms / 1000) - seen)
 

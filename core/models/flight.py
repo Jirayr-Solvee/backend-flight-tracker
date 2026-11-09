@@ -223,6 +223,11 @@ class GlobalFlightPositionRead(SQLModel):
     vertical_rate_mps: float | None = None
     vertical_speed_fpm: int | None = None
     on_ground: bool
+    registration: str | None = None
+    aircraft_type: str | None = None
+    aircraft_description: str | None = None
+    aircraft_categories: list[str] = Field(default_factory=list)
+    position_source: str | None = None
 
 
 class GlobalFlightResolveCandidate(SQLModel):

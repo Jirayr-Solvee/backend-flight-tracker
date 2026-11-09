@@ -264,9 +264,25 @@ async def _execute_search_with_date_fallback(
 async def get_global_live_flight_positions(
     limit: int = Query(5000, ge=1, le=20000),
     regional: bool = Query(False),
+    aircraft: bool = Query(False),
     user: User = Depends(get_current_user),
 ):
+    # Preserve the exact legacy service call for existing clients.
+    if aircraft:
+        return await FlightService.get_global_flight_positions(limit=limit, regional=regional, aircraft=True)
     return await FlightService.get_global_flight_positions(limit=limit, regional=regional)
+
+
+@router.get("/live-positions/{icao24}/context")
+async def get_aircraft_context(
+    icao24: str,
+    user: User = Depends(get_current_user),
+):
+    import re
+    from ..services.flight.aircraft_context import AircraftContextService
+    if re.fullmatch(r"[0-9a-fA-F]{6}", icao24) is None:
+        raise HTTPException(status_code=422, detail="Invalid ICAO aircraft address")
+    return await AircraftContextService.get(icao24.lower())
 
 
 @router.get("/live-positions/resolve", response_model=FlightRead)

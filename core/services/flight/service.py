@@ -150,18 +150,35 @@ class FlightService:
     }
 
     @staticmethod
-    async def get_global_flight_positions(limit: int | None = None, *, regional: bool = False) -> list[GlobalFlightPositionRead]:
+    async def get_global_flight_positions(limit: int | None = None, *, regional: bool = False, aircraft: bool = False) -> list[GlobalFlightPositionRead]:
         now = datetime.now(timezone.utc)
         positions = await FlightService._get_cached_global_positions(now=now)
 
         # Opt-in candidate pool for on-device home/viewport ranking. No user's
         # airport or location is sent to this endpoint. Legacy clients retain
         # their compact feed; the new UI still displays at most 20/continent.
-        response_limit = 5000 if regional else settings.GLOBAL_FLIGHT_POSITIONS_RESPONSE_LIMIT
+        response_limit = 5000 if regional or aircraft else settings.GLOBAL_FLIGHT_POSITIONS_RESPONSE_LIMIT
         if limit is not None:
             response_limit = min(limit, response_limit)
 
-        if regional:
+        if aircraft:
+            from .aircraft_metadata import visible_aircraft
+            positions = [p for p in positions if visible_aircraft(p, int(now.timestamp()))]
+            # Reserve a bounded share for each classification before geographic
+            # sampling, so rare types are not crowded out by airline traffic.
+            selected: dict[str, GlobalFlightPositionRead] = {}
+            for category in ("military", "cargo", "helicopters", "interesting"):
+                for p in FlightService._sample_global_positions(
+                    [p for p in positions if category in p.aircraft_categories], min(200, response_limit // 5)):
+                    selected[p.icao24] = p
+            remaining = FlightService._sample_global_positions_by_continent(
+                [p for p in positions if p.icao24 not in selected],
+                per_continent_limit=1000, overall_limit=max(0, response_limit - len(selected)))
+            result = list(selected.values()) + remaining
+            from .aircraft_context import ObservedAircraftTrails
+            ObservedAircraftTrails.record(result)
+            return result
+        elif regional:
             positions = [p for p in positions if FlightService._global_position_is_on_route(
                 position=p, now_timestamp=int(now.timestamp()), major_airlines_only=False)]
         else:

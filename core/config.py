@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     ADSBEXCHANGE_GLOBAL_PATHS: str = "all"
     ADSBEXCHANGE_RAPIDAPI_HOST: str | None = None
     ADSBEXCHANGE_CACHE_TTL_SECONDS: int = 300
+    # Enable only after trace entitlement/path is verified for this account.
+    # Current RapidAPI live-position access does not establish history access.
+    ADSBEXCHANGE_TRACE_ENABLED: bool = False
     GLOBAL_FLIGHT_POSITIONS_RESPONSE_LIMIT: int = 70
     GLOBAL_FLIGHT_POSITIONS_PER_CONTINENT_LIMIT: int = 10
     GLOBAL_FLIGHT_MAJOR_AIRLINES_ONLY: bool = True
