@@ -18,7 +18,7 @@ def supported_releases():
     result = set()
     for item in raw.split(','):
         if not item:continue
-        if not re.fullmatch(r'[0-9]+(?:\.[0-9]+){2}:[1-9][0-9]{0,6}', item):
+        if not re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,2}:[1-9][0-9]{0,6}', item):
             raise ValueError('Invalid supported story-push release')
         version, build = item.split(':')
         result.add((version, int(build)))
@@ -38,6 +38,7 @@ async def main():
         qa_device_id = str(uuid.UUID(qa_device_id))
     elif environment != 'production' or qa_device_id or os.environ.get('SOFLY_STORY_PUSH_QA_ENABLED') == '1':
         raise ValueError('Invalid story-push environment or QA scope')
+    releases = supported_releases()
     from core.models import engine  # Ensure new tables exist before opening raw transactions.
     from core.services.story_push import dispatch
     from core.services.apn.service import get_apns_client
@@ -53,7 +54,7 @@ async def main():
         os.environ.get('SOFLY_FLIGHT_DB', 'database.db'), os.environ['SOFLY_COCKPIT_DB'], send,
         enabled=True, version=os.environ.get('SOFLY_STORY_PUSH_VERSION', ''),
         build=int(os.environ.get('SOFLY_STORY_PUSH_BUILD', '0')),
-        environment=environment, releases=supported_releases(),
+        environment=environment, releases=releases,
         qa_device_id=qa_device_id, max_sends=20 if qa_device_id else 200,
     )
     print(json.dumps(metrics))

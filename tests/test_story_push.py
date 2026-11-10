@@ -3,8 +3,10 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
 from core.services.story_push import eligible, slot_for, reserve, dispatch, payload, campaign_for, candidates
 from core.services.cockpit_stories import open_store, utc_string
@@ -68,24 +70,41 @@ class StoryPushTests(unittest.TestCase):
         self.assertIsNone(slot_for(self.now.replace(hour=23),'UTC')[1])
         self.assertEqual(slot_for(self.now.replace(hour=6),'Asia/Yerevan')[1],0)
 
-    def test_three_per_day_spacing_and_no_repeat_across_devices(self):
+    def test_one_per_day_across_slots_and_devices(self):
         first=reserve(self.db,self.device,self.stories[0],self.now)
         self.assertIsNotNone(first)
         self.assertIsNone(reserve(self.db,self.device,self.stories[0],self.now))
-        second=reserve(self.db,self.device,self.stories[1],self.now.replace(hour=15))
-        third=reserve(self.db,self.device,self.stories[2],self.now.replace(hour=19))
-        self.assertEqual(len({first,second,third}),3)
-        self.assertIsNone(reserve(self.db,self.device,self.stories[3],self.now.replace(hour=20)))
+        self.assertIsNone(reserve(self.db,self.device,self.stories[1],self.now.replace(hour=15)))
+        self.assertIsNone(reserve(self.db,dict(self.device,device_id='tablet'),self.stories[2],
+                                  self.now.replace(hour=19),flight=True))
         self.assertIsNone(reserve(self.db,self.device,self.stories[3],self.now+timedelta(days=1,minutes=-1)))
         fourth=reserve(self.db,self.device,self.stories[3],self.now+timedelta(days=1,minutes=1))
         self.assertIsNotNone(fourth)
+
+    def test_fall_back_day_does_not_allow_second_push(self):
+        first=datetime(2026,11,1,4,15,tzinfo=timezone.utc)
+        device=dict(self.device,time_zone='America/New_York')
+        self.assertIsNotNone(reserve(self.db,device,self.stories[0],first,flight=True))
+        self.assertIsNone(reserve(self.db,device,self.stories[1],first+timedelta(hours=24,minutes=15),flight=True))
+        self.assertIsNotNone(reserve(self.db,device,self.stories[1],first+timedelta(hours=25),flight=True))
 
     def test_independent_worker_cannot_duplicate_reservation(self):
         other=sqlite3.connect(self.database); other.row_factory=sqlite3.Row
         try:
             self.assertIsNotNone(reserve(self.db,self.device,self.stories[0],self.now))
-            self.assertIsNone(reserve(other,self.device,self.stories[0],self.now))
+            self.assertIsNone(reserve(other,dict(self.device,device_id='tablet'),self.stories[1],self.now,flight=True))
         finally: other.close()
+
+    def test_concurrent_workers_share_daily_quota(self):
+        ready = Barrier(2)
+        def attempt(index):
+            with sqlite3.connect(self.database, timeout=5) as connection:
+                connection.row_factory = sqlite3.Row
+                ready.wait(timeout=5)
+                return reserve(connection, dict(self.device, device_id=f'device{index}'),
+                               self.stories[index], self.now, flight=bool(index))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            self.assertEqual(sum(result is not None for result in pool.map(attempt, range(2))), 1)
 
     def test_payload_uses_translation_and_no_fake_flight(self):
         value=payload(self.stories[0],'fr','notification')
@@ -93,21 +112,25 @@ class StoryPushTests(unittest.TestCase):
         self.assertNotIn('flight_id',value)
         self.assertIsNone(payload(self.stories[0],'ar','notification'))
 
-    def test_shared_campaign_is_frozen_and_delivered_to_each_device(self):
+    def test_shared_campaign_is_frozen_and_delivered_once_per_account(self):
         day,slot=slot_for(self.now,'UTC')
         first=campaign_for(self.db,self.stories,day,slot,self.now)
         second=campaign_for(self.db,list(reversed(self.stories)),day,slot,self.now)
         self.assertEqual(first['id'],second['id'])
         self.assertIsNotNone(reserve(self.db,self.device,first,self.now))
-        other=dict(self.device,device_id='tablet')
+        self.assertIsNone(reserve(self.db,dict(self.device,device_id='tablet'),first,self.now))
+        other=dict(self.device,device_id='tablet',user_id='other')
         self.assertIsNotNone(reserve(self.db,other,first,self.now))
         self.assertIsNone(reserve(self.db,other,first,self.now))
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM storypushdelivery').fetchone()[0],2)
 
-    def test_flight_alert_is_additive_and_not_repeated_after_shared_send(self):
+    def test_shared_and_flight_alerts_consume_same_daily_cap(self):
         self.assertIsNotNone(reserve(self.db,self.device,self.stories[0],self.now,flight=True))
-        self.assertIsNotNone(reserve(self.db,self.device,self.stories[1],self.now))
+        self.assertIsNone(reserve(self.db,self.device,self.stories[1],self.now))
         self.assertIsNone(reserve(self.db,self.device,self.stories[1],self.now,flight=True))
+        other=dict(self.device,device_id='tablet',user_id='other')
+        self.assertIsNotNone(reserve(self.db,other,self.stories[0],self.now))
+        self.assertIsNone(reserve(self.db,other,self.stories[1],self.now,flight=True))
         self.assertEqual(payload(dict(self.stories[0],flight='EK123'),'en','id',flight=True)['aps']['alert']['subtitle'],'EK123')
 
     def test_disabled_never_opens_database_or_calls_sender(self):
@@ -165,7 +188,7 @@ class StoryPushTests(unittest.TestCase):
         self.db.execute('UPDATE "transaction" SET expires_date=?',(int(self.now.timestamp()*1000)+1000,));self.db.commit()
         async def send(*args):self.fail('subscription expired during run')
         with patch('core.services.story_push.time') as clock:
-            clock.monotonic.side_effect=[100,100,102]
+            clock.monotonic.side_effect=[100,100,100,102]
             result=asyncio.run(dispatch(self.database,self.feed,send,enabled=True,
                 version='3.9.3',build=142,now=self.now))
         self.assertEqual(result['accepted'],0)
@@ -185,12 +208,12 @@ class StoryPushTests(unittest.TestCase):
         self.assertEqual(len(calls),2)
         self.assertEqual(self.db.execute('SELECT status FROM storypushdelivery').fetchone()[0],'unknown')
 
-    def test_dispatch_shared_story_to_two_subscribers_and_extra_flight_story(self):
+    def test_dispatch_supported_310_prioritizes_flight_story_under_cap(self):
         self.db.execute('INSERT INTO user VALUES (?,?)',('second',self.device['premium_valid_until']))
         add_subscription(self.db,int(self.now.timestamp()*1000),user_id='second',chain='second',tx='second')
         self.db.execute('INSERT INTO device VALUES (?,?,?,?)',('tablet','second','tablet-token',1))
         self.db.execute('INSERT INTO storypushdevice VALUES (?,?,?,?,?,?,?,?,?,?)',
-                        ('tablet','second','3.9.4',143,1,1,'en','UTC','production',int(self.now.timestamp())))
+                        ('tablet','second','3.10',146,1,1,'en','UTC','production',int(self.now.timestamp())))
         self.db.commit()
         with sqlite3.connect(self.feed) as db:
             story=dict(self.stories[1],flight='EK123')
@@ -200,11 +223,10 @@ class StoryPushTests(unittest.TestCase):
         with patch('core.services.story_push.load_targets',return_value=[{'id':1}]), \
              patch('core.services.story_push.matches',side_effect=lambda story,target:story['id']==self.stories[1]['id']):
             result=asyncio.run(dispatch(self.database,self.feed,send,enabled=True,
-                releases={('3.9.3',142),('3.9.4',143)},now=self.now))
-        self.assertEqual(result['accepted'],4)
+                releases={('3.9.3',142),('3.10',146)},now=self.now))
+        self.assertEqual(result['accepted'],2)
         self.assertEqual(result['flight_reserved'],2)
-        shared={v['story_id'] for _,v in calls if v['aps']['thread-id']=='aircraft-stories'}
-        self.assertEqual(shared,{self.stories[0]['id']})
+        self.assertTrue(all(v['aps']['thread-id']=='flight-messages' for _,v in calls))
         self.assertEqual({token for token,_ in calls},{'test-token','tablet-token'})
 
     def test_expired_subscription_and_unmatched_flight_never_send(self):

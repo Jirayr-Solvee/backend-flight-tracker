@@ -18,6 +18,7 @@ from .story_push_entitlement import has_subscription_access
 # A shared alert is news: never about a message older than a day.
 SHARED_STORY_MAX_AGE = timedelta(hours=24)
 FLIGHT_STORY_MAX_AGE = timedelta(hours=2)
+ACCOUNT_PUSH_COOLDOWN = timedelta(hours=24)
 
 
 def slot_for(now, time_zone):
@@ -117,6 +118,16 @@ def reserve(db, device, story, now, *, flight=False):
     identity = fingerprint(story)
     db.execute('BEGIN IMMEDIATE')
     try:
+        # One attempt across all devices and both story types, even if APNs
+        # times out or the worker exits after reserving. Use the longer of the
+        # rolling cooldown and the current local day (e.g. a 25-hour DST day).
+        midnight = now.astimezone(ZoneInfo(device['time_zone'])).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        cooldown_start = min(stamp - int(ACCOUNT_PUSH_COOLDOWN.total_seconds()) + 1,
+                             int(midnight.timestamp()))
+        if db.execute('SELECT 1 FROM storypushdelivery WHERE user_id=? AND reserved_at>=? LIMIT 1',
+                      (device['user_id'], cooldown_start)).fetchone():
+            db.rollback(); return None
         history = db.execute('SELECT * FROM storypushdelivery WHERE user_id=? AND reserved_at>?',
                              (device['user_id'], stamp-90*86400)).fetchall()
         if any(r['device_id'] == device['device_id'] and r['story_fingerprint'] == identity for r in history):
@@ -124,14 +135,6 @@ def reserve(db, device, story, now, *, flight=False):
         if flight:
             # A shared alert already told this account about the same message.
             if any(r['story_fingerprint'] == identity and r['slot'] >= 0 for r in history):
-                db.rollback(); return None
-        else:
-            recent = [r for r in history if r['reserved_at'] > stamp-86400 and r['slot'] >= 0]
-            slots = {(r['local_day'], r['slot']) for r in recent}
-            same_slot = [r for r in recent if r['local_day'] == day and r['slot'] == slot]
-            if (len(slots) >= 3 and (day, slot) not in slots
-                    or any(stamp-r['reserved_at'] < 3*3600 for r in recent if (r['local_day'],r['slot']) != (day,slot))
-                    or any(r['story_id'] != story['id'] for r in same_slot)):
                 db.rollback(); return None
         delivery = str(uuid.uuid4())
         db.execute('INSERT INTO storypushdelivery (id,user_id,device_id,story_id,story_fingerprint,reserved_at,local_day,slot,status) VALUES (?,?,?,?,?,?,?,?,?)',
@@ -184,13 +187,14 @@ async def dispatch(database, feed, send, *, enabled=False, version='', build=0,
             metrics['eligible'] += 1
             day,slot = slot_for(now, device['time_zone'])
             sends=[]
+            shared = None
             if slot is not None and stories:
                 campaign_key=(day,slot)
                 if campaign_key not in campaign_cache:
                     campaign_cache[campaign_key]=campaign_for(db, stories, day, slot, now)
                 story=campaign_cache[campaign_key]
                 if story and payload(story,device['language'],str(uuid.UUID(int=0))):
-                    sends.append((story,False))
+                    shared = story
             for story in stories:
                 received=parse_time(story['receivedAt'])
                 if not received or now-received>FLIGHT_STORY_MAX_AGE or not story.get('flight'):continue
@@ -200,9 +204,13 @@ async def dispatch(database, feed, send, *, enabled=False, version='', build=0,
                     targets=load_targets(database,user_id=device['user_id'],now=received)
                     target_cache[key]=any(matches(story,target) for target in targets)
                 if target_cache[key]:sends.append((story,True))
+            # A relevant tracked-flight message gets the daily slot before a
+            # shared story when both are eligible in this run.
+            if shared is not None:
+                sends.append((shared,False))
             for story,is_flight in sends:
                 if metrics['reserved'] >= max_sends:break
-                delivery=reserve(db,device,story,now,flight=is_flight)
+                delivery=reserve(db,device,story,delivery_now(),flight=is_flight)
                 if not delivery:continue
                 metrics['reserved'] += 1
                 if is_flight:metrics['flight_reserved'] += 1
