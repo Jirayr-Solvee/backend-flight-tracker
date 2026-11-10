@@ -340,6 +340,7 @@ class AircraftContextService:
     cache = OrderedDict()
     pending = {}
     slots = asyncio.Semaphore(4)
+    trace_slots = asyncio.Semaphore(3)
     nearby_slots = asyncio.Semaphore(3)
     trace_backoff_until = 0.0
     schedule_pool = SchedulePool()
@@ -571,7 +572,7 @@ class AircraftContextService:
                 break
 
     @classmethod
-    async def get(cls, icao24: str, *, for_tracking=False) -> AircraftContext:
+    async def get(cls, icao24: str, *, for_tracking=False, include_trace=True, trace_only=False) -> AircraftContext:
         from .service import FlightService
         now = datetime.now(timezone.utc)
         positions = await FlightService._get_cached_global_positions(now=now)
@@ -584,9 +585,9 @@ class AircraftContextService:
             result._preview_reasons.add("position_not_fresh_airborne" if any(p.icao24 == icao24 for p in positions)
                                         else "aircraft_not_in_feed")
             return result
-        key = (icao24, position.callsign, now.date(), for_tracking)
+        key = (icao24, position.callsign, now.date(), for_tracking, include_trace, trace_only)
         cached = cls.cache.get(key)
-        state = await asyncio.to_thread(cls.schedule_pool.snapshot)
+        state = {} if trace_only else await asyncio.to_thread(cls.schedule_pool.snapshot)
         schedule = cls.verified_schedule(position, now, state.get("entries", {}))
         if for_tracking and schedule and not schedule._resolver_match:
             # Older pool entries contain display fields only, not an exact
@@ -610,13 +611,18 @@ class AircraftContextService:
                 return result
             async def run():
                 try:
-                    async with cls.slots:
+                    async with (cls.trace_slots if trace_only else cls.slots):
                         result = AircraftContext(icao24=icao24)
-                        if schedule:
+                        if trace_only:
+                            await cls.trace(result, now)
+                        elif schedule:
                             result.origin, result.destination = schedule.origin, schedule.destination
                             result.route_status = schedule.route_status
                             result._resolver_match = schedule._resolver_match
-                            await cls.trace(result, now)
+                            if include_trace:
+                                await cls.trace(result, now)
+                        elif not include_trace:
+                            await cls.route(result, position, now, full_resolver=True)
                         else:
                             await asyncio.gather(cls.trace(result, now), cls.route(result, position, now, full_resolver=True))
                         if not result.segments:

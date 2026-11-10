@@ -291,11 +291,14 @@ async def get_selected_aircraft_position(icao24: str, user: User = Depends(get_c
 async def get_aircraft_context(
     icao24: str,
     user: User = Depends(get_current_user),
+    trace_only: bool = False,
 ):
     import re
     from ..services.flight.aircraft_context import AircraftContextService
     if re.fullmatch(r"[0-9a-fA-F]{6}", icao24) is None:
         raise HTTPException(status_code=422, detail="Invalid ICAO aircraft address")
+    if trace_only:
+        return await AircraftContextService.get(icao24.lower(), trace_only=True)
     return await AircraftContextService.get(icao24.lower())
 
 
@@ -328,6 +331,8 @@ async def resolve_aircraft_tracking_preview(
     async def exact():
         try:
             async with asyncio.timeout(4 if fast else None):
+                if fast:
+                    return await AircraftContextService.get(address, for_tracking=True, include_trace=False)
                 return await AircraftContextService.get(address, for_tracking=True)
         except TimeoutError:
             if not fast:

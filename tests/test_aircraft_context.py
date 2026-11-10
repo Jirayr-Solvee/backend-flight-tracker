@@ -286,6 +286,28 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(pool.snapshot()["entries"], {"kept": [300, None]})
             self.assertIsNone(pool.claim())
 
+    async def test_fast_route_and_trace_requests_are_independent(self):
+        plane = position(1, time_position=int(time.time()))
+        trace_started, release_trace = asyncio.Event(), asyncio.Event()
+        async def trace(*args):
+            trace_started.set()
+            await release_trace.wait()
+
+        with patch.object(FlightService, "_get_cached_global_positions", AsyncMock(return_value=[plane])), \
+             patch.object(AircraftContextService, "trace", AsyncMock(side_effect=trace)) as trail_lookup, \
+             patch.object(AircraftContextService, "route", AsyncMock()) as route_lookup:
+            task = asyncio.create_task(AircraftContextService.get(plane.icao24, trace_only=True))
+            try:
+                async with asyncio.timeout(1):
+                    await trace_started.wait()
+                    await AircraftContextService.get(plane.icao24, for_tracking=True, include_trace=False)
+                self.assertFalse(task.done())
+            finally:
+                release_trace.set()
+                await task
+            trail_lookup.assert_awaited_once()
+            route_lookup.assert_awaited_once()
+
     async def test_active_nearby_lookup_caps_fanout_and_does_not_prepare_tracking(self):
         now = int(time.time())
         planes = [position(i, lat=51.5, lon=i / 10, time_position=now) for i in range(1, 6)]
