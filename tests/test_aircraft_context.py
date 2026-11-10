@@ -208,6 +208,12 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
                                           expected.scheduledTime.local if expected.scheduledTime else None))
                     self.assertNotIn("tracking_match", result.model_dump())
                 self.assertEqual(lookup.await_count, 2, "No second provider lookup on tap")
+                suggestion = await AircraftContextService.nearby_route(planes[0].icao24, planes)
+                self.assertEqual((suggestion.callsign, suggestion.origin.code, suggestion.destination.code),
+                                 ("THY6RB", "HEL", "IST"))
+                self.assertIsNone(await AircraftContextService.nearby_route(
+                    planes[0].icao24, [planes[0], planes[1].model_copy(update={"lat": 40})]))
+                self.assertEqual(lookup.await_count, 2, "Suggestions must not trigger provider lookups")
                 entries = pool.snapshot()["entries"]
                 tapped, neighbor = planes
                 tapped_key = AircraftContextService.schedule_key(tapped, now)
@@ -269,6 +275,31 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(pool.publish(second, {}, backoff=True))
             self.assertEqual(pool.snapshot()["entries"], {"kept": [300, None]})
             self.assertIsNone(pool.claim())
+
+    async def test_active_nearby_lookup_caps_fanout_and_does_not_prepare_tracking(self):
+        now = int(time.time())
+        planes = [position(i, lat=51.5, lon=i / 10, time_position=now) for i in range(1, 6)]
+        from core.services.flight.aircraft_context import NearbyAircraftRoute
+        fallback = NearbyAircraftRoute(callsign=planes[1].callsign,
+                                       origin=AircraftRouteEndpoint(code="LHR"),
+                                       destination=AircraftRouteEndpoint(code="FRA"))
+        with patch.object(FlightService, "_fetch_global_live_flight_match_for_candidate",
+                          AsyncMock(return_value=None)) as lookup:
+            self.assertIsNone(await AircraftContextService.nearby_route(planes[0].icao24, planes, active=True))
+            self.assertEqual({call.kwargs["candidate"].icao24 for call in lookup.await_args_list},
+                             {plane.icao24 for plane in planes[1:4]})
+        context = AircraftContext(icao24=planes[0].icao24)
+        from unittest.mock import Mock
+        with patch.object(FlightService, "_global_positions_cache", (datetime.now(timezone.utc), planes)), \
+             patch.object(AircraftContextService, "get", AsyncMock(return_value=context)), \
+             patch.object(AircraftContextService, "nearby_route", AsyncMock(return_value=fallback)), \
+             patch.object(FlightService, "_persist_global_live_flight_match") as persist:
+            response = await fixture.flights.resolve_aircraft_tracking_preview(planes[0].icao24, Obj(), Mock(), fast=True)
+        self.assertEqual(response.nearby_route, fallback)
+        self.assertEqual(response.context.icao24, planes[0].icao24)
+        self.assertIsNone(response.tracking_flight)
+        self.assertIsNone(response.context.origin)
+        persist.assert_not_called()
 
     async def test_route_looks_up_scheduled_flight_number_for_icao_callsign(self):
         now = datetime.now(timezone.utc)

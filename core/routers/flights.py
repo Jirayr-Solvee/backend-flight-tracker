@@ -304,14 +304,48 @@ async def resolve_aircraft_tracking_preview(
     icao24: str,
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
+    fast: bool = False,
 ):
+    import asyncio
     import re
-    from ..services.flight.aircraft_context import AircraftContextService, AircraftTrackingPreview
+    from ..services.flight.aircraft_context import AircraftContext, AircraftContextService, AircraftTrackingPreview
     from ..utils import get_time
     if re.fullmatch(r"[0-9a-fA-F]{6}", icao24) is None:
         raise HTTPException(status_code=422, detail="Invalid ICAO aircraft address")
-    context = await AircraftContextService.get(icao24.lower(), for_tracking=True)
+    address = icao24.lower()
+    deadline = asyncio.get_running_loop().time() + 4
+    async def nearby():
+        snapshot = FlightService._global_positions_cache
+        if not snapshot:
+            return None
+        async with asyncio.timeout_at(deadline):
+            _, positions = snapshot
+            return await AircraftContextService.nearby_route(address, positions, active=True)
+
+    suggestion = asyncio.create_task(nearby()) if fast and FlightService._global_positions_cache else None
+    nearby_result = None
+    try:
+        try:
+            async with asyncio.timeout(4 if fast else None):
+                context = await AircraftContextService.get(address, for_tracking=True)
+        except TimeoutError:
+            if not fast:
+                raise
+            context = AircraftContext(icao24=address, route_status="provider_unavailable")
+            context._preview_reasons.add("fast_preview_deadline")
+        if fast and context.route_status != "available":
+            try:
+                nearby_result = await suggestion if suggestion else await nearby()
+            except TimeoutError:
+                context._preview_reasons.add("nearby_lookup_timeout")
+            except Exception:
+                context._preview_reasons.add("nearby_lookup_failed")
+    finally:
+        if suggestion:
+            suggestion.cancel()
+            await asyncio.gather(suggestion, return_exceptions=True)
     result = AircraftTrackingPreview(context=context)
+    result.nearby_route = nearby_result
     match = context._resolver_match
     if match and context.origin and context.destination:
         try:

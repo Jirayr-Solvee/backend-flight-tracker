@@ -91,9 +91,16 @@ class AircraftContext(SQLModel):
     route_status: str = "unavailable"
 
 
+class NearbyAircraftRoute(SQLModel):
+    callsign: str
+    origin: AircraftRouteEndpoint
+    destination: AircraftRouteEndpoint
+
+
 class AircraftTrackingPreview(SQLModel):
     context: AircraftContext
     tracking_flight: FlightRead | None = None
+    nearby_route: NearbyAircraftRoute | None = None
 
 
 def finite(value):
@@ -333,6 +340,7 @@ class AircraftContextService:
     cache = OrderedDict()
     pending = {}
     slots = asyncio.Semaphore(4)
+    nearby_slots = asyncio.Semaphore(3)
     trace_backoff_until = 0.0
     schedule_pool = SchedulePool()
     schedule_task: asyncio.Task | None = None
@@ -341,6 +349,62 @@ class AircraftContextService:
     @staticmethod
     def schedule_key(position, now):
         return json.dumps((position.icao24, position.callsign, now.date().isoformat()), separators=(",", ":"))
+
+    @classmethod
+    async def nearby_route(cls, icao24, positions, *, active=False):
+        from .service import FlightService
+        now = datetime.now(timezone.utc)
+        selected = next((p for p in positions if p.icao24 == icao24
+                         and visible_aircraft(p, int(now.timestamp()))), None)
+        if selected is None:
+            return None
+        entries = (await asyncio.to_thread(cls.schedule_pool.snapshot)).get("entries", {})
+
+        def distance_score(position):
+            lat1, lat2 = math.radians(selected.lat), math.radians(position.lat)
+            return (math.sin((lat2 - lat1) / 2) ** 2
+                    + math.cos(lat1) * math.cos(lat2) * math.sin(math.radians(position.lon - selected.lon) / 2) ** 2)
+
+        candidates = sorted((p for p in positions if p.icao24 != icao24 and p.callsign
+                             and not p.aircraft_categories and visible_aircraft(p, int(now.timestamp()))
+                             and distance_score(p) <= math.sin(250 / (2 * 6371)) ** 2), key=distance_score)
+        for position in candidates:
+            route = cls.verified_schedule(position, now, entries)
+            if route and route._resolver_match and route.origin and route.destination:
+                return NearbyAircraftRoute(callsign=position.callsign, origin=route.origin, destination=route.destination)
+        if not active:
+            return None
+
+        # Use the same flight-number resolver as the live globe, but never
+        # persist or return its flight as the selected aircraft's tracking ID.
+        async def lookup(position):
+            async with cls.nearby_slots:
+                candidate = FlightService._normalized_global_resolve_candidate(position.callsign, position.icao24)
+                if not candidate:
+                    return None
+                match = await FlightService._fetch_global_live_flight_match_for_candidate(
+                    candidate=candidate, require_on_route=True)
+                if not match:
+                    return None
+                flight = match.live_flight
+                endpoints = cls.reusable_schedule(flight, position, now)
+                if endpoints:
+                    return NearbyAircraftRoute(callsign=position.callsign, origin=endpoints[0], destination=endpoints[1])
+                return None
+
+        eligible = {p.icao24: p for p in reversed(candidates)
+                    if FlightService._looks_like_route_callsign(p)}
+        closest = sorted(eligible.values(), key=distance_score)[:3]
+        tasks = [asyncio.create_task(lookup(p)) for p in closest]
+        try:
+            for task in asyncio.as_completed(tasks):
+                if result := await task:
+                    return result
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return None
 
     @classmethod
     def verified_schedule(cls, position, now, entries):
