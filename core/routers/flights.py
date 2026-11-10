@@ -273,6 +273,15 @@ async def get_global_live_flight_positions(
     return await FlightService.get_global_flight_positions(limit=limit, regional=regional)
 
 
+@router.get("/live-positions/{icao24}/position", response_model=GlobalFlightPositionRead | None)
+async def get_selected_aircraft_position(icao24: str, user: User = Depends(get_current_user)):
+    import re
+    from ..services.flight.aircraft_context import SelectedAircraftPositions
+    if re.fullmatch(r"[0-9a-fA-F]{6}", icao24) is None:
+        raise HTTPException(status_code=422, detail="Invalid ICAO aircraft address")
+    return await SelectedAircraftPositions.get(icao24.lower())
+
+
 @router.get("/live-positions/{icao24}/context")
 async def get_aircraft_context(
     icao24: str,

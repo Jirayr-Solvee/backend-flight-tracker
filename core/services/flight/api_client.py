@@ -341,13 +341,13 @@ class ADSBExchangeClient:
             if not isinstance(item, dict):
                 continue
 
-            position = cls._position_from_aircraft(item=item, now_ms=now_ms)
+            position = cls._position_from_aircraft(item=item, now_ms=now_ms if now_ms is not None else cls._float_value(item.get("now")))
             if position:
                 positions.append(position)
 
         return positions
 
-    async def get_positions_for_path(self, path: str) -> list[GlobalFlightPositionRead]:
+    async def get_positions_for_path(self, path: str, *, raise_for_status: bool = False) -> list[GlobalFlightPositionRead]:
         api_key = (settings.ADSBEXCHANGE_API_KEY or "").strip()
         if not api_key:
             return []
@@ -358,6 +358,8 @@ class ADSBExchangeClient:
             headers=self._headers(api_key),
         )
         if response.status_code != 200:
+            if raise_for_status:
+                response.raise_for_status()
             return []
 
         return self._positions_from_payload(response.json())
@@ -530,7 +532,10 @@ class ADSBExchangeClient:
         if seen is None:
             return None  # Missing age is unknown, not a newly observed position.
 
-        return int((now_ms / 1000) - seen)
+        if not math.isfinite(now_ms) or not math.isfinite(seen) or seen < 0:
+            return None
+        epoch_seconds = now_ms / 1000 if now_ms >= 100_000_000_000 else now_ms
+        return int(epoch_seconds - seen)
 
 
 class OpenSkyClient:

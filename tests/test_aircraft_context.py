@@ -1,5 +1,6 @@
 """Synthetic public aircraft only. No provider/production requests or writes."""
 import asyncio
+import time
 import unittest
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace as Obj
@@ -7,7 +8,8 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 from tests.test_regional_traffic import fixture, position
-from core.services.flight.aircraft_context import AircraftContext, AircraftContextService, ObservedAircraftTrails, parse_trace, matched_route
+from core.services.flight.aircraft_context import AircraftContext, AircraftContextService, ObservedAircraftTrails, SelectedAircraftPositions, parse_trace, matched_route
+from core.services.flight.api_client import ADSBExchangeClient
 from core.services.flight import FlightService
 
 
@@ -157,6 +159,35 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AircraftContextRouteTests(unittest.TestCase):
+    def test_selected_position_auth_and_validation(self):
+        app = fixture.FastAPI()
+        app.include_router(fixture.flights.router, prefix="/flights")
+        client = fixture.TestClient(app)
+        endpoint = "/flights/live-positions/"
+        self.assertIn(client.get(endpoint + "abc123/position").status_code, (401, 403))
+        app.dependency_overrides[fixture.flights.get_current_user] = lambda: Obj(id="synthetic")
+        self.assertEqual(client.get(endpoint + "nothex/position").status_code, 422)
+        with patch.object(SelectedAircraftPositions, "get", AsyncMock(return_value=None)) as lookup:
+            self.assertIsNone(client.get(endpoint + "ABC123/position").json())
+            lookup.assert_awaited_once_with("abc123")
+
+    def test_selected_position_uses_hex_and_preserves_observation_time(self):
+        now = int(time.time())
+        item = dict(hex="000001", lat=40, lon=44, seen_pos=7)
+        for payload in [dict(ac=[item], now=now), dict(item, now=now * 1000)]:
+            self.assertEqual(ADSBExchangeClient._positions_from_payload(payload)[0].time_position, now - 7)
+        fresh = position(1, time_position=now - 7)
+        client = Obj(get_positions_for_path=AsyncMock(return_value=[
+            position(1, time_position=now - 999), position(2, time_position=now), fresh]),
+            client=Obj(aclose=AsyncMock()))
+        with patch("core.services.flight.aircraft_context.ADSBExchangeClient", return_value=client), \
+             patch.object(SelectedAircraftPositions, "cache", ObservedAircraftTrails.aircraft.copy()), \
+             patch.object(SelectedAircraftPositions, "next_request_at", 0):
+            self.assertEqual(asyncio.run(SelectedAircraftPositions.get("000001")), fresh)
+            self.assertEqual(asyncio.run(SelectedAircraftPositions.get("000001")), fresh)
+            client.get_positions_for_path.assert_awaited_once_with("hex/000001", raise_for_status=True)
+            client.client.aclose.assert_awaited_once()
+
     def test_auth_validation_and_no_user_assignment(self):
         app = fixture.FastAPI()
         app.include_router(fixture.flights.router, prefix="/flights")

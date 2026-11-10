@@ -15,7 +15,51 @@ import httpx
 from sqlmodel import SQLModel, Field
 
 from ...config import settings
-from .api_client import AerodataboxClient
+from .api_client import ADSBExchangeClient, AerodataboxClient
+from .aircraft_metadata import visible_aircraft
+from ...models.flight import GlobalFlightPositionRead
+
+
+class SelectedAircraftPositions:
+    """Separate, bounded per-worker cache and upstream budget for active Copilot."""
+    cache: OrderedDict[str, tuple[float, GlobalFlightPositionRead | None]] = OrderedDict()
+    in_flight = False
+    next_request_at = 0.0
+
+    @classmethod
+    async def get(cls, icao24: str) -> GlobalFlightPositionRead | None:
+        now = time.monotonic()
+        cached = cls.cache.get(icao24)
+        if cached and now - cached[0] < 15:
+            return cached[1]
+        if cls.in_flight or now < cls.next_request_at:
+            return None
+        cls.in_flight = True
+        cls.next_request_at = now + 2
+        client = ADSBExchangeClient()
+        result = None
+        try:
+            async with asyncio.timeout(8):
+                positions = await client.get_positions_for_path(f"hex/{icao24}", raise_for_status=True)
+            timestamp = int(time.time())
+            result = max((position for position in positions
+                          if position.icao24 == icao24 and visible_aircraft(position, timestamp)),
+                         key=lambda position: position.time_position, default=None)
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code in {401, 402, 403, 429}:
+                cls.next_request_at = time.monotonic() + 60
+        except (httpx.HTTPError, TimeoutError, ValueError):
+            pass
+        finally:
+            try:
+                await client.client.aclose()
+            finally:
+                cls.in_flight = False
+        cls.cache[icao24] = (time.monotonic(), result)
+        cls.cache.move_to_end(icao24)
+        while len(cls.cache) > 256:
+            cls.cache.popitem(last=False)
+        return result
 
 
 class AircraftTrailPoint(SQLModel):
