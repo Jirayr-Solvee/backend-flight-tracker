@@ -464,9 +464,10 @@ class AircraftContextService:
                             if result.segments:
                                 result.trail_status = "partial"
                                 result.trail_source = "sofly_observed"
-                    cls.cache[key] = (time.monotonic(), result)
-                    cls.cache.move_to_end(key)
-                    while len(cls.cache) > 256: cls.cache.popitem(last=False)
+                    if result.route_status != "provider_unavailable":
+                        cls.cache[key] = (time.monotonic(), result)
+                        cls.cache.move_to_end(key)
+                        while len(cls.cache) > 256: cls.cache.popitem(last=False)
                     return result
                 finally:
                     cls.pending.pop(key, None)

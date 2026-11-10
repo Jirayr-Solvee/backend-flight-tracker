@@ -260,6 +260,18 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(fetch.await_count, 1)
             self.assertFalse(AircraftContextService.pending)
 
+    async def test_transient_route_failure_is_not_cached(self):
+        aircraft = position(1, icao24="abc123", time_position=int(time.time()))
+        async def unavailable(result, *args, **kwargs):
+            result.route_status = "provider_unavailable"
+        with patch.object(FlightService, "_get_cached_global_positions", AsyncMock(return_value=[aircraft])), \
+             patch.object(AircraftContextService, "trace", AsyncMock()), \
+             patch.object(AircraftContextService, "route", AsyncMock(side_effect=unavailable)) as lookup:
+            for _ in range(2):
+                self.assertEqual((await AircraftContextService.get("abc123", for_tracking=True)).route_status,
+                                 "provider_unavailable")
+            self.assertEqual(lookup.await_count, 2)
+
     async def test_trace_transport_permissions_and_backoff(self):
         original = httpx.AsyncClient
         calls = []
