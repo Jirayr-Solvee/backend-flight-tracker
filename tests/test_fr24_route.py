@@ -24,6 +24,16 @@ class FlightradarRouteTests(unittest.TestCase):
     def test_accepts_one_aircraft_and_active_leg(self):
         self.assertEqual(self.lookup([self.row]), ("LFOB", "GMFF"))
 
+    def test_unmapped_airline_needs_provider_operator_corroboration(self):
+        def match(**changes):
+            return match_route([dict(self.row, **changes)], "RYR1TM", "4d227a", self.observed, None)
+
+        self.assertEqual(match(operated_as="RYR"), ("LFOB", "GMFF"))
+        self.assertIsNone(match())
+        self.assertIsNone(match(operated_as="THY"))
+        self.assertIsNone(match(operated_as="RYR", hex="4CA708"))
+        self.assertIsNone(match(operated_as="RYR", last_seen="2026-11-10T10:59:59Z"))
+
     def test_rejects_other_aircraft_and_prior_leg(self):
         self.assertIsNone(self.lookup([dict(self.row, hex="4CA708")]))
         self.assertIsNone(self.lookup([dict(self.row, last_seen="2026-11-10T10:59:59Z")]))
@@ -82,5 +92,13 @@ class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(result.tracking_flight)
                 self.assertIsNone(result.nearby_route)
             lookup.assert_awaited_once_with(position, "synthetic", "FR")
-        self.assertEqual([line.split("reason=")[-1] for line in logs.output if "globe_fr24" in line], ["matched"])
+            primary = AircraftContext(icao24=position.icao24, route_status="available")
+            with patch.object(AircraftContextService, "get", AsyncMock(return_value=primary)):
+                result = await fixture.flights.resolve_aircraft_tracking_preview(
+                    position.icao24, SimpleNamespace(id="qa"), session, fast=True, exact_only=True
+                )
+            self.assertEqual(lookup.await_count, 2)
+            self.assertIsNone(result.context.origin)  # Existing primary context was not overwritten.
+        self.assertEqual([line.split("reason=")[-1] for line in logs.output if "globe_fr24" in line],
+                         ["matched", "matched"])
         session.commit.assert_not_called()

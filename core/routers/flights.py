@@ -382,9 +382,7 @@ async def resolve_aircraft_tracking_preview(
 
         snapshot = FlightService._global_positions_cache
         position = next((p for p in snapshot[1] if p.icao24 == address), None) if snapshot else None
-        if context.route_status == "available":
-            fr24_reason = "primary_route_available"
-        elif not settings.FR24_GLOBE_PREVIEW_TOKEN:
+        if not settings.FR24_GLOBE_PREVIEW_TOKEN:
             fr24_reason = "not_configured"
         elif not position:
             fr24_reason = "aircraft_not_in_snapshot"
@@ -392,7 +390,7 @@ async def resolve_aircraft_tracking_preview(
             callsign = (position.callsign or "").strip().upper()
             airline = FlightService._iata_for_airline_prefix(callsign[:3])
             route, fr24_reason = await lookup_route(position, settings.FR24_GLOBE_PREVIEW_TOKEN, airline)
-            if route:
+            if route and context.route_status != "available":
                 context.origin = AircraftRouteEndpoint(code=route[0])
                 context.destination = AircraftRouteEndpoint(code=route[1])
                 context.route_status = "available"

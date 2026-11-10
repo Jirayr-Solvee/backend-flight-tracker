@@ -31,8 +31,19 @@ def _match_route(rows, callsign, address, observed_at, airline):
         if not isinstance(row, dict):
             continue
         if (str(row.get("callsign")).strip().upper() != callsign
-                or str(row.get("hex")).lower() != address
-                or not re.fullmatch(re.escape(airline) + r"\d{1,4}[A-Z]?", str(row.get("flight")))):
+                or str(row.get("hex")).lower() != address):
+            continue
+        if airline:
+            carrier_matches = re.fullmatch(re.escape(airline) + r"\d{1,4}[A-Z]?", str(row.get("flight")))
+        else:
+            operator = row.get("operated_as") or row.get("operating_as")
+            carrier_matches = (
+                operator == callsign[:3]
+                and re.fullmatch(r"[A-Z0-9]{2}\d{1,4}[A-Z]?", str(row.get("flight")))
+            )
+        if not carrier_matches:
+            if miss == "identity_mismatch":
+                miss = "carrier_not_verified"
             continue
         start, end = (_timestamp(row.get(field)) for field in ("first_seen", "last_seen"))
         landed = _timestamp(row.get("datetime_landed"))
@@ -73,8 +84,6 @@ async def lookup_route(position, token, airline):
         return None, "ineligible_aircraft"
     if not re.fullmatch(r"[A-Z]{3}[0-9][A-Z0-9]{0,4}", callsign):
         return None, "unsupported_callsign"
-    if not airline:
-        return None, "unknown_airline"
     if not re.fullmatch(r"[0-9a-f]{6}", address):
         return None, "invalid_aircraft_address"
     if not observed_at:
