@@ -12,6 +12,29 @@ from core.services.flight.fr24_route import match_route
 
 
 class FlightradarRouteTests(unittest.TestCase):
+    def test_shared_burst_minute_limit_and_backoff(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(fr24_route.time, "time") as now:
+            def reserve(worker):
+                with patch.object(fr24_route, "_request_budget", worker):
+                    return fr24_route._reserve_request()
+
+            first = fr24_route.SchedulePool(directory)
+            second = fr24_route.SchedulePool(directory)
+            for offset in (0, 6, 12, 18, 24):
+                now.return_value = 1000 + offset
+                self.assertIsNone(reserve(first))
+                self.assertIsNone(reserve(second))
+                blocked = reserve(first)
+                self.assertEqual(blocked, "request_burst_limit" if offset < 24 else "request_minute_limit")
+                self.assertEqual(blocked.retry_after, 6 if offset < 24 else 36)
+            now.return_value = 1060
+            self.assertIsNone(reserve(second))
+            with patch.object(fr24_route, "_request_budget", first):
+                fr24_route._record_provider_backoff()
+            self.assertEqual(reserve(second), "provider_backoff")
+            now.return_value = 1121
+            self.assertIsNone(reserve(second))
+
     observed = datetime(2026, 11, 10, 11, tzinfo=timezone.utc).timestamp()
     row = {
         "fr24_id": "test-leg", "flight": "FR5223", "callsign": "RYR1TM", "hex": "4D227A",
@@ -58,6 +81,26 @@ class FlightradarRouteTests(unittest.TestCase):
 
 
 class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_preview_only_sends_retry_hint_when_route_is_missing(self):
+        from fastapi import Response
+
+        position = SimpleNamespace(icao24="4d227a", callsign="RYR1TM")
+        with (patch.object(fixture.settings, "FR24_GLOBE_PREVIEW_TOKEN", "synthetic"),
+              patch.object(fixture.settings, "FR24_GLOBE_PREVIEW_QA_USER_ID", "qa"),
+              patch.object(FlightService, "_global_positions_cache", (None, [position])),
+              patch.object(AircraftContextService, "get", AsyncMock()) as exact,
+              patch.object(fr24_route, "lookup_route", AsyncMock(
+                  return_value=(None, fr24_route.RetryReason("request_burst_limit", 2.2))))):
+            for status in ("unavailable", "available"):
+                exact.return_value = AircraftContext(icao24=position.icao24, route_status=status)
+                response = Response()
+                await fixture.flights.resolve_aircraft_tracking_preview(
+                    position.icao24, SimpleNamespace(id="qa"), Mock(), fast=True, exact_only=True,
+                    response=response
+                )
+                self.assertEqual(response.headers.get("X-Sofly-Route-Retry-After"),
+                                 "3" if status == "unavailable" else None)
+
     async def test_missing_snapshot_uses_only_the_selected_aircraft(self):
         from core.services.flight.aircraft_context import SelectedAircraftPositions
 
@@ -120,7 +163,7 @@ class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
         row = dict(FlightradarRouteTests.row, reg="9H-QCE", operated_as="RYR",
                    first_seen=iso(observed - 10), last_seen=iso(observed + 1))
         client = AsyncMock()
-        with (patch.object(fr24_route, "_next_request", 0),
+        with (patch.object(fr24_route, "_reserve_request", return_value=None),
               patch.object(fr24_route, "_cached_route", return_value=None),
               patch.object(fr24_route, "_remember_route"),
               patch.object(fr24_route.httpx, "AsyncClient") as factory):
@@ -132,7 +175,6 @@ class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
                 (None, row, {"callsigns": "FR5223"}, None),
             ):
                 position.registration = registration
-                fr24_route._next_request = 0
                 response = Mock(status_code=200)
                 response.json.return_value = {"data": [provider_row]}
                 client.get.return_value = response
@@ -153,24 +195,22 @@ class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(fr24_route, "_verified_routes", fr24_route.SchedulePool(directory)):
                 fr24_route._remember_route(key, route)
             with (patch.object(fr24_route, "_verified_routes", fr24_route.SchedulePool(directory)),
-                  patch.object(fr24_route, "_next_request", time.monotonic() + 30),
-                  patch.object(fr24_route, "_cooldown_reason", "request_cooldown"),
+                  patch.object(fr24_route, "_reserve_request", return_value="request_burst_limit"),
                   patch.object(fr24_route.httpx, "AsyncClient") as client):
                 self.assertEqual(await fr24_route.lookup_route(position, "synthetic", "FR"),
                                  (route, "matched_repeat"))
                 position.time_position += 1
                 self.assertEqual(await fr24_route.lookup_route(position, "synthetic", "FR"),
-                                 (None, "request_cooldown"))
+                                 (None, "request_burst_limit"))
                 client.assert_not_called()
 
     async def test_cooldown_and_stale_positions_do_not_call_provider(self):
         position = SimpleNamespace(icao24="4d227a", callsign="RYR1TM", on_ground=False,
                                    aircraft_categories=[], time_position=int(time.time()))
-        with (patch.object(fr24_route, "_next_request", time.monotonic() + 30),
-              patch.object(fr24_route, "_cooldown_reason", "request_cooldown"),
+        with (patch.object(fr24_route, "_reserve_request", return_value="request_burst_limit"),
               patch.object(fr24_route.httpx, "AsyncClient") as client):
             self.assertEqual(await fr24_route.lookup_route(position, "synthetic", "FR"),
-                             (None, "request_cooldown"))
+                             (None, "request_burst_limit"))
             position.time_position -= 600
             self.assertEqual(await fr24_route.lookup_route(position, "synthetic", "FR"),
                              (None, "observation_not_fresh"))

@@ -1,6 +1,7 @@
 """Display-only commercial globe route fallback; no tracking or schedule writes."""
 
 import asyncio
+import math
 import os
 import re
 import tempfile
@@ -77,10 +78,49 @@ def _match_route(rows, callsign, address, observed_at, airline, *, registration=
     return None, "ambiguous_leg" if matches else miss
 
 
-# Bound provider use within each worker. Also rely on the vendor's account cap.
-_next_request = 0.0
-_cooldown_reason = "request_cooldown"
+_request_budget = SchedulePool(Path(tempfile.gettempdir()) / f"sofly-fr24-budget-v1-{os.getuid()}")
+_local_backoff_until = 0.0
 _verified_routes = SchedulePool(Path(tempfile.gettempdir()) / f"sofly-fr24-routes-v1-{os.getuid()}")
+
+
+class RetryReason(str):
+    def __new__(cls, reason, delay):
+        result = super().__new__(cls, reason)
+        result.retry_after = max(1, math.ceil(delay))
+        return result
+
+
+def _reserve_request():
+    # All API workers on this host share one budget. A lock or storage failure
+    # must not turn into an unmetered provider request.
+    reason = "request_budget_unavailable"
+
+    def reserve(state):
+        nonlocal reason
+        now = time.time()
+        recent = [stamp for stamp in state.get("requests", []) if now - stamp < 60]
+        burst = [stamp for stamp in recent if now - stamp < 6]
+        backoff = state.get("backoff_until", 0) - now
+        minute_wait = sorted(recent)[-10] + 60 - now if len(recent) >= 10 else 0
+        burst_wait = sorted(burst)[-2] + 6 - now if len(burst) >= 2 else 0
+        delay, tag = max((backoff, "provider_backoff"),
+                         (minute_wait, "request_minute_limit"), (burst_wait, "request_burst_limit"))
+        if delay > 0:
+            reason = RetryReason(tag, delay)
+        else:
+            state["requests"] = [*recent, now]
+            return True
+        return None
+
+    return None if _request_budget.update(reserve) else reason
+
+
+def _record_provider_backoff():
+    def update(state):
+        state["backoff_until"] = max(state.get("backoff_until", 0), time.time() + 60)
+        return True
+
+    _request_budget.update(update)
 
 
 def _cached_route(key):
@@ -103,7 +143,7 @@ def _remember_route(key, route):
 
 
 async def lookup_route(position, token, airline):
-    global _next_request, _cooldown_reason
+    global _local_backoff_until
     callsign = (position.callsign or "").strip().upper()
     address = position.icao24.lower()
     observed_at = position.time_position
@@ -135,10 +175,11 @@ async def lookup_route(position, token, airline):
     route = await asyncio.to_thread(_cached_route, key)
     if route:
         return route, "matched_repeat"
-    if time.monotonic() < _next_request:
-        return None, _cooldown_reason
-    _next_request = time.monotonic() + 6
-    _cooldown_reason = "request_cooldown"
+    if time.monotonic() < _local_backoff_until:
+        return None, RetryReason("provider_backoff", _local_backoff_until - time.monotonic())
+    budget_reason = await asyncio.to_thread(_reserve_request)
+    if budget_reason:
+        return None, budget_reason
     observed = datetime.fromtimestamp(observed_at, timezone.utc)
     fmt = "%Y-%m-%dT%H:%M:%S"
     identity_filter = {"registrations": registration} if registration else {"callsigns": callsign}
@@ -155,8 +196,8 @@ async def lookup_route(position, token, airline):
                          "Accept-Version": "v1"},
             )
             if response.status_code in (401, 402, 403, 429):
-                _next_request = time.monotonic() + 60
-                _cooldown_reason = "provider_backoff"
+                _local_backoff_until = time.monotonic() + 60
+                await asyncio.to_thread(_record_provider_backoff)
             response.raise_for_status()
             payload = response.json()
             rows = payload.get("data") if isinstance(payload, dict) else None
@@ -169,6 +210,8 @@ async def lookup_route(position, token, airline):
         return route, reason
     except httpx.HTTPStatusError as error:
         status = error.response.status_code
+        if status == 429:
+            return None, RetryReason("provider_rate_limited", _local_backoff_until - time.monotonic())
         return None, {
             401: "provider_unauthorized", 402: "provider_payment_required",
             403: "provider_forbidden", 429: "provider_rate_limited",
