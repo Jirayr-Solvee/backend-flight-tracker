@@ -1,4 +1,5 @@
 import unittest
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -34,8 +35,31 @@ class FlightradarRouteTests(unittest.TestCase):
             self.assertIsNone(self.lookup([dict(self.row, **changes)]))
         self.assertIsNone(self.lookup([self.row, dict(self.row, fr24_id="another-leg")]))
 
+    def test_distinguishes_provider_rejection_reasons(self):
+        def reason(rows):
+            return fr24_route._match_route(rows, "RYR1TM", "4d227a", self.observed, "FR")[1]
+
+        self.assertEqual(reason([]), "no_rows")
+        self.assertEqual(reason([dict(self.row, hex="4CA708")]), "identity_mismatch")
+        self.assertEqual(reason([dict(self.row, last_seen="2026-11-10T10:59:59Z")]), "observation_outside_leg")
+        self.assertEqual(reason([dict(self.row, dest_icao=None)]), "invalid_airports")
+        self.assertEqual(reason([self.row, dict(self.row, fr24_id="another-leg")]), "ambiguous_leg")
+
 
 class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cooldown_and_stale_positions_do_not_call_provider(self):
+        position = SimpleNamespace(icao24="4d227a", callsign="RYR1TM", on_ground=False,
+                                   aircraft_categories=[], time_position=int(time.time()))
+        with (patch.object(fr24_route, "_next_request", time.monotonic() + 30),
+              patch.object(fr24_route, "_cooldown_reason", "request_cooldown"),
+              patch.object(fr24_route.httpx, "AsyncClient") as client):
+            self.assertEqual(await fr24_route.lookup_route(position, "synthetic", "FR"),
+                             (None, "request_cooldown"))
+            position.time_position -= 600
+            self.assertEqual(await fr24_route.lookup_route(position, "synthetic", "FR"),
+                             (None, "observation_not_fresh"))
+            client.assert_not_called()
+
     async def test_only_allowlisted_user_gets_display_only_fallback(self):
         position = SimpleNamespace(icao24="4d227a", callsign="RYR1TM")
         session = Mock()
@@ -47,7 +71,8 @@ class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
             patch.object(AircraftContextService, "get", AsyncMock(
                 side_effect=lambda *a, **k: AircraftContext(icao24=position.icao24)
             )),
-            patch.object(fr24_route, "lookup_route", AsyncMock(return_value=("LFOB", "GMFF"))) as lookup,
+            patch.object(fr24_route, "lookup_route", AsyncMock(return_value=(("LFOB", "GMFF"), "matched"))) as lookup,
+            self.assertLogs(fixture.flights.logger, level="INFO") as logs,
         ):
             for user_id, allowed in (("other", False), ("qa", True)):
                 result = await fixture.flights.resolve_aircraft_tracking_preview(
@@ -57,4 +82,5 @@ class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(result.tracking_flight)
                 self.assertIsNone(result.nearby_route)
             lookup.assert_awaited_once_with(position, "synthetic", "FR")
+        self.assertEqual([line.split("reason=")[-1] for line in logs.output if "globe_fr24" in line], ["matched"])
         session.commit.assert_not_called()

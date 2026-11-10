@@ -17,9 +17,16 @@ def _timestamp(value):
 
 
 def match_route(rows, callsign, address, observed_at, airline):
+    return _match_route(rows, callsign, address, observed_at, airline)[0]
+
+
+def _match_route(rows, callsign, address, observed_at, airline):
     if not isinstance(rows, list):
-        return None
+        return None, "invalid_response"
+    if not rows:
+        return None, "no_rows"
     matches = {}
+    miss = "identity_mismatch"
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -31,40 +38,54 @@ def match_route(rows, callsign, address, observed_at, airline):
         landed = _timestamp(row.get("datetime_landed"))
         if (start is None or end is None or end < start
                 or not start <= observed_at <= min(end, landed if landed is not None else end)):
+            miss = "observation_outside_leg"
             continue
         flight_id = row.get("fr24_id")
         if not isinstance(flight_id, str) or not flight_id:
-            return None
+            return None, "missing_flight_id"
         codes = tuple(
             row.get(prefix + "_iata") or row.get(prefix + "_icao") for prefix in ("orig", "dest")
         )
         if (not all(isinstance(code, str) and re.fullmatch(r"[A-Z]{3,4}", code) for code in codes)
                 or codes[0] == codes[1]):
-            return None
+            return None, "invalid_airports"
         if flight_id in matches and matches[flight_id] != codes:
-            return None
+            return None, "conflicting_airports"
         matches[flight_id] = codes
-    return next(iter(matches.values())) if len(matches) == 1 else None
+    if len(matches) == 1:
+        return next(iter(matches.values())), "matched"
+    return None, "ambiguous_leg" if matches else miss
 
 
 # Bound provider use within each worker. Also rely on the vendor's account cap.
 _next_request = 0.0
+_cooldown_reason = "request_cooldown"
 
 
 async def lookup_route(position, token, airline):
-    global _next_request
+    global _next_request, _cooldown_reason
     callsign = (position.callsign or "").strip().upper()
     address = position.icao24.lower()
     observed_at = position.time_position
-    if (not token or not airline or not observed_at or position.on_ground
-            or "military" in position.aircraft_categories
-            or not re.fullmatch(r"[A-Z]{3}[0-9][A-Z0-9]{0,4}", callsign)
-            or not re.fullmatch(r"[0-9a-f]{6}", address)):
-        return None
+    if not token:
+        return None, "not_configured"
+    if position.on_ground or "military" in position.aircraft_categories:
+        return None, "ineligible_aircraft"
+    if not re.fullmatch(r"[A-Z]{3}[0-9][A-Z0-9]{0,4}", callsign):
+        return None, "unsupported_callsign"
+    if not airline:
+        return None, "unknown_airline"
+    if not re.fullmatch(r"[0-9a-f]{6}", address):
+        return None, "invalid_aircraft_address"
+    if not observed_at:
+        return None, "missing_observation"
     now = datetime.now(timezone.utc)
-    if not 0 <= now.timestamp() - observed_at <= 300 or time.monotonic() < _next_request:
-        return None
+    if not 0 <= now.timestamp() - observed_at <= 300:
+        return None, "observation_not_fresh"
+    if time.monotonic() < _next_request:
+        return None, _cooldown_reason
     _next_request = time.monotonic() + 6
+    _cooldown_reason = "request_cooldown"
     observed = datetime.fromtimestamp(observed_at, timezone.utc)
     fmt = "%Y-%m-%dT%H:%M:%S"
     try:
@@ -79,11 +100,22 @@ async def lookup_route(position, token, airline):
             )
             if response.status_code in (401, 402, 403, 429):
                 _next_request = time.monotonic() + 60
+                _cooldown_reason = "provider_backoff"
             response.raise_for_status()
             payload = response.json()
             rows = payload.get("data") if isinstance(payload, dict) else None
-            if not isinstance(rows, list) or len(rows) >= 20:
-                return None
-            return match_route(rows, callsign, address, observed_at, airline)
-    except (httpx.HTTPError, ValueError, TimeoutError):
-        return None
+            if isinstance(rows, list) and len(rows) >= 20:
+                return None, "result_limit"
+            return _match_route(rows, callsign, address, observed_at, airline)
+    except httpx.HTTPStatusError as error:
+        status = error.response.status_code
+        return None, {
+            401: "provider_unauthorized", 402: "provider_payment_required",
+            403: "provider_forbidden", 429: "provider_rate_limited",
+        }.get(status, "provider_http_error")
+    except (httpx.TimeoutException, TimeoutError):
+        return None, "provider_timeout"
+    except httpx.HTTPError:
+        return None, "provider_transport_error"
+    except ValueError:
+        return None, "invalid_response"

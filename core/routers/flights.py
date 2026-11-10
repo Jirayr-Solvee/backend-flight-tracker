@@ -375,18 +375,23 @@ async def resolve_aircraft_tracking_preview(
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-    if (fast and exact_only and context.route_status != "available"
-            and settings.FR24_GLOBE_PREVIEW_TOKEN and settings.FR24_GLOBE_PREVIEW_QA_USER_ID
+    if (fast and exact_only and settings.FR24_GLOBE_PREVIEW_QA_USER_ID
             and user.id == settings.FR24_GLOBE_PREVIEW_QA_USER_ID):
         from ..services.flight.aircraft_context import AircraftRouteEndpoint
         from ..services.flight.fr24_route import lookup_route
 
         snapshot = FlightService._global_positions_cache
         position = next((p for p in snapshot[1] if p.icao24 == address), None) if snapshot else None
-        if position:
+        if context.route_status == "available":
+            fr24_reason = "primary_route_available"
+        elif not settings.FR24_GLOBE_PREVIEW_TOKEN:
+            fr24_reason = "not_configured"
+        elif not position:
+            fr24_reason = "aircraft_not_in_snapshot"
+        else:
             callsign = (position.callsign or "").strip().upper()
             airline = FlightService._iata_for_airline_prefix(callsign[:3])
-            route = await lookup_route(position, settings.FR24_GLOBE_PREVIEW_TOKEN, airline)
+            route, fr24_reason = await lookup_route(position, settings.FR24_GLOBE_PREVIEW_TOKEN, airline)
             if route:
                 context.origin = AircraftRouteEndpoint(code=route[0])
                 context.destination = AircraftRouteEndpoint(code=route[1])
@@ -394,6 +399,7 @@ async def resolve_aircraft_tracking_preview(
                 # FR24 airports alone cannot authorize a tracking handoff.
                 context._resolver_match = None
                 context._preview_reasons.add("fr24_display_only")
+        logger.info("globe_fr24 aircraft=%s reason=%s", address, fr24_reason)
     result = AircraftTrackingPreview(context=context)
     result.nearby_route = nearby_result
     match = context._resolver_match
