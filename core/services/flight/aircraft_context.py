@@ -79,6 +79,7 @@ class AircraftRouteEndpoint(SQLModel):
 
 
 class AircraftContext(SQLModel):
+    _preview_reasons: set[str] = PrivateAttr(default_factory=set)
     _schedule_valid_until: float | None = PrivateAttr(default=None)
     _resolver_match: object | None = PrivateAttr(default=None)
     icao24: str
@@ -190,17 +191,22 @@ def schedule_window(flight, position, now, *, arrival_grace):
         return False
 
 
-def matched_route(flight, position, now: datetime, *, resolver_number=None, by_aircraft=False):
+def matched_route(flight, position, now: datetime, *, resolver_number=None, by_aircraft=False, reasons=None):
+    def reject(reason):
+        if reasons is not None:
+            reasons.add(reason)
+        return None
+
     aircraft = flight.aircraft
     if not aircraft:
-        return None
+        return reject("missing_provider_aircraft")
     normalize = lambda value: re.sub(r"[^A-Z0-9]", "", (value or "").upper())
     if aircraft.modeS:
         identity_matches = aircraft.modeS.strip().lower() == position.icao24.strip().lower()
     else:
         identity_matches = bool(position.registration) and normalize(aircraft.reg) == normalize(position.registration)
     if not identity_matches:
-        return None
+        return reject("aircraft_identity_mismatch")
     resolver_identity = bool(
         resolver_number and aircraft.modeS and position.callsign
         and normalize(resolver_number) == normalize(getattr(flight, "number", None))
@@ -213,10 +219,12 @@ def matched_route(flight, position, now: datetime, *, resolver_number=None, by_a
         # A tail can fly several legs in a day. The exact address alone
         # cannot identify which scheduled leg the user tapped.
         if (not aircraft.modeS or not position.callsign or not getattr(flight, "callSign", None)
-                or normalize(flight.callSign) not in {normalize(position.callsign), normalize(resolver_number)}
-                or position.aircraft_categories or getattr(flight, "isCargo", None) is not False
-                or not visible_aircraft(position, int(now.timestamp()))):
-            return None
+                or normalize(flight.callSign) not in {normalize(position.callsign), normalize(resolver_number)}):
+            return reject("aircraft_lookup_leg_identity_mismatch")
+        if position.aircraft_categories or getattr(flight, "isCargo", None) is not False:
+            return reject("unsupported_aircraft_category")
+        if not visible_aircraft(position, int(now.timestamp())):
+            return reject("position_not_fresh_airborne")
         resolver_identity = True
     status = str(flight.status.value)
     live_status = status in {"EnRoute", "Departed", "Approaching", "Delayed"}
@@ -224,13 +232,13 @@ def matched_route(flight, position, now: datetime, *, resolver_number=None, by_a
     # Expected is a lagging schedule status, never evidence of a live state.
     if not live_status and not (status == "Expected" and resolver_identity
                                 and visible_aircraft(position, int(now.timestamp()))):
-        return None
+        return reject("flight_status_not_eligible")
     try:
         updated = datetime.fromisoformat(flight.lastUpdatedUtc.replace("Z", "+00:00"))
         if updated.tzinfo is None or (now - updated).total_seconds() < -30:
-            return None
+            return reject("invalid_provider_update_time")
     except (ValueError, TypeError):
-        return None
+        return reject("invalid_provider_update_time")
     location = flight.location
     location_fresh = False
     if location is not None:
@@ -239,35 +247,35 @@ def matched_route(flight, position, now: datetime, *, resolver_number=None, by_a
             location = None
     if location is not None:
         if location.lat is None or location.lon is None or not location.reportedAtUtc:
-            return None
+            return reject("missing_provider_position_fields")
         if not -90 <= location.lat <= 90 or not -180 <= location.lon <= 180:
-            return None
+            return reject("invalid_provider_coordinates")
         try:
             reported = datetime.fromisoformat(location.reportedAtUtc.replace("Z", "+00:00"))
             # The field itself is explicitly UTC; some provider rows omit Z.
             if reported.tzinfo is None:
                 reported = reported.replace(tzinfo=timezone.utc)
             if (now - reported).total_seconds() < -30:
-                return None
+                return reject("future_provider_position")
             location_fresh = (now - reported).total_seconds() <= 900
             if location_fresh:
                 lat1, lat2 = math.radians(position.lat), math.radians(location.lat)
                 dlon = math.radians(position.lon - location.lon)
                 a = math.sin((lat2-lat1)/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
                 if not math.isfinite(a) or 6371 * 2 * math.asin(math.sqrt(min(1, max(0, a)))) > 200:
-                    return None
+                    return reject("provider_position_conflict")
         except (ValueError, TypeError):
-            return None
+            return reject("invalid_provider_position_time")
     if by_aircraft or not live_status or not location_fresh or (now - updated).total_seconds() > 900:
         # The current ADS-B aircraft can corroborate a scheduled passenger leg
         # even when the schedule provider has not updated its live data.
         # Only expose the original schedule, never that stale status/position.
         if not resolver_identity and (not aircraft.modeS or not position.callsign or normalize(getattr(flight, "callSign", None)) != normalize(position.callsign)):
-            return None
+            return reject("scheduled_leg_not_corroborated")
         if set(position.aircraft_categories or ()) & {"military", "cargo", "helicopters", "interesting"} or getattr(flight, "isCargo", None) is not False:
-            return None
+            return reject("unsupported_aircraft_category")
         if not schedule_window(flight, position, now, arrival_grace=timedelta(hours=2)):
-            return None
+            return reject("schedule_window_not_verified")
     def endpoint(data):
         airport = data.airport
         clean = lambda value: value.strip()[:120] if isinstance(value, str) and value.strip() else None
@@ -498,7 +506,10 @@ class AircraftContextService:
         # Restrict enrichment to real currently available aircraft, not arbitrary
         # client-supplied callsigns/provider paths. No guest/account data in cache.
         if position is None:
-            return AircraftContext(icao24=icao24)
+            result = AircraftContext(icao24=icao24)
+            result._preview_reasons.add("position_not_fresh_airborne" if any(p.icao24 == icao24 for p in positions)
+                                        else "aircraft_not_in_feed")
+            return result
         key = (icao24, position.callsign, now.date(), for_tracking)
         cached = cls.cache.get(key)
         state = await asyncio.to_thread(cls.schedule_pool.snapshot)
@@ -520,7 +531,9 @@ class AircraftContextService:
             return result
         if key not in cls.pending:
             if len(cls.pending) >= 32:
-                return AircraftContext(icao24=icao24, trail_status="provider_unavailable", route_status="provider_unavailable")
+                result = AircraftContext(icao24=icao24, trail_status="provider_unavailable", route_status="provider_unavailable")
+                result._preview_reasons.add("lookup_capacity_reached")
+                return result
             async def run():
                 try:
                     async with cls.slots:
@@ -596,23 +609,31 @@ class AircraftContextService:
                          or prefix[1] in FlightService._preferred_airline_codes_for_continent("all")))
         number_eligible = FlightService._looks_like_route_callsign(position)
         if not number_eligible and not fallback:
+            result._preview_reasons.add("callsign_not_lookup_eligible")
             return
         # The provider lookup is by scheduled flight number, not ADS-B callsign.
         code = FlightService._normalized_callsign_for_tracking(raw) or raw
         client = AerodataboxClient()
         try:
             matches = {}
+            candidate_count = 0
             def collect(flights, date, *, by_aircraft=False):
+                nonlocal candidate_count
                 for flight in flights:
+                    candidate_count += 1
                     endpoints = matched_route(flight, position, now, resolver_number=code if full_resolver else None,
-                                              by_aircraft=by_aircraft)
+                                              by_aircraft=by_aircraft, reasons=result._preview_reasons)
                     if endpoints and flight.arrival.scheduledTime is None:
                         endpoints = cls.reusable_schedule(flight, position, now)
+                        if not endpoints:
+                            result._preview_reasons.add("partial_schedule_not_corroborated")
                     if endpoints and (not by_aircraft or
                                       (endpoints[0].scheduled_time_local and all(e.code for e in endpoints))):
                         key = tuple((e.code or e.name, e.scheduled_time_local) for e in endpoints)
                         arrival_utc = getattr(getattr(flight.arrival, "scheduledTime", None), "utc", None)
                         matches[key] = (endpoints, arrival_utc, flight, date)
+                    elif endpoints:
+                        result._preview_reasons.add("missing_airports_or_departure_time")
             async def lookup_number():
                 for number in dict.fromkeys((code, raw)):
                     async for date, flights in FlightService._global_resolver_flight_batches(
@@ -631,9 +652,11 @@ class AircraftContextService:
                 try:
                     async with asyncio.timeout(8 if fallback else 12):
                         await lookup_number()
-                except Exception:
+                except Exception as exc:
                     if not fallback:
                         raise
+                    result._preview_reasons.add("number_lookup_timeout" if isinstance(exc, TimeoutError)
+                                                else "number_lookup_failed")
                     result.route_status = "provider_unavailable"
             if fallback and not matches:
                 async with asyncio.timeout(7):
@@ -657,7 +680,13 @@ class AircraftContextService:
                     candidate=NormalizedGlobalFlightResolveCandidate(code, position.icao24),
                     departure_date=date, live_flights=[flight], live_flight=flight,
                 )
-        except Exception:
+            elif len(matches) > 1:
+                result._preview_reasons.add("ambiguous_matching_legs")
+            elif not candidate_count:
+                result._preview_reasons.add("no_usable_provider_records")
+        except Exception as exc:
+            result._preview_reasons.add("provider_lookup_timeout" if isinstance(exc, TimeoutError)
+                                        else "provider_lookup_failed")
             result.route_status = "provider_unavailable"
         finally:
             await client.client.aclose()

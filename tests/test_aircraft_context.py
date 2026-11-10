@@ -68,7 +68,10 @@ class AircraftTraceTests(unittest.TestCase):
         self.assertEqual(departure.scheduled_time_local, "2026-11-10 09:00+00:00")
         self.assertIsNone(arrival.scheduled_time_local)
         flight.aircraft.modeS = "abc124"
-        self.assertIsNone(matched_route(flight, aircraft, now), "Contradictory modeS cannot fall back to same tail")
+        reasons = set()
+        self.assertIsNone(matched_route(flight, aircraft, now, reasons=reasons),
+                          "Contradictory modeS cannot fall back to same tail")
+        self.assertEqual(reasons, {"aircraft_identity_mismatch"})
         flight.aircraft.modeS = None
         self.assertIsNotNone(matched_route(flight, aircraft, now))
         aircraft.registration = None
@@ -317,12 +320,15 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
         context._resolver_match = Obj(live_flight=Obj())
         from unittest.mock import Mock
         session = Mock()
-        with patch.object(AircraftContextService, "get", AsyncMock(return_value=context)) as lookup, \
+        with self.assertLogs(fixture.flights.logger, level="INFO") as logs, \
+             patch.object(AircraftContextService, "get", AsyncMock(return_value=context)) as lookup, \
              patch.object(FlightService, "_persist_global_live_flight_match", return_value=Obj(aircraft_modeS="abc124")):
             response = await fixture.flights.resolve_aircraft_tracking_preview("ABC123", Obj(), session)
         self.assertIsNone(response.tracking_flight)
         self.assertEqual(response.context.origin.code, "AMS")
         self.assertNotIn("_resolver_match", response.context.model_dump())
+        self.assertNotIn("_preview_reasons", response.context.model_dump())
+        self.assertIn("route=available track_ready=False reasons=stored_aircraft_mismatch", logs.output[0])
         lookup.assert_awaited_once_with("abc123", for_tracking=True)
         session.commit.assert_not_called()
         session.rollback.assert_called_once()

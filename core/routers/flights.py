@@ -332,10 +332,21 @@ async def resolve_aircraft_tracking_preview(
                 session.commit()
                 result.tracking_flight = snapshot
             else:
+                context._preview_reasons.add("stored_flight_missing" if not flight else
+                                             "stored_aircraft_mismatch" if (flight.aircraft_modeS or "").strip().lower() != icao24.lower()
+                                             else "stored_leg_mismatch")
                 session.rollback()
         except Exception:
+            context._preview_reasons.add("tracking_preparation_error")
             session.rollback()
             logger.exception("Unable to prepare an exact aircraft tracking preview")
+    if context.route_status != "available" or result.tracking_flight is None:
+        reasons = sorted(context._preview_reasons)
+        if context.route_status == "available":
+            reasons = [reason for reason in reasons if reason.startswith(("stored_", "tracking_"))]
+        logger.info("globe_preview aircraft=%s route=%s track_ready=%s reasons=%s",
+                    icao24.lower(), context.route_status, result.tracking_flight is not None,
+                    ",".join(reasons or ["no_exact_tracking_match"]))
     return result
 
 
