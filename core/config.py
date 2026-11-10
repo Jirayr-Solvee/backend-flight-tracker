@@ -1,3 +1,4 @@
+import os
 from enum import Enum
 from typing import Literal
 
@@ -46,6 +47,9 @@ class Settings(BaseSettings):
     X_API_MARKET_KEY: str
 
     AERODATABOX_SERVICE_URL: str
+    FR24_GLOBE_PREVIEW_TOKEN: str | None = Field(default=None, repr=False)
+    # Private device QA: a configured token alone must not enable production traffic.
+    FR24_GLOBE_PREVIEW_QA_USER_ID: str | None = Field(default=None, repr=False)
     ADSBEXCHANGE_API_KEY: str | None = None
     ADSBEXCHANGE_BASE_URL: str = "https://gateway.adsbexchange.com/api/aircraft/v2"
     ADSBEXCHANGE_AUTH_HEADER: str = "api-auth"
@@ -172,7 +176,7 @@ class Settings(BaseSettings):
         return self
 
 
-settings = Settings()  # type: ignore
+settings = Settings(_secrets_dir=os.environ.get("CREDENTIALS_DIRECTORY"))  # type: ignore
 
 # Pinned MapLibre build for the flight-share page. Re-verify both hashes with
 # `curl -s URL | openssl dgst -sha384 -binary | openssl base64 -A` on upgrade.
