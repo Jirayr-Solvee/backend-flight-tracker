@@ -313,12 +313,14 @@ async def resolve_aircraft_tracking_preview(
     if re.fullmatch(r"[0-9a-fA-F]{6}", icao24) is None:
         raise HTTPException(status_code=422, detail="Invalid ICAO aircraft address")
     address = icao24.lower()
-    deadline = asyncio.get_running_loop().time() + 4
+    # The app renders the aircraft card before this request completes. Keep
+    # exact-route priority brief without cutting off the nearby provider calls.
+    nearby_deadline = asyncio.get_running_loop().time() + 12
     async def nearby():
         snapshot = FlightService._global_positions_cache
         if not snapshot:
             return None
-        async with asyncio.timeout_at(deadline):
+        async with asyncio.timeout_at(nearby_deadline):
             _, positions = snapshot
             return await AircraftContextService.nearby_route(address, positions, active=True)
 

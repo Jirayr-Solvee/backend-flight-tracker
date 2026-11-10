@@ -290,9 +290,13 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
                              {plane.icao24 for plane in planes[1:4]})
         context = AircraftContext(icao24=planes[0].icao24)
         from unittest.mock import Mock
+        async def delayed_nearby(*args, **kwargs):
+            await asyncio.sleep(4.1)
+            return fallback
+
         with patch.object(FlightService, "_global_positions_cache", (datetime.now(timezone.utc), planes)), \
              patch.object(AircraftContextService, "get", AsyncMock(return_value=context)), \
-             patch.object(AircraftContextService, "nearby_route", AsyncMock(return_value=fallback)), \
+             patch.object(AircraftContextService, "nearby_route", AsyncMock(side_effect=delayed_nearby)), \
              patch.object(FlightService, "_persist_global_live_flight_match") as persist:
             response = await fixture.flights.resolve_aircraft_tracking_preview(planes[0].icao24, Obj(), Mock(), fast=True)
         self.assertEqual(response.nearby_route, fallback)
