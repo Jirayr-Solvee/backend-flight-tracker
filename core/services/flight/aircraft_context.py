@@ -160,7 +160,7 @@ def parse_trace(payload: dict, icao24: str, now: int) -> list[list[AircraftTrail
     return result
 
 
-def matched_route(flight, position, now: datetime):
+def matched_route(flight, position, now: datetime, *, resolver_number=None):
     aircraft = flight.aircraft
     if not aircraft:
         return None
@@ -171,6 +171,14 @@ def matched_route(flight, position, now: datetime):
         identity_matches = bool(position.registration) and normalize(aircraft.reg) == normalize(position.registration)
     if not identity_matches or str(flight.status.value) not in {"EnRoute", "Departed", "Approaching", "Delayed"}:
         return None
+    resolver_identity = bool(
+        resolver_number and aircraft.modeS and position.callsign
+        and normalize(resolver_number) == normalize(getattr(flight, "number", None))
+        and (not getattr(flight, "callSign", None) or normalize(flight.callSign) in {
+            normalize(position.callsign), normalize(resolver_number)
+        })
+        and not position.aircraft_categories and getattr(flight, "isCargo", None) is False
+    )
     try:
         updated = datetime.fromisoformat(flight.lastUpdatedUtc.replace("Z", "+00:00"))
         if updated.tzinfo is None or (now - updated).total_seconds() < -30:
@@ -179,6 +187,10 @@ def matched_route(flight, position, now: datetime):
         return None
     location = flight.location
     location_fresh = False
+    if location is not None:
+        if (location.lat is None or location.lon is None or not location.reportedAtUtc) and resolver_identity:
+            # Incomplete telemetry is not evidence of a contradictory position.
+            location = None
     if location is not None:
         if location.lat is None or location.lon is None or not location.reportedAtUtc:
             return None
@@ -201,7 +213,7 @@ def matched_route(flight, position, now: datetime):
         # The current ADS-B aircraft can corroborate a scheduled passenger leg
         # even when the schedule provider has not updated its live data.
         # Only expose the original schedule, never that stale status/position.
-        if not aircraft.modeS or not position.callsign or normalize(getattr(flight, "callSign", None)) != normalize(position.callsign):
+        if not resolver_identity and (not aircraft.modeS or not position.callsign or normalize(getattr(flight, "callSign", None)) != normalize(position.callsign)):
             return None
         if set(position.aircraft_categories or ()) & {"military", "cargo", "helicopters", "interesting"} or getattr(flight, "isCargo", None) is not False:
             return None
@@ -430,7 +442,7 @@ class AircraftContextService:
                             result.route_status = schedule.route_status
                             await cls.trace(result, now)
                         else:
-                            await asyncio.gather(cls.trace(result, now), cls.route(result, position, now))
+                            await asyncio.gather(cls.trace(result, now), cls.route(result, position, now, full_resolver=True))
                         if not result.segments:
                             result.segments = ObservedAircraftTrails.segments(icao24, position.callsign, int(now.timestamp()))
                             if result.segments:
@@ -484,7 +496,7 @@ class AircraftContextService:
             result.trail_status = "provider_unavailable"
 
     @classmethod
-    async def route(cls, result, position, now):
+    async def route(cls, result, position, now, *, full_resolver=False):
         from .service import FlightService
         if not FlightService._looks_like_route_callsign(position):
             return
@@ -495,16 +507,18 @@ class AircraftContextService:
         try:
             async with asyncio.timeout(12):
                 matches = {}
-                dates = (now.date(), now.date() - timedelta(days=1))
                 for number in dict.fromkeys((code, raw)):
-                    for date in dates:
-                        flights = await client.get_flight(number, date.isoformat(), with_location=True)
+                    async for date, flights in FlightService._global_resolver_flight_batches(
+                        client, number, now, include_next_day=full_resolver
+                    ):
                         for flight in flights:
-                            endpoints = matched_route(flight, position, now)
+                            endpoints = matched_route(flight, position, now, resolver_number=code if full_resolver else None)
                             if endpoints:
                                 key = tuple((e.code or e.name, e.scheduled_time_local) for e in endpoints)
                                 arrival_utc = getattr(getattr(flight.arrival, "scheduledTime", None), "utc", None)
                                 matches[key] = (endpoints, arrival_utc)
+                        if matches and date != now.date().isoformat():
+                            break
                     if matches:
                         break
                 if len(matches) == 1:

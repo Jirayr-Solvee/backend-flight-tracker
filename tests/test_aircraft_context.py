@@ -81,6 +81,30 @@ class AircraftTraceTests(unittest.TestCase):
         flight.status.value = "Arrived"
         self.assertIsNone(matched_route(flight, aircraft, now))
 
+    def test_full_resolver_requires_matching_number_and_mode_s_for_schedule_without_telemetry(self):
+        now = datetime.now(timezone.utc)
+        def leg(code, at):
+            return Obj(airport=Obj(iata=code, icao=None, name=code, municipalityName=None),
+                       scheduledTime=Obj(utc=at.isoformat(), local=at.isoformat()),
+                       revisedTime=Obj(local=(at+timedelta(minutes=40)).isoformat()))
+        aircraft = position(1, icao24="abc123", callsign="KLM689")
+        flight = Obj(aircraft=Obj(modeS="ABC123", reg=None), status=Obj(value="Departed"),
+                     lastUpdatedUtc=(now-timedelta(hours=2)).isoformat(), location=None,
+                     number="KL 689", callSign=None, isCargo=False,
+                     departure=leg("AMS", now-timedelta(hours=1)), arrival=leg("YYZ", now+timedelta(hours=4)))
+        self.assertIsNone(matched_route(flight, aircraft, now))
+        origin, destination = matched_route(flight, aircraft, now, resolver_number="KL689")
+        self.assertEqual(origin.scheduled_time_local, flight.departure.scheduledTime.local)
+        self.assertEqual(destination.scheduled_time_local, flight.arrival.scheduledTime.local)
+        flight.aircraft.modeS = "ABC124"
+        self.assertIsNone(matched_route(flight, aircraft, now, resolver_number="KL689"))
+        flight.aircraft.modeS = "ABC123"
+        flight.callSign = "KLM999"
+        self.assertIsNone(matched_route(flight, aircraft, now, resolver_number="KL689"))
+        flight.callSign = None
+        flight.number = "KL 999"
+        self.assertIsNone(matched_route(flight, aircraft, now, resolver_number="KL689"))
+
     def test_passenger_schedule_without_location_requires_corroboration(self):
         now = datetime.now(timezone.utc)
         def leg(code, stamp):

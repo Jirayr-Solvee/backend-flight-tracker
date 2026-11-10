@@ -730,24 +730,29 @@ class FlightService:
         return None
 
     @staticmethod
+    async def _global_resolver_flight_batches(client, number, now, *, include_next_day=True):
+        """Read provider candidates without selecting or persisting a flight."""
+        offsets = (0, -1, 1) if include_next_day else (0, -1)
+        for offset in offsets:
+            date = (now.date() + timedelta(days=offset)).isoformat()
+            yield date, await client.get_flight(number, date, with_location=True)
+
+    @staticmethod
     async def _fetch_global_live_flight_match(
         candidate: NormalizedGlobalFlightResolveCandidate,
         require_on_route: bool,
     ) -> GlobalLiveFlightResolveMatch | None:
-        today = datetime.now(timezone.utc).date()
-        dates = [
-            today.isoformat(),
-            (today - timedelta(days=1)).isoformat(),
-            (today + timedelta(days=1)).isoformat(),
-        ]
-
         api_client = AerodataboxClient()
-        for departure_date in dates:
-            live_flights = await api_client.get_flight(
-                full_number=candidate.callsign,
-                departure_date=departure_date,
-                with_location=True,
-            )
+        try:
+            return await FlightService._select_global_resolver_match(api_client, candidate, require_on_route)
+        finally:
+            await api_client.client.aclose()
+
+    @staticmethod
+    async def _select_global_resolver_match(api_client, candidate, require_on_route):
+        async for departure_date, live_flights in FlightService._global_resolver_flight_batches(
+            api_client, candidate.callsign, datetime.now(timezone.utc)
+        ):
             if not live_flights:
                 continue
 
