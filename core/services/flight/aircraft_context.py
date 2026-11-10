@@ -170,14 +170,34 @@ def matched_route(flight, position, now: datetime):
         return None
     try:
         updated = datetime.fromisoformat(flight.lastUpdatedUtc.replace("Z", "+00:00"))
-        if updated.tzinfo is None or not -30 <= (now - updated).total_seconds() <= 900:
+        if updated.tzinfo is None or (now - updated).total_seconds() < -30:
             return None
     except (ValueError, TypeError):
         return None
     location = flight.location
-    if location is None:
-        # Some scheduled passenger legs have no provider position. Require
-        # matching live callsign and Mode S, not just a flight number or tail.
+    location_fresh = False
+    if location is not None:
+        if location.lat is None or location.lon is None or not location.reportedAtUtc:
+            return None
+        if not -90 <= location.lat <= 90 or not -180 <= location.lon <= 180:
+            return None
+        try:
+            reported = datetime.fromisoformat(location.reportedAtUtc.replace("Z", "+00:00"))
+            if reported.tzinfo is None or (now - reported).total_seconds() < -30:
+                return None
+            location_fresh = (now - reported).total_seconds() <= 900
+            if location_fresh:
+                lat1, lat2 = math.radians(position.lat), math.radians(location.lat)
+                dlon = math.radians(position.lon - location.lon)
+                a = math.sin((lat2-lat1)/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
+                if not math.isfinite(a) or 6371 * 2 * math.asin(math.sqrt(min(1, max(0, a)))) > 200:
+                    return None
+        except (ValueError, TypeError):
+            return None
+    if not location_fresh or (now - updated).total_seconds() > 900:
+        # The current ADS-B aircraft can corroborate a scheduled passenger leg
+        # even when the schedule provider has not updated its live data.
+        # Only expose the original schedule, never that stale status/position.
         if not aircraft.modeS or not position.callsign or normalize(getattr(flight, "callSign", None)) != normalize(position.callsign):
             return None
         if set(position.aircraft_categories or ()) & {"military", "cargo", "helicopters", "interesting"} or getattr(flight, "isCargo", None) is not False:
@@ -190,22 +210,6 @@ def matched_route(flight, position, now: datetime):
             departure = scheduled_utc(flight.departure)
             arrival = scheduled_utc(flight.arrival)
             if not departure or not arrival or not departure < arrival or not departure - timedelta(minutes=30) <= now <= arrival + timedelta(hours=2):
-                return None
-        except (ValueError, TypeError):
-            return None
-    else:
-        if location.lat is None or location.lon is None or not location.reportedAtUtc:
-            return None
-        if not -90 <= location.lat <= 90 or not -180 <= location.lon <= 180:
-            return None
-        try:
-            reported = datetime.fromisoformat(location.reportedAtUtc.replace("Z", "+00:00"))
-            if reported.tzinfo is None or not -30 <= (now - reported).total_seconds() <= 900:
-                return None
-            lat1, lat2 = math.radians(position.lat), math.radians(location.lat)
-            dlon = math.radians(position.lon - location.lon)
-            a = math.sin((lat2-lat1)/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
-            if not math.isfinite(a) or 6371 * 2 * math.asin(math.sqrt(min(1, max(0, a)))) > 200:
                 return None
         except (ValueError, TypeError):
             return None
@@ -367,7 +371,7 @@ class AircraftContextService:
                         for flight in flights:
                             endpoints = matched_route(flight, position, now)
                             if endpoints:
-                                key = tuple((e.code, e.name) for e in endpoints)
+                                key = tuple((e.code or e.name, e.scheduled_time_local) for e in endpoints)
                                 matches[key] = endpoints
                     if matches:
                         break

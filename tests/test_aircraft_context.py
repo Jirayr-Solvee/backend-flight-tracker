@@ -83,15 +83,23 @@ class AircraftTraceTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         def leg(code, stamp):
             return Obj(airport=Obj(iata=code, icao=None, name=code, municipalityName=None),
-                       scheduledTime=Obj(utc=stamp.isoformat(), local=stamp.isoformat()))
-        flight = Obj(aircraft=Obj(modeS="ABC123", reg=None), status=Obj(value="EnRoute"),
-                     lastUpdatedUtc=now.isoformat(), location=None, callSign="UAL957", isCargo=False,
-                     departure=leg("LHR", now-timedelta(hours=1)), arrival=leg("JFK", now+timedelta(hours=1)))
-        aircraft = position(1, icao24="abc123", callsign="UAL957")
-        self.assertIsNotNone(matched_route(flight, aircraft, now))
-        flight.callSign = "UAL958"
+                       scheduledTime=Obj(utc=stamp.isoformat(), local=stamp.isoformat()),
+                       revisedTime=Obj(local=(stamp+timedelta(minutes=25)).isoformat()))
+        flight = Obj(aircraft=Obj(modeS="ABC123", reg=None), status=Obj(value="Departed"),
+                     lastUpdatedUtc=(now-timedelta(hours=2)).isoformat(), location=None, callSign="KLM689", isCargo=False,
+                     departure=leg("AMS", now-timedelta(hours=2)), arrival=leg("YYZ", now+timedelta(hours=4)))
+        aircraft = position(1, icao24="abc123", callsign="KLM689")
+        endpoints = matched_route(flight, aircraft, now)
+        self.assertEqual([(e.code, e.scheduled_time_local) for e in endpoints],
+                         [(leg.airport.iata, leg.scheduledTime.local) for leg in (flight.departure, flight.arrival)])
+        flight.location = Obj(lat=-40, lon=44, reportedAtUtc=now.isoformat())
+        self.assertIsNone(matched_route(flight, aircraft, now), "A fresh conflicting position must still reject the match")
+        flight.location.reportedAtUtc = flight.lastUpdatedUtc
+        self.assertIsNotNone(matched_route(flight, aircraft, now), "An old position cannot disprove the current leg")
+        flight.location = None
+        flight.callSign = "KLM688"
         self.assertIsNone(matched_route(flight, aircraft, now))
-        flight.callSign = "UAL957"
+        flight.callSign = "KLM689"
         flight.isCargo = True
         self.assertIsNone(matched_route(flight, aircraft, now))
         flight.isCargo = False
