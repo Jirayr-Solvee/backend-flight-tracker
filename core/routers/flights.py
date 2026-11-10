@@ -323,19 +323,24 @@ async def resolve_aircraft_tracking_preview(
     preview_deadline = asyncio.get_running_loop().time() + 2.6
 
     async def fr24():
+        from ..services.flight.aircraft_context import SelectedAircraftPositions
         from ..services.flight.fr24_route import lookup_route
 
         if not settings.FR24_GLOBE_PREVIEW_TOKEN:
             return None, "not_configured"
         snapshot = FlightService._global_positions_cache
         position = next((p for p in snapshot[1] if p.icao24 == address), None) if snapshot else None
-        if not position:
-            return None, "aircraft_not_in_snapshot"
-        callsign = (position.callsign or "").strip().upper()
-        airline = FlightService._iata_for_airline_prefix(callsign[:3])
         try:
             async with asyncio.timeout_at(preview_deadline):
-                return await lookup_route(position, settings.FR24_GLOBE_PREVIEW_TOKEN, airline)
+                selected = position is None
+                if selected:
+                    position = await SelectedAircraftPositions.get(address)
+                    if not position or position.icao24 != address:
+                        return None, "selected_position_unavailable"
+                callsign = (position.callsign or "").strip().upper()
+                airline = FlightService._iata_for_airline_prefix(callsign[:3])
+                route, reason = await lookup_route(position, settings.FR24_GLOBE_PREVIEW_TOKEN, airline)
+                return route, f"selected_{reason}" if selected else reason
         except TimeoutError:
             return None, "preview_deadline"
 
@@ -390,7 +395,10 @@ async def resolve_aircraft_tracking_preview(
             context = await exact_task if exact_task else await exact()
         if fr24_task:
             route, fr24_reason = await fr24_task
-            if fr24_reason == "aircraft_not_in_snapshot" and asyncio.get_running_loop().time() < preview_deadline:
+            snapshot = FlightService._global_positions_cache
+            if (fr24_reason == "selected_position_unavailable" and snapshot
+                    and any(p.icao24 == address for p in snapshot[1])
+                    and asyncio.get_running_loop().time() < preview_deadline):
                 # The exact lookup can refresh the worker's snapshot on a cold start.
                 route, fr24_reason = await fr24()
             logger.info("globe_fr24 aircraft=%s reason=%s", address, fr24_reason)

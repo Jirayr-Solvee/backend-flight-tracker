@@ -58,6 +58,34 @@ class FlightradarRouteTests(unittest.TestCase):
 
 
 class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_snapshot_uses_only_the_selected_aircraft(self):
+        from core.services.flight.aircraft_context import SelectedAircraftPositions
+
+        position = SimpleNamespace(icao24="4d227a", callsign="RYR1TM")
+        session = Mock()
+        with (patch.object(fixture.settings, "FR24_GLOBE_PREVIEW_TOKEN", "synthetic"),
+              patch.object(fixture.settings, "FR24_GLOBE_PREVIEW_QA_USER_ID", "qa"),
+              patch.object(FlightService, "_global_positions_cache", None),
+              patch.object(FlightService, "_iata_for_airline_prefix", return_value="FR"),
+              patch.object(AircraftContextService, "get", AsyncMock(
+                  side_effect=lambda *a, **k: AircraftContext(icao24=position.icao24))),
+              patch.object(SelectedAircraftPositions, "get", AsyncMock(return_value=position)) as selected,
+              patch.object(fr24_route, "lookup_route", AsyncMock(
+                  return_value=(("LFOB", "GMFF"), "matched"))) as lookup):
+            result = await fixture.flights.resolve_aircraft_tracking_preview(
+                position.icao24, SimpleNamespace(id="qa"), session, fast=True, exact_only=True
+            )
+            self.assertEqual(result.context.origin.code, "LFOB")
+            self.assertIsNone(result.tracking_flight)
+            selected.assert_awaited_once_with(position.icao24)
+            lookup.assert_awaited_once_with(position, "synthetic", "FR")
+            selected.return_value = SimpleNamespace(icao24="4ca708")
+            result = await fixture.flights.resolve_aircraft_tracking_preview(
+                position.icao24, SimpleNamespace(id="qa"), session, fast=True, exact_only=True
+            )
+            self.assertIsNone(result.context.origin)
+            self.assertEqual(lookup.await_count, 1)
+
     async def test_private_preview_runs_both_lookups_in_parallel(self):
         import asyncio
 
