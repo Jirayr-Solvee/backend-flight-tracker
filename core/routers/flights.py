@@ -483,9 +483,11 @@ async def complete_aircraft_tracking_schedule(
     position, leg = claimed
     context = AircraftContext(icao24=address)
     result = AircraftTrackingPreview(context=context)
+    diagnostics = {}
+    started = time.monotonic()
     try:
         async with asyncio.timeout(9):
-            enriched = await enrich_schedule(position, leg)
+            enriched = await enrich_schedule(position, leg, diagnostics=diagnostics)
         if enriched:
             (context.origin, context.destination), context._resolver_match = enriched
             context.route_status = "available"
@@ -493,12 +495,15 @@ async def complete_aircraft_tracking_schedule(
         else:
             context._preview_reasons.add("fr24_schedule_unverified")
     except TimeoutError:
+        diagnostics["outcome"] = "deadline"
         context._preview_reasons.add("fr24_schedule_timeout")
     except Exception:
+        diagnostics["outcome"] = "unexpected_error"
         context._preview_reasons.add("fr24_schedule_failed")
-    logger.info("globe_schedule aircraft=%s route=%s track_ready=%s reasons=%s",
+    logger.info("globe_schedule aircraft=%s route=%s track_ready=%s reasons=%s elapsed_ms=%d diagnostics=%s",
                 address, context.route_status, result.tracking_flight is not None,
-                ",".join(sorted(context._preview_reasons)) or "verified")
+                ",".join(sorted(context._preview_reasons)) or "verified",
+                round((time.monotonic() - started) * 1000), diagnostics)
     return result
 
 

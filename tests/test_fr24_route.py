@@ -3,7 +3,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from tests import test_flight_share as fixture  # Initializes isolated backend settings.
 from core.services.flight import FlightService, fr24_route
@@ -111,7 +111,7 @@ class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
             claim.assert_not_called()
             await fixture.flights.complete_aircraft_tracking_schedule(
                 address, ticket, SimpleNamespace(id="qa"), session)
-            enrich.assert_awaited_once_with(position, leg)
+            enrich.assert_awaited_once_with(position, leg, diagnostics=ANY)
             with self.assertRaises(HTTPException):
                 await fixture.flights.complete_aircraft_tracking_schedule(
                     address, ticket, SimpleNamespace(id="qa"), session)
@@ -164,9 +164,20 @@ class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(endpoints[1].scheduled_time_local, exact.arrival.scheduledTime.local)
             self.assertTrue(all(call.args[0] == "FR5223" for call in client.get_flight.await_args_list))
             client.get_flight.side_effect = [[exact, flight(offset=-120)], [], []]
-            self.assertIsNone(await fr24_route.enrich_schedule(position, leg))
+            diagnostics = {}
+            self.assertIsNone(await fr24_route.enrich_schedule(position, leg, diagnostics=diagnostics))
+            self.assertEqual(diagnostics["outcome"], "ambiguous_schedule")
             client.get_flight.side_effect = [[flight(address="4CA708"), flight(airport="GMAD")], [], []]
-            self.assertIsNone(await fr24_route.enrich_schedule(position, leg))
+            self.assertIsNone(await fr24_route.enrich_schedule(position, leg, diagnostics=diagnostics))
+            self.assertEqual(diagnostics["outcome"], "all_rows_rejected")
+            self.assertEqual(dict(diagnostics["rejected"]), {
+                "aircraft_address_mismatch": 1, "route_airports_mismatch": 1,
+            })
+            client.get_flight.side_effect = [api_client.AerodataboxUnavailableError(
+                ["flight:status_503", "untrusted details"]), [], []]
+            self.assertIsNone(await fr24_route.enrich_schedule(position, leg, diagnostics=diagnostics))
+            self.assertEqual(diagnostics["outcome"], "incomplete_provider_batches")
+            self.assertEqual(diagnostics["batches"]["0"], ["flight:status_503", "provider_unavailable"])
 
     async def test_preview_only_sends_retry_hint_when_route_is_missing(self):
         from fastapi import Response

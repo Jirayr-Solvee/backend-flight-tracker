@@ -7,6 +7,7 @@ import re
 import tempfile
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -263,47 +264,95 @@ async def lookup_route(position, token, airline, *, include_leg=False):
         return None, "invalid_response"
 
 
-async def enrich_schedule(position, leg):
+async def enrich_schedule(position, leg, *, diagnostics=None):
     """Look up the verified FR24 flight number using the search provider."""
     from .aircraft_context import matched_route, schedule_window
-    from .api_client import AerodataboxClient
+    from .api_client import AerodataboxClient, AerodataboxUnavailableError
     from .service import GlobalLiveFlightResolveMatch, NormalizedGlobalFlightResolveCandidate
 
     origin, destination, number, leg_start = leg
     observed = datetime.fromtimestamp(position.time_position, timezone.utc)
     day = datetime.fromtimestamp(leg_start, timezone.utc).date()
     dates = [(day + timedelta(days=offset)).isoformat() for offset in (0, -1, 1)]
+    diagnostics = diagnostics if diagnostics is not None else {}
+    rejected = Counter()
+    diagnostics["rejected"] = rejected
+    diagnostics["batches"] = {}
     client = AerodataboxClient()
+
+    async def lookup(date, offset):
+        key = str(offset)
+        diagnostics["batches"][key] = "pending"
+        try:
+            rows = await client.get_flight(number, date, with_location=True)
+        except AerodataboxUnavailableError as error:
+            diagnostics["batches"][key] = [
+                reason if re.fullmatch(r"flight:(?:transport_error|status_[1-5][0-9]{2})", reason)
+                else "provider_unavailable" for reason in error.failures
+            ] or ["provider_unavailable"]
+            raise
+        except asyncio.CancelledError:
+            diagnostics["batches"][key] = "cancelled"
+            raise
+        except Exception:
+            diagnostics["batches"][key] = "provider_response_error"
+            raise
+        diagnostics["batches"][key] = len(rows)
+        return rows
+
     try:
-        batches = await asyncio.gather(*(client.get_flight(number, day, with_location=True)
-                                         for day in dates), return_exceptions=True)
+        batches = await asyncio.gather(*(lookup(date, offset) for date, offset in zip(dates, (0, -1, 1))),
+                                       return_exceptions=True)
     finally:
         await client.client.aclose()
 
     # A failed date lookup leaves ambiguity unresolved. Keep the FR24 route
     # alone rather than trusting a partial view of repeated flight numbers.
     if any(isinstance(rows, BaseException) for rows in batches):
+        diagnostics["outcome"] = "incomplete_provider_batches"
         return None
     matches = {}
     for date, rows in zip(dates, batches):
         for flight in rows:
-            if (flight.number.replace(" ", "").upper() != number or flight.isCargo is not False
-                    or not flight.aircraft or (flight.aircraft.modeS or "").lower() != position.icao24
-                    or not schedule_window(flight, position, observed, arrival_grace=timedelta(minutes=30))):
+            if flight.number.replace(" ", "").upper() != number:
+                rejected["flight_number_mismatch"] += 1
+                continue
+            if flight.isCargo is not False:
+                rejected["cargo_or_unknown_category"] += 1
+                continue
+            if not flight.aircraft or not flight.aircraft.modeS:
+                rejected["missing_aircraft_address"] += 1
+                continue
+            if flight.aircraft.modeS.lower() != position.icao24:
+                rejected["aircraft_address_mismatch"] += 1
+                continue
+            if not schedule_window(flight, position, observed, arrival_grace=timedelta(minutes=30)):
+                rejected["schedule_window_not_verified"] += 1
                 continue
             airports = [getattr(movement, "airport", None) for movement in (flight.departure, flight.arrival)]
             if not all(airport and code in (airport.iata, airport.icao)
                        for airport, code in zip(airports, (origin, destination))):
+                rejected["route_airports_mismatch"] += 1
                 continue
-            endpoints = matched_route(flight, position, datetime.now(timezone.utc), resolver_number=number)
-            if not endpoints or not endpoints[0].scheduled_time_local:
+            reasons = set()
+            endpoints = matched_route(flight, position, datetime.now(timezone.utc), resolver_number=number,
+                                      reasons=reasons)
+            if not endpoints:
+                rejected.update(reasons or {"route_not_corroborated"})
+                continue
+            if not endpoints[0].scheduled_time_local:
+                rejected["missing_original_departure_local"] += 1
                 continue
             departure = _timestamp(flight.departure.scheduledTime.utc)
             if not departure or abs(departure - leg_start) > 6 * 3600:
+                rejected["departure_outside_leg_window"] += 1
                 continue
             arrival = _timestamp(flight.arrival.scheduledTime.utc) if flight.arrival.scheduledTime else None
             matches.setdefault((departure, arrival), (endpoints, GlobalLiveFlightResolveMatch(
                 candidate=NormalizedGlobalFlightResolveCandidate(number, position.icao24),
                 departure_date=date, live_flights=[flight], live_flight=flight,
             )))
+    diagnostics["unique_matches"] = len(matches)
+    diagnostics["outcome"] = ("verified" if len(matches) == 1 else "ambiguous_schedule" if matches
+                              else "no_provider_rows" if not any(batches) else "all_rows_rejected")
     return next(iter(matches.values())) if len(matches) == 1 else None
