@@ -56,9 +56,13 @@ class AircraftTraceTests(unittest.TestCase):
         airport = Obj(iata="LHR", icao="EGLL", name="Heathrow", municipalityName="London")
         flight = Obj(aircraft=Obj(modeS="ABC123", reg="SAMPLE"), status=Obj(value="EnRoute"),
                      lastUpdatedUtc=now.isoformat(), location=Obj(lat=40.15, lon=44.4, reportedAtUtc=now.isoformat()),
-                     departure=Obj(airport=airport), arrival=Obj(airport=airport))
+                     departure=Obj(airport=airport, scheduledTime=Obj(local="2026-11-10 09:00+00:00"),
+                                   revisedTime=Obj(local="2026-11-10 09:25+00:00")),
+                     arrival=Obj(airport=airport, revisedTime=Obj(local="2026-11-10 13:00+00:00")))
         aircraft = position(1, icao24="abc123", registration="SAMPLE")
-        self.assertIsNotNone(matched_route(flight, aircraft, now))
+        departure, arrival = matched_route(flight, aircraft, now)
+        self.assertEqual(departure.scheduled_time_local, "2026-11-10 09:00+00:00")
+        self.assertIsNone(arrival.scheduled_time_local)
         flight.aircraft.modeS = "abc124"
         self.assertIsNone(matched_route(flight, aircraft, now), "Contradictory modeS cannot fall back to same tail")
         flight.aircraft.modeS = None
@@ -83,6 +87,19 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
         AircraftContextService.pending.clear()
         AircraftContextService.slots = asyncio.Semaphore(4)
         AircraftContextService.trace_backoff_until = 0
+
+    async def test_route_looks_up_scheduled_flight_number_for_icao_callsign(self):
+        now = datetime.now(timezone.utc)
+        aircraft = position(1, icao24="abc123", callsign="UAL957")
+        client = Obj(get_flight=AsyncMock(return_value=[]), client=Obj(aclose=AsyncMock()))
+        with patch.object(FlightService, "_iata_for_airline_prefix", return_value="UA"), \
+             patch("core.services.flight.aircraft_context.AerodataboxClient", return_value=client):
+            result = AircraftContext(icao24=aircraft.icao24)
+            await AircraftContextService.route(result, aircraft, now)
+        self.assertEqual([call.args[0] for call in client.get_flight.await_args_list], ["UA957", "UA957"])
+        self.assertEqual(aircraft.callsign, "UAL957")
+        self.assertIsNone(result.origin)
+        client.client.aclose.assert_awaited_once()
 
     async def test_cache_coalescing_and_waiter_cancellation(self):
         now = int(datetime.now(timezone.utc).timestamp())

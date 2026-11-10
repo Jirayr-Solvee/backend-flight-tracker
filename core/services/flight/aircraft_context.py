@@ -72,6 +72,7 @@ class AircraftRouteEndpoint(SQLModel):
     code: str | None = None
     name: str | None = None
     city: str | None = None
+    scheduled_time_local: str | None = None
 
 
 class AircraftContext(SQLModel):
@@ -192,7 +193,9 @@ def matched_route(flight, position, now: datetime):
     def endpoint(data):
         airport = data.airport
         clean = lambda value: value.strip()[:120] if isinstance(value, str) and value.strip() else None
-        return AircraftRouteEndpoint(code=clean(airport.iata) or clean(airport.icao), name=clean(airport.name), city=clean(airport.municipalityName))
+        return AircraftRouteEndpoint(code=clean(airport.iata) or clean(airport.icao), name=clean(airport.name),
+                                     city=clean(airport.municipalityName),
+                                     scheduled_time_local=clean(getattr(getattr(data, "scheduledTime", None), "local", None)))
     return endpoint(flight.departure), endpoint(flight.arrival)
 
 
@@ -331,12 +334,15 @@ class AircraftContextService:
         from .service import FlightService
         if not FlightService._looks_like_route_callsign(position):
             return
+        code = (position.callsign or position.display_code).strip().upper()
+        # The provider lookup is by scheduled flight number, not ADS-B callsign.
+        code = FlightService._normalized_callsign_for_tracking(code) or code
         client = AerodataboxClient()
         try:
             async with asyncio.timeout(12):
                 matches = {}
                 for date in (now.date(), now.date() - timedelta(days=1)):
-                    flights = await client.get_flight(position.callsign or position.display_code, date.isoformat(), with_location=True)
+                    flights = await client.get_flight(code, date.isoformat(), with_location=True)
                     for flight in flights:
                         endpoints = matched_route(flight, position, now)
                         if endpoints:
