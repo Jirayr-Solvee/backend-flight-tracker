@@ -299,6 +299,44 @@ async def get_aircraft_context(
     return await AircraftContextService.get(icao24.lower())
 
 
+@router.post("/live-positions/{icao24}/preview")
+async def resolve_aircraft_tracking_preview(
+    icao24: str,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    import re
+    from ..services.flight.aircraft_context import AircraftContextService, AircraftTrackingPreview
+    from ..utils import get_time
+    if re.fullmatch(r"[0-9a-fA-F]{6}", icao24) is None:
+        raise HTTPException(status_code=422, detail="Invalid ICAO aircraft address")
+    context = await AircraftContextService.get(icao24.lower(), for_tracking=True)
+    result = AircraftTrackingPreview(context=context)
+    match = context._resolver_match
+    if match and context.origin and context.destination:
+        try:
+            flight = FlightService._persist_global_live_flight_match(session, match)
+            def leg_matches(stored, observed, endpoint):
+                scheduled_utc = get_time(observed.scheduledTime, "utc")
+                return (stored and stored.airport and endpoint.code and scheduled_utc
+                        and endpoint.code in (stored.airport.iata, stored.airport.icao)
+                        and stored.scheduled_time_utc == scheduled_utc)
+            if (flight and (flight.aircraft_modeS or "").strip().lower() == icao24.lower()
+                    and leg_matches(flight.departure, match.live_flight.departure, context.origin)
+                    and leg_matches(flight.arrival, match.live_flight.arrival, context.destination)):
+                snapshot = FlightRead.model_validate(flight, from_attributes=True)
+                snapshot.departure.scheduled_time_local = context.origin.scheduled_time_local
+                snapshot.arrival.scheduled_time_local = context.destination.scheduled_time_local
+                session.commit()
+                result.tracking_flight = snapshot
+            else:
+                session.rollback()
+        except Exception:
+            session.rollback()
+            logger.exception("Unable to prepare an exact aircraft tracking preview")
+    return result
+
+
 @router.get("/live-positions/resolve", response_model=FlightRead)
 async def resolve_global_live_flight(
     callsign: str = Query(..., min_length=3),

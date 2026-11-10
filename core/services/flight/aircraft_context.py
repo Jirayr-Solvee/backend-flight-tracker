@@ -19,7 +19,7 @@ from ...config import settings
 from .api_client import ADSBExchangeClient, AerodataboxClient
 from .aircraft_metadata import visible_aircraft
 from .schedule_pool import SchedulePool
-from ...models.flight import GlobalFlightPositionRead
+from ...models.flight import FlightRead, GlobalFlightPositionRead
 
 
 class SelectedAircraftPositions:
@@ -79,6 +79,7 @@ class AircraftRouteEndpoint(SQLModel):
 
 class AircraftContext(SQLModel):
     _schedule_valid_until: float | None = PrivateAttr(default=None)
+    _resolver_match: object | None = PrivateAttr(default=None)
     icao24: str
     segments: list[list[AircraftTrailPoint]] = Field(default_factory=list)
     trail_status: str = "unavailable"
@@ -86,6 +87,11 @@ class AircraftContext(SQLModel):
     origin: AircraftRouteEndpoint | None = None
     destination: AircraftRouteEndpoint | None = None
     route_status: str = "unavailable"
+
+
+class AircraftTrackingPreview(SQLModel):
+    context: AircraftContext
+    tracking_flight: FlightRead | None = None
 
 
 def finite(value):
@@ -416,7 +422,7 @@ class AircraftContextService:
                 break
 
     @classmethod
-    async def get(cls, icao24: str) -> AircraftContext:
+    async def get(cls, icao24: str, *, for_tracking=False) -> AircraftContext:
         from .service import FlightService
         now = datetime.now(timezone.utc)
         positions = await FlightService._get_cached_global_positions(now=now)
@@ -426,10 +432,10 @@ class AircraftContextService:
         # client-supplied callsigns/provider paths. No guest/account data in cache.
         if position is None:
             return AircraftContext(icao24=icao24)
-        key = (icao24, position.callsign, now.date())
+        key = (icao24, position.callsign, now.date(), for_tracking)
         cached = cls.cache.get(key)
         state = await asyncio.to_thread(cls.schedule_pool.snapshot)
-        schedule = cls.verified_schedule(position, now, state.get("entries", {}))
+        schedule = None if for_tracking else cls.verified_schedule(position, now, state.get("entries", {}))
         if cached and time.monotonic() - cached[0] < 60:
             result = cached[1].model_copy(deep=True)
             if schedule:
@@ -507,7 +513,7 @@ class AircraftContextService:
 
     @classmethod
     async def route(cls, result, position, now, *, full_resolver=False):
-        from .service import FlightService
+        from .service import FlightService, GlobalLiveFlightResolveMatch, NormalizedGlobalFlightResolveCandidate
         if not FlightService._looks_like_route_callsign(position):
             return
         raw = (position.callsign or position.display_code).strip().upper()
@@ -526,7 +532,7 @@ class AircraftContextService:
                             if endpoints:
                                 key = tuple((e.code or e.name, e.scheduled_time_local) for e in endpoints)
                                 arrival_utc = getattr(getattr(flight.arrival, "scheduledTime", None), "utc", None)
-                                matches[key] = (endpoints, arrival_utc)
+                                matches[key] = (endpoints, arrival_utc, flight, date)
                         if full_resolver and len(matches) == 1:
                             # An already corroborated exact leg should not be
                             # lost to a timeout fetching optional dates.
@@ -536,7 +542,7 @@ class AircraftContextService:
                     if matches:
                         break
                 if len(matches) == 1:
-                    endpoints, arrival_utc = next(iter(matches.values()))
+                    endpoints, arrival_utc, flight, date = next(iter(matches.values()))
                     if arrival_utc:
                         try:
                             arrival = datetime.fromisoformat(arrival_utc.replace("Z", "+00:00"))
@@ -546,6 +552,11 @@ class AircraftContextService:
                             pass
                     result.origin, result.destination = endpoints
                     result.route_status = "available"
+                    if full_resolver:
+                        result._resolver_match = GlobalLiveFlightResolveMatch(
+                            candidate=NormalizedGlobalFlightResolveCandidate(code, position.icao24),
+                            departure_date=date, live_flights=[flight], live_flight=flight,
+                        )
         except Exception:
             result.route_status = "provider_unavailable"
         finally:

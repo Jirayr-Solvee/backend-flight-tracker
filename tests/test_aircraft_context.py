@@ -217,6 +217,25 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result.origin)
         client.client.aclose.assert_awaited_once()
 
+    async def test_tracking_preview_rejects_a_different_persisted_aircraft(self):
+        now = datetime.now(timezone.utc)
+        context = AircraftContext(
+            icao24="abc123", route_status="available",
+            origin=AircraftRouteEndpoint(code="AMS"), destination=AircraftRouteEndpoint(code="YYZ"),
+        )
+        context._resolver_match = Obj(live_flight=Obj())
+        from unittest.mock import Mock
+        session = Mock()
+        with patch.object(AircraftContextService, "get", AsyncMock(return_value=context)) as lookup, \
+             patch.object(FlightService, "_persist_global_live_flight_match", return_value=Obj(aircraft_modeS="abc124")):
+            response = await fixture.flights.resolve_aircraft_tracking_preview("ABC123", Obj(), session)
+        self.assertIsNone(response.tracking_flight)
+        self.assertEqual(response.context.origin.code, "AMS")
+        self.assertNotIn("_resolver_match", response.context.model_dump())
+        lookup.assert_awaited_once_with("abc123", for_tracking=True)
+        session.commit.assert_not_called()
+        session.rollback.assert_called_once()
+
     async def test_cache_coalescing_and_waiter_cancellation(self):
         now = int(datetime.now(timezone.utc).timestamp())
         aircraft = position(1, icao24="abc123", time_position=now)
