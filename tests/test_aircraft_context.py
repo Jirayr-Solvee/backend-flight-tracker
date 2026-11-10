@@ -75,6 +75,8 @@ class AircraftTraceTests(unittest.TestCase):
         flight.location.lat = -40
         self.assertIsNone(matched_route(flight, aircraft, now))
         flight.location.lat = 40.15
+        flight.location.reportedAtUtc = now.replace(tzinfo=None).isoformat()
+        self.assertIsNotNone(matched_route(flight, aircraft, now), "Explicit UTC field can omit its offset")
         flight.lastUpdatedUtc = (now - timedelta(hours=1)).isoformat()
         self.assertIsNone(matched_route(flight, aircraft, now))
         flight.lastUpdatedUtc = now.isoformat()
@@ -87,7 +89,7 @@ class AircraftTraceTests(unittest.TestCase):
             return Obj(airport=Obj(iata=code, icao=None, name=code, municipalityName=None),
                        scheduledTime=Obj(utc=at.isoformat(), local=at.isoformat()),
                        revisedTime=Obj(local=(at+timedelta(minutes=40)).isoformat()))
-        aircraft = position(1, icao24="abc123", callsign="KLM689")
+        aircraft = position(1, icao24="abc123", callsign="KLM689", time_position=int(now.timestamp()))
         flight = Obj(aircraft=Obj(modeS="ABC123", reg=None), status=Obj(value="Departed"),
                      lastUpdatedUtc=(now-timedelta(hours=2)).isoformat(), location=None,
                      number="KL 689", callSign=None, isCargo=False,
@@ -96,6 +98,12 @@ class AircraftTraceTests(unittest.TestCase):
         origin, destination = matched_route(flight, aircraft, now, resolver_number="KL689")
         self.assertEqual(origin.scheduled_time_local, flight.departure.scheduledTime.local)
         self.assertEqual(destination.scheduled_time_local, flight.arrival.scheduledTime.local)
+        flight.status.value = "Expected"
+        self.assertIsNotNone(matched_route(flight, aircraft, now, resolver_number="KL689"))
+        aircraft.on_ground = True
+        self.assertIsNone(matched_route(flight, aircraft, now, resolver_number="KL689"))
+        aircraft.on_ground = False
+        flight.status.value = "Departed"
         flight.aircraft.modeS = "ABC124"
         self.assertIsNone(matched_route(flight, aircraft, now, resolver_number="KL689"))
         flight.aircraft.modeS = "ABC123"

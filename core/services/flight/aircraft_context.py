@@ -169,7 +169,7 @@ def matched_route(flight, position, now: datetime, *, resolver_number=None):
         identity_matches = aircraft.modeS.strip().lower() == position.icao24.strip().lower()
     else:
         identity_matches = bool(position.registration) and normalize(aircraft.reg) == normalize(position.registration)
-    if not identity_matches or str(flight.status.value) not in {"EnRoute", "Departed", "Approaching", "Delayed"}:
+    if not identity_matches:
         return None
     resolver_identity = bool(
         resolver_number and aircraft.modeS and position.callsign
@@ -179,6 +179,13 @@ def matched_route(flight, position, now: datetime, *, resolver_number=None):
         })
         and not position.aircraft_categories and getattr(flight, "isCargo", None) is False
     )
+    status = str(flight.status.value)
+    live_status = status in {"EnRoute", "Departed", "Approaching", "Delayed"}
+    # ADS-B has already confirmed this exact passenger aircraft is airborne.
+    # Expected is a lagging schedule status, never evidence of a live state.
+    if not live_status and not (status == "Expected" and resolver_identity
+                                and visible_aircraft(position, int(now.timestamp()))):
+        return None
     try:
         updated = datetime.fromisoformat(flight.lastUpdatedUtc.replace("Z", "+00:00"))
         if updated.tzinfo is None or (now - updated).total_seconds() < -30:
@@ -198,7 +205,10 @@ def matched_route(flight, position, now: datetime, *, resolver_number=None):
             return None
         try:
             reported = datetime.fromisoformat(location.reportedAtUtc.replace("Z", "+00:00"))
-            if reported.tzinfo is None or (now - reported).total_seconds() < -30:
+            # The field itself is explicitly UTC; some provider rows omit Z.
+            if reported.tzinfo is None:
+                reported = reported.replace(tzinfo=timezone.utc)
+            if (now - reported).total_seconds() < -30:
                 return None
             location_fresh = (now - reported).total_seconds() <= 900
             if location_fresh:
@@ -209,7 +219,7 @@ def matched_route(flight, position, now: datetime, *, resolver_number=None):
                     return None
         except (ValueError, TypeError):
             return None
-    if not location_fresh or (now - updated).total_seconds() > 900:
+    if not live_status or not location_fresh or (now - updated).total_seconds() > 900:
         # The current ADS-B aircraft can corroborate a scheduled passenger leg
         # even when the schedule provider has not updated its live data.
         # Only expose the original schedule, never that stale status/position.
@@ -517,6 +527,10 @@ class AircraftContextService:
                                 key = tuple((e.code or e.name, e.scheduled_time_local) for e in endpoints)
                                 arrival_utc = getattr(getattr(flight.arrival, "scheduledTime", None), "utc", None)
                                 matches[key] = (endpoints, arrival_utc)
+                        if full_resolver and len(matches) == 1:
+                            # An already corroborated exact leg should not be
+                            # lost to a timeout fetching optional dates.
+                            break
                         if matches and date != now.date().isoformat():
                             break
                     if matches:
