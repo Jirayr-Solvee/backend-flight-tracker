@@ -1,4 +1,5 @@
 import unittest
+import tempfile
 import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -57,6 +58,26 @@ class FlightradarRouteTests(unittest.TestCase):
 
 
 class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_verified_repeat_is_shared_and_does_not_cross_observations(self):
+        observed = int(time.time()) - 2
+        position = SimpleNamespace(icao24="4d227a", callsign="RYR1TM", on_ground=False,
+                                   aircraft_categories=[], time_position=observed)
+        key = f"4d227a:RYR1TM:{observed}:FR"
+        route = ("LFOB", "GMFF")
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(fr24_route, "_verified_routes", fr24_route.SchedulePool(directory)):
+                fr24_route._remember_route(key, route)
+            with (patch.object(fr24_route, "_verified_routes", fr24_route.SchedulePool(directory)),
+                  patch.object(fr24_route, "_next_request", time.monotonic() + 30),
+                  patch.object(fr24_route, "_cooldown_reason", "request_cooldown"),
+                  patch.object(fr24_route.httpx, "AsyncClient") as client):
+                self.assertEqual(await fr24_route.lookup_route(position, "synthetic", "FR"),
+                                 (route, "matched_repeat"))
+                position.time_position += 1
+                self.assertEqual(await fr24_route.lookup_route(position, "synthetic", "FR"),
+                                 (None, "request_cooldown"))
+                client.assert_not_called()
+
     async def test_cooldown_and_stale_positions_do_not_call_provider(self):
         position = SimpleNamespace(icao24="4d227a", callsign="RYR1TM", on_ground=False,
                                    aircraft_categories=[], time_position=int(time.time()))

@@ -1,11 +1,16 @@
 """Display-only commercial globe route fallback; no tracking or schedule writes."""
 
 import asyncio
+import os
 import re
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
+
+from .schedule_pool import SchedulePool
 
 
 def _timestamp(value):
@@ -71,6 +76,26 @@ def _match_route(rows, callsign, address, observed_at, airline):
 # Bound provider use within each worker. Also rely on the vendor's account cap.
 _next_request = 0.0
 _cooldown_reason = "request_cooldown"
+_verified_routes = SchedulePool(Path(tempfile.gettempdir()) / f"sofly-fr24-routes-v1-{os.getuid()}")
+
+
+def _cached_route(key):
+    value = _verified_routes.snapshot().get(key)
+    if value and value[0] > time.time():
+        return tuple(value[1])
+    return None
+
+
+def _remember_route(key, route):
+    def update(state):
+        now = time.time()
+        live = [(k, v) for k, v in state.items() if k != key and v[0] > now]
+        state.clear()
+        state.update(live[-63:])
+        state[key] = [now + 15, route]
+        return True
+
+    _verified_routes.update(update)
 
 
 async def lookup_route(position, token, airline):
@@ -91,6 +116,12 @@ async def lookup_route(position, token, airline):
     now = datetime.now(timezone.utc)
     if not 0 <= now.timestamp() - observed_at <= 300:
         return None, "observation_not_fresh"
+    # Identical ADS-B observations only: never carry a route to a new observation
+    # (even on the same airframe and callsign). Read before the provider cooldown.
+    key = f"{address}:{callsign}:{observed_at}:{airline or ''}"
+    route = await asyncio.to_thread(_cached_route, key)
+    if route:
+        return route, "matched_repeat"
     if time.monotonic() < _next_request:
         return None, _cooldown_reason
     _next_request = time.monotonic() + 6
@@ -115,7 +146,10 @@ async def lookup_route(position, token, airline):
             rows = payload.get("data") if isinstance(payload, dict) else None
             if isinstance(rows, list) and len(rows) >= 20:
                 return None, "result_limit"
-            return _match_route(rows, callsign, address, observed_at, airline)
+            route, reason = _match_route(rows, callsign, address, observed_at, airline)
+        if route:
+            await asyncio.to_thread(_remember_route, key, route)
+        return route, reason
     except httpx.HTTPStatusError as error:
         status = error.response.status_code
         return None, {
