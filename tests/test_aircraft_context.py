@@ -13,6 +13,8 @@ from core.services.flight.aircraft_context import AircraftContext, AircraftConte
 from core.services.flight.api_client import ADSBExchangeClient
 from core.services.flight.schedule_pool import SchedulePool
 from core.services.flight import FlightService
+from core.models.aerodatabox import AerodataboxFlight
+from core.services.flight.service import GlobalLiveFlightResolveMatch, NormalizedGlobalFlightResolveCandidate
 
 
 def row(seconds, lat=40, lon=44, flags=0, altitude=30000):
@@ -152,6 +154,68 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.object(AircraftContextService, "schedule_pool", SchedulePool(directory)))
         AircraftContextService.schedule_task = None
         AircraftContextService.next_schedule_check = 0
+
+    async def test_exact_london_reported_flights_reuse_original_schedule_across_workers(self):
+        now = datetime.now(timezone.utc)
+        # Replay the reported aircraft identities and routes with a synthetic
+        # active window; this does not imply the upstream returned these rows.
+        cases = [
+            ("RYR1TM", "FR5223", "4d227a", "BVA", "FEZ"),
+            ("THY6RB", "TK1762", "4bb214", "HEL", "IST"),
+        ]
+        planes = []
+        flights = {}
+        def leg(code, at):
+            return dict(airport=dict(iata=code, name=code), quality=[],
+                        scheduledTime=dict(utc=at.isoformat(), local=at.isoformat()),
+                        revisedTime=dict(utc=at.isoformat(), local=(at+timedelta(minutes=25)).isoformat()))
+        for i, (callsign, number, address, origin, destination) in enumerate(cases):
+            planes.append(position(i, icao24=address, callsign=callsign, lat=51.5, lon=-0.1,
+                                   time_position=int(now.timestamp())))
+            flights[address] = AerodataboxFlight.model_validate(dict(
+                aircraft=dict(modeS=address), number=number, callSign=callsign, status="Departed",
+                lastUpdatedUtc=(now-timedelta(hours=1)).isoformat(), codeshareStatus="IsOperator",
+                isCargo=False, departure=leg(origin, now-timedelta(hours=1)),
+                arrival=leg(destination, now+timedelta(hours=1))))
+            if callsign == "THY6RB":
+                flights[address].arrival.scheduledTime = None  # Provider returned only departure.
+
+        async def route(result, plane, at, **kwargs):
+            flight = flights[plane.icao24]
+            result.origin, result.destination = matched_route(flight, plane, at)
+            result.route_status = "available"
+            result._resolver_match = GlobalLiveFlightResolveMatch(
+                NormalizedGlobalFlightResolveCandidate(plane.callsign, plane.icao24),
+                now.date().isoformat(), [flight], flight)
+
+        with patch.object(AircraftContextService, "route", AsyncMock(side_effect=route)) as lookup, \
+             patch.object(FlightService, "_get_cached_global_positions", AsyncMock(return_value=planes)), \
+             patch.object(AircraftContextService, "trace", AsyncMock()):
+            lease, _, _ = AircraftContextService.schedule_pool.claim()
+            await AircraftContextService.precheck_schedules(planes, lease)
+            pool = SchedulePool(AircraftContextService.schedule_pool.directory)
+            with patch.object(AircraftContextService, "schedule_pool", pool):
+                for plane in planes:
+                    result = await AircraftContextService.get(plane.icao24, for_tracking=True)
+                    flight = flights[plane.icao24]
+                    self.assertEqual(result._resolver_match.live_flight, flight)
+                    for endpoint, expected in ((result.origin, flight.departure), (result.destination, flight.arrival)):
+                        self.assertEqual((endpoint.code, endpoint.scheduled_time_local),
+                                         (expected.airport.iata,
+                                          expected.scheduledTime.local if expected.scheduledTime else None))
+                    self.assertNotIn("tracking_match", result.model_dump())
+                self.assertEqual(lookup.await_count, 2, "No second provider lookup on tap")
+                entries = pool.snapshot()["entries"]
+                tapped, neighbor = planes
+                tapped_key = AircraftContextService.schedule_key(tapped, now)
+                self.assertIsNone(AircraftContextService.verified_schedule(
+                    tapped.model_copy(update={"callsign": "RYR2TM"}), now, entries))
+                self.assertIsNone(AircraftContextService.verified_schedule(tapped, now + timedelta(minutes=16), entries))
+                neighbor_entry = entries[AircraftContextService.schedule_key(neighbor, now)]
+                self.assertIsNone(AircraftContextService.verified_schedule(tapped, now, {tapped_key: neighbor_entry}))
+                partial = flights[neighbor.icao24]
+                self.assertIsNone(AircraftContextService.reusable_schedule(
+                    partial.model_copy(update={"callSign": None}), neighbor, now))
 
     async def test_priority_precheck_only_marks_complete_airline_schedules_and_reuses_them_on_tap(self):
         now = int(time.time())

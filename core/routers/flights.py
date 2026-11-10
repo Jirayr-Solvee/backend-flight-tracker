@@ -316,14 +316,16 @@ async def resolve_aircraft_tracking_preview(
     if match and context.origin and context.destination:
         try:
             flight = FlightService._persist_global_live_flight_match(session, match)
-            def leg_matches(stored, observed, endpoint):
+            def leg_matches(stored, observed, endpoint, *, allow_missing_schedule=False):
                 scheduled_utc = get_time(observed.scheduledTime, "utc")
-                return (stored and stored.airport and endpoint.code and scheduled_utc
+                return (stored and stored.airport and endpoint.code
                         and endpoint.code == stored.airport.iata
-                        and stored.scheduled_time_utc == scheduled_utc)
+                        and (stored.scheduled_time_utc == scheduled_utc if scheduled_utc
+                             else allow_missing_schedule and observed.scheduledTime is None))
             if (flight and (flight.aircraft_modeS or "").strip().lower() == icao24.lower()
                     and leg_matches(flight.departure, match.live_flight.departure, context.origin)
-                    and leg_matches(flight.arrival, match.live_flight.arrival, context.destination)):
+                    and leg_matches(flight.arrival, match.live_flight.arrival, context.destination,
+                                    allow_missing_schedule=True)):
                 snapshot = FlightRead.model_validate(flight, from_attributes=True)
                 snapshot.departure.scheduled_time_local = context.origin.scheduled_time_local
                 snapshot.arrival.scheduled_time_local = context.destination.scheduled_time_local
