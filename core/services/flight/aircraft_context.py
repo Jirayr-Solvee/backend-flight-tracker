@@ -294,6 +294,7 @@ class AircraftContextService:
     @classmethod
     async def prioritize_schedules(cls, positions):
         """Read the shared pool; only one worker can warm it per interval."""
+        from .service import FlightService
         now = datetime.now(timezone.utc)
         state = await asyncio.to_thread(cls.schedule_pool.snapshot)
         if (positions and now.timestamp() >= state.get("next_batch", 0)
@@ -302,10 +303,29 @@ class AircraftContextService:
             cls.next_schedule_check = time.monotonic() + 5
             cls.schedule_task = asyncio.create_task(cls.warm_schedules(positions))
         entries = state.get("entries", {})
-        return [
-            p.model_copy(update={"verified_schedule": True}) if cls.verified_schedule(p, now, entries) else p
-            for p in positions
-        ]
+        if not positions or not any(expiry > now.timestamp() and value for expiry, value in entries.values()):
+            return positions
+        verified_keys = {key for key, (expiry, value) in entries.items() if expiry > now.timestamp() and value}
+        def confirmed(position):
+            return not position.aircraft_categories and position.callsign and cls.schedule_key(position, now) in verified_keys
+
+        result = [p.model_copy(update={"verified_schedule": True}) if confirmed(p) else p for p in positions]
+        included = {p.icao24 for p in result}
+        # The workers can stride-sample different snapshots. Reserve existing
+        # ordinary slots for confirmed aircraft so sampling cannot discard them.
+        slots = {}
+        for index, p in enumerate(result):
+            if not p.aircraft_categories and not p.verified_schedule:
+                slots.setdefault(FlightService._continent_key(lat=p.lat, lon=p.lon), []).append(index)
+        full = await FlightService._get_cached_global_positions(now=now)
+        for p in full:
+            if p.icao24 in included or not confirmed(p) or not visible_aircraft(p, int(now.timestamp())):
+                continue
+            available = slots.get(FlightService._continent_key(lat=p.lat, lon=p.lon))
+            if available:
+                result[available.pop()] = p.model_copy(update={"verified_schedule": True})
+                included.add(p.icao24)
+        return result
 
     @classmethod
     async def warm_schedules(cls, positions):

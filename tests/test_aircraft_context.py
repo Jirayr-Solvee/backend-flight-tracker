@@ -149,6 +149,10 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
             marked = await AircraftContextService.prioritize_schedules(rows)
             self.assertEqual([p.verified_schedule for p in marked], [None, True, None])
             self.assertIsNone(airline.verified_schedule)
+            fallback = position(4, lat=48, lon=5, time_position=now)
+            sampled = await AircraftContextService.prioritize_schedules([special, fallback, partial])
+            self.assertEqual([p.icao24 for p in sampled], [special.icao24, airline.icao24, partial.icao24])
+            self.assertTrue(sampled[1].verified_schedule)
             changed = await AircraftContextService.prioritize_schedules(
                 [airline.model_copy(update={"callsign": "AF999"})])
             self.assertIsNone(changed[0].verified_schedule)
