@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Awaitable, Callable, Literal
@@ -67,13 +68,16 @@ class AerodataboxFetcherService:
         return data
 
     async def fetch_single_flight(
-        self, full_number: str, departure_date: str, with_location: bool = False
+        self, full_number: str, departure_date: str, with_location: bool = False,
+        *, search_by: Literal["Number", "icao24"] = "Number",
     ) -> Any:
+        if search_by == "icao24" and not re.fullmatch(r"[0-9a-fA-F]{6}", full_number):
+            raise HTTPException(status_code=422, detail="Invalid aircraft address")
         async with self.limiter:
             try:
                 url = (
                     f"{self.base_url}/api/v1/aedbx/aerodatabox"
-                    f"/flights/Number/{full_number}/{departure_date}"
+                    f"/flights/{'Icao24' if search_by == 'icao24' else 'Number'}/{full_number}/{departure_date}"
                     f"?dateLocalRole=Departure"
                     f"&withAircraftImage=false"
                     f"&withLocation={str(with_location).lower()}"
@@ -416,11 +420,13 @@ async def fetch_single_flight(
     full_number: str = Query(...),
     departure_date: str = Query(...),
     with_location: bool = Query(False),
+    search_by: Literal["Number", "icao24"] = Query("Number"),
 ):
     return await aerodatabox_fetcher_service.fetch_single_flight(
         full_number=full_number,
         departure_date=departure_date,
         with_location=with_location,
+        search_by=search_by,
     )
 
 

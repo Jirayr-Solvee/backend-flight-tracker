@@ -47,13 +47,15 @@ class AerodataboxClient:
         )
 
     async def get_flight(
-        self, full_number: str, departure_date: str, with_location: bool = False
+        self, full_number: str, departure_date: str, with_location: bool = False,
+        *, by_aircraft: bool = False,
     ) -> list[AerodataboxFlight]:
         """Get flights from Aerodatabox API"""
         fetcher_url = (
             f"{settings.AERODATABOX_SERVICE_URL}"
             f"flights?full_number={full_number}&departure_date={departure_date}"
             f"&with_location={str(with_location).lower()}"
+            + ("&search_by=icao24" if by_aircraft else "")
         )
         try:
             response = await self.client.get(fetcher_url)

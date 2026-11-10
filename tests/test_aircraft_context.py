@@ -217,6 +217,33 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result.origin)
         client.client.aclose.assert_awaited_once()
 
+    async def test_aircraft_id_fallback_only_uses_the_exact_current_leg(self):
+        now = datetime.now(timezone.utc)
+        aircraft = position(1, icao24="abc123", callsign="UAL957A", time_position=int(now.timestamp()))
+        def leg(code, at):
+            return Obj(airport=Obj(iata=code, icao=None, name=code, municipalityName=None),
+                       scheduledTime=Obj(utc=at.isoformat(), local=at.isoformat()))
+        current = dict(status=Obj(value="EnRoute"), number="UA123", isCargo=False, location=None,
+                       lastUpdatedUtc=now.isoformat(), departure=leg("LHR", now-timedelta(hours=1)),
+                       arrival=leg("ORD", now+timedelta(hours=5)))
+        exact = Obj(**current, callSign="UAL957A", aircraft=Obj(modeS="ABC123"))
+        wrong_plane = Obj(**current, callSign="UAL957A", aircraft=Obj(modeS="ABC124"))
+        wrong_leg = Obj(**current, callSign="UAL111", aircraft=Obj(modeS="ABC123"))
+        async def lookup(value, date, with_location=False, *, by_aircraft=False):
+            if by_aircraft:
+                self.assertEqual(value, aircraft.icao24)
+                return [wrong_plane, wrong_leg, exact] if date == now.date().isoformat() else []
+            return []
+        client = Obj(get_flight=AsyncMock(side_effect=lookup), client=Obj(aclose=AsyncMock()))
+        with patch.object(FlightService, "_iata_for_airline_prefix", return_value="UA"), \
+             patch("core.services.flight.aircraft_context.AerodataboxClient", return_value=client):
+            result = AircraftContext(icao24=aircraft.icao24)
+            await AircraftContextService.route(result, aircraft, now, full_resolver=True)
+        self.assertEqual(result.route_status, "available")
+        self.assertIs(result._resolver_match.live_flight, exact)
+        self.assertEqual(result.origin.scheduled_time_local, exact.departure.scheduledTime.local)
+        self.assertEqual(sum(c.kwargs.get("by_aircraft", False) for c in client.get_flight.await_args_list), 2)
+
     async def test_tracking_preview_rejects_a_different_persisted_aircraft(self):
         now = datetime.now(timezone.utc)
         context = AircraftContext(

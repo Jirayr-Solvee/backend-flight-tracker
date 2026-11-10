@@ -166,7 +166,7 @@ def parse_trace(payload: dict, icao24: str, now: int) -> list[list[AircraftTrail
     return result
 
 
-def matched_route(flight, position, now: datetime, *, resolver_number=None):
+def matched_route(flight, position, now: datetime, *, resolver_number=None, by_aircraft=False):
     aircraft = flight.aircraft
     if not aircraft:
         return None
@@ -185,6 +185,15 @@ def matched_route(flight, position, now: datetime, *, resolver_number=None):
         })
         and not position.aircraft_categories and getattr(flight, "isCargo", None) is False
     )
+    if by_aircraft:
+        # A tail can fly several legs in a day. The exact address alone
+        # cannot identify which scheduled leg the user tapped.
+        if (not aircraft.modeS or not position.callsign or not getattr(flight, "callSign", None)
+                or normalize(flight.callSign) not in {normalize(position.callsign), normalize(resolver_number)}
+                or position.aircraft_categories or getattr(flight, "isCargo", None) is not False
+                or not visible_aircraft(position, int(now.timestamp()))):
+            return None
+        resolver_identity = True
     status = str(flight.status.value)
     live_status = status in {"EnRoute", "Departed", "Approaching", "Delayed"}
     # ADS-B has already confirmed this exact passenger aircraft is airborne.
@@ -225,7 +234,7 @@ def matched_route(flight, position, now: datetime, *, resolver_number=None):
                     return None
         except (ValueError, TypeError):
             return None
-    if not live_status or not location_fresh or (now - updated).total_seconds() > 900:
+    if by_aircraft or not live_status or not location_fresh or (now - updated).total_seconds() > 900:
         # The current ADS-B aircraft can corroborate a scheduled passenger leg
         # even when the schedule provider has not updated its live data.
         # Only expose the original schedule, never that stale status/position.
@@ -515,25 +524,34 @@ class AircraftContextService:
     @classmethod
     async def route(cls, result, position, now, *, full_resolver=False):
         from .service import FlightService, GlobalLiveFlightResolveMatch, NormalizedGlobalFlightResolveCandidate
-        if not FlightService._looks_like_route_callsign(position):
+        raw = (position.callsign or position.display_code or "").strip().upper()
+        prefix = re.match(r"^([A-Z]{3}|[A-Z0-9]{2})[0-9][A-Z0-9]{0,4}$", raw)
+        fallback = (full_resolver and position.callsign and not position.aircraft_categories and prefix
+                    and re.fullmatch(r"[0-9a-fA-F]{6}", position.icao24)
+                    and (FlightService._iata_for_airline_prefix(prefix[1])
+                         or prefix[1] in FlightService._preferred_airline_codes_for_continent("all")))
+        number_eligible = FlightService._looks_like_route_callsign(position)
+        if not number_eligible and not fallback:
             return
-        raw = (position.callsign or position.display_code).strip().upper()
         # The provider lookup is by scheduled flight number, not ADS-B callsign.
         code = FlightService._normalized_callsign_for_tracking(raw) or raw
         client = AerodataboxClient()
         try:
-            async with asyncio.timeout(12):
-                matches = {}
+            matches = {}
+            def collect(flights, date, *, by_aircraft=False):
+                for flight in flights:
+                    endpoints = matched_route(flight, position, now, resolver_number=code if full_resolver else None,
+                                              by_aircraft=by_aircraft)
+                    if endpoints and (not by_aircraft or all(e.code and e.scheduled_time_local for e in endpoints)):
+                        key = tuple((e.code or e.name, e.scheduled_time_local) for e in endpoints)
+                        arrival_utc = getattr(getattr(flight.arrival, "scheduledTime", None), "utc", None)
+                        matches[key] = (endpoints, arrival_utc, flight, date)
+            async def lookup_number():
                 for number in dict.fromkeys((code, raw)):
                     async for date, flights in FlightService._global_resolver_flight_batches(
                         client, number, now, include_next_day=full_resolver
                     ):
-                        for flight in flights:
-                            endpoints = matched_route(flight, position, now, resolver_number=code if full_resolver else None)
-                            if endpoints:
-                                key = tuple((e.code or e.name, e.scheduled_time_local) for e in endpoints)
-                                arrival_utc = getattr(getattr(flight.arrival, "scheduledTime", None), "utc", None)
-                                matches[key] = (endpoints, arrival_utc, flight, date)
+                        collect(flights, date)
                         if full_resolver and len(matches) == 1:
                             # An already corroborated exact leg should not be
                             # lost to a timeout fetching optional dates.
@@ -542,22 +560,37 @@ class AircraftContextService:
                             break
                     if matches:
                         break
-                if len(matches) == 1:
-                    endpoints, arrival_utc, flight, date = next(iter(matches.values()))
-                    if arrival_utc:
-                        try:
-                            arrival = datetime.fromisoformat(arrival_utc.replace("Z", "+00:00"))
-                            if arrival.tzinfo:
-                                result._schedule_valid_until = (arrival + timedelta(minutes=30)).timestamp()
-                        except (ValueError, TypeError):
-                            pass
-                    result.origin, result.destination = endpoints
-                    result.route_status = "available"
-                    if full_resolver:
-                        result._resolver_match = GlobalLiveFlightResolveMatch(
-                            candidate=NormalizedGlobalFlightResolveCandidate(code, position.icao24),
-                            departure_date=date, live_flights=[flight], live_flight=flight,
-                        )
+            if number_eligible:
+                try:
+                    async with asyncio.timeout(8 if fallback else 12):
+                        await lookup_number()
+                except Exception:
+                    if not fallback:
+                        raise
+                    result.route_status = "provider_unavailable"
+            if fallback and not matches:
+                async with asyncio.timeout(7):
+                    dates = [(now.date() + timedelta(days=offset)).isoformat() for offset in (0, -1)]
+                    batches = await asyncio.gather(*(client.get_flight(position.icao24, date, with_location=True,
+                                                                        by_aircraft=True) for date in dates))
+                    for date, flights in zip(dates, batches):
+                        collect(flights, date, by_aircraft=True)
+            if len(matches) == 1:
+                endpoints, arrival_utc, flight, date = next(iter(matches.values()))
+                if arrival_utc:
+                    try:
+                        arrival = datetime.fromisoformat(arrival_utc.replace("Z", "+00:00"))
+                        if arrival.tzinfo:
+                            result._schedule_valid_until = (arrival + timedelta(minutes=30)).timestamp()
+                    except (ValueError, TypeError):
+                        pass
+                result.origin, result.destination = endpoints
+                result.route_status = "available"
+                if full_resolver:
+                    result._resolver_match = GlobalLiveFlightResolveMatch(
+                        candidate=NormalizedGlobalFlightResolveCandidate(code, position.icao24),
+                        departure_date=date, live_flights=[flight], live_flight=flight,
+                    )
         except Exception:
             result.route_status = "provider_unavailable"
         finally:
