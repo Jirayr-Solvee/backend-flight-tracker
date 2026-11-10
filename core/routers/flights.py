@@ -6,7 +6,7 @@ from typing import Annotated, Any
 
 from fastapi import (APIRouter, BackgroundTasks, Body, Depends, Header, HTTPException,
                      Query, status)
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from sqlmodel import Session, select
 
 from ..background_tasks import create_webhook_for_flight
@@ -308,47 +308,14 @@ async def resolve_aircraft_tracking_preview(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
     fast: bool = False,
-    exact_only: bool = False,
-    response: Response = None,
-    defer_schedule: bool = False,
 ):
     import asyncio
     import re
-    from ..config import settings
     from ..services.flight.aircraft_context import AircraftContext, AircraftContextService, AircraftTrackingPreview
+    from ..utils import get_time
     if re.fullmatch(r"[0-9a-fA-F]{6}", icao24) is None:
         raise HTTPException(status_code=422, detail="Invalid ICAO aircraft address")
     address = icao24.lower()
-    private_fast = bool(fast and exact_only and settings.FR24_GLOBE_PREVIEW_QA_USER_ID
-                        and user.id == settings.FR24_GLOBE_PREVIEW_QA_USER_ID)
-    preview_deadline = asyncio.get_running_loop().time() + 2.6
-    fr24_position = None
-
-    async def fr24():
-        nonlocal fr24_position
-        from ..services.flight.aircraft_context import SelectedAircraftPositions
-        from ..services.flight.fr24_route import lookup_route
-
-        if not settings.FR24_GLOBE_PREVIEW_TOKEN:
-            return None, "not_configured", None
-        snapshot = FlightService._global_positions_cache
-        position = next((p for p in snapshot[1] if p.icao24 == address), None) if snapshot else None
-        try:
-            async with asyncio.timeout_at(preview_deadline):
-                selected = position is None
-                if selected:
-                    position = await SelectedAircraftPositions.get(address)
-                    if not position or position.icao24 != address:
-                        return None, "selected_position_unavailable", None
-                callsign = (position.callsign or "").strip().upper()
-                airline = FlightService._iata_for_airline_prefix(callsign[:3])
-                fr24_position = position
-                route, reason = await lookup_route(position, settings.FR24_GLOBE_PREVIEW_TOKEN, airline,
-                                                   include_leg=True)
-                return route, f"selected_{reason}" if selected else reason, getattr(reason, "retry_after", None)
-        except TimeoutError:
-            return None, "preview_deadline", None
-
     # The app renders the aircraft card before this request completes. Keep
     # exact-route priority brief without cutting off the nearby provider calls.
     nearby_deadline = asyncio.get_running_loop().time() + 12
@@ -360,14 +327,10 @@ async def resolve_aircraft_tracking_preview(
             _, positions = snapshot
             return await AircraftContextService.nearby_route(address, positions, active=True)
 
-    use_nearby = fast and not exact_only
-    suggestion = asyncio.create_task(nearby()) if use_nearby and FlightService._global_positions_cache else None
+    suggestion = asyncio.create_task(nearby()) if fast and FlightService._global_positions_cache else None
     async def exact():
         try:
-            deadline = preview_deadline if private_fast else (
-                asyncio.get_running_loop().time() + (8 if exact_only else 4) if fast else None
-            )
-            async with asyncio.timeout_at(deadline):
+            async with asyncio.timeout(4 if fast else None):
                 if fast:
                     return await AircraftContextService.get(address, for_tracking=True, include_trace=False)
                 return await AircraftContextService.get(address, for_tracking=True)
@@ -378,11 +341,8 @@ async def resolve_aircraft_tracking_preview(
             result._preview_reasons.add("fast_preview_deadline")
             return result
 
-    fr24_task = asyncio.create_task(fr24()) if private_fast else None
     exact_task = asyncio.create_task(exact()) if suggestion else None
     nearby_result = None
-    route = None
-    retry_after = None
     try:
         if exact_task:
             await asyncio.wait((exact_task, suggestion), return_when=asyncio.FIRST_COMPLETED)
@@ -399,16 +359,7 @@ async def resolve_aircraft_tracking_preview(
                 context._preview_reasons.add("exact_lookup_pending")
         else:
             context = await exact_task if exact_task else await exact()
-        if fr24_task:
-            route, fr24_reason, retry_after = await fr24_task
-            snapshot = FlightService._global_positions_cache
-            if (fr24_reason == "selected_position_unavailable" and snapshot
-                    and any(p.icao24 == address for p in snapshot[1])
-                    and asyncio.get_running_loop().time() < preview_deadline):
-                # The exact lookup can refresh the worker's snapshot on a cold start.
-                route, fr24_reason, retry_after = await fr24()
-            logger.info("globe_fr24 aircraft=%s reason=%s", address, fr24_reason)
-        if use_nearby and context.route_status != "available":
+        if fast and context.route_status != "available":
             try:
                 nearby_result = await suggestion if suggestion else await nearby()
             except TimeoutError:
@@ -416,101 +367,13 @@ async def resolve_aircraft_tracking_preview(
             except Exception:
                 context._preview_reasons.add("nearby_lookup_failed")
     finally:
-        tasks = [task for task in (exact_task, suggestion, fr24_task) if task is not None]
+        tasks = [task for task in (exact_task, suggestion) if task is not None]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-    if route and context.route_status != "available":
-        from ..services.flight.aircraft_context import AircraftRouteEndpoint
-
-        context.origin = AircraftRouteEndpoint(code=route[0])
-        context.destination = AircraftRouteEndpoint(code=route[1])
-        context.route_status = "available"
-        # FR24 airports alone cannot authorize a tracking handoff.
-        context._resolver_match = None
-        context._preview_reasons.add("fr24_display_only")
-    if route and len(route) == 4 and not context._resolver_match and fr24_position is not None:
-        from ..services.flight.fr24_route import enrich_schedule, issue_schedule_ticket
-
-        if defer_schedule and response is not None:
-            ticket = await asyncio.to_thread(issue_schedule_ticket, fr24_position, route)
-            if ticket:
-                response.headers["X-Sofly-Schedule-Ticket"] = ticket
-                result = AircraftTrackingPreview(context=context)
-                logger.info("globe_preview aircraft=%s route=available track_ready=False reasons=fr24_schedule_deferred", address)
-                return result
-
-        try:
-            async with asyncio.timeout(1.2):
-                enriched = await enrich_schedule(fr24_position, route)
-            if enriched:
-                (context.origin, context.destination), context._resolver_match = enriched
-                context.route_status = "available"
-                context._preview_reasons.discard("fr24_display_only")
-            else:
-                context._preview_reasons.add("fr24_schedule_unverified")
-        except TimeoutError:
-            context._preview_reasons.add("fr24_schedule_timeout")
-        except Exception:
-            context._preview_reasons.add("fr24_schedule_failed")
     result = AircraftTrackingPreview(context=context)
     result.nearby_route = nearby_result
-    _prepare_aircraft_tracking_flight(session, result, address)
-    if response is not None and retry_after is not None and context.route_status != "available":
-        response.headers["X-Sofly-Route-Retry-After"] = str(retry_after)
-    return result
-
-
-@router.post("/live-positions/{icao24}/preview/schedule")
-async def complete_aircraft_tracking_schedule(
-    icao24: str,
-    ticket: Annotated[str, Header(alias="X-Sofly-Schedule-Ticket")],
-    user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-):
-    import asyncio
-    from ..config import settings
-    from ..services.flight.aircraft_context import AircraftContext, AircraftTrackingPreview
-    from ..services.flight.fr24_route import claim_schedule_ticket, enrich_schedule
-
-    if not settings.FR24_GLOBE_PREVIEW_QA_USER_ID or user.id != settings.FR24_GLOBE_PREVIEW_QA_USER_ID:
-        raise HTTPException(status_code=404)
-    address = icao24.lower()
-    claimed = await asyncio.to_thread(claim_schedule_ticket, address, ticket)
-    if not claimed:
-        raise HTTPException(status_code=404)
-    position, leg = claimed
-    context = AircraftContext(icao24=address)
-    result = AircraftTrackingPreview(context=context)
-    diagnostics = {}
-    started = time.monotonic()
-    try:
-        async with asyncio.timeout(9):
-            enriched = await enrich_schedule(position, leg, diagnostics=diagnostics)
-        if enriched:
-            (context.origin, context.destination), context._resolver_match = enriched
-            context.route_status = "available"
-            _prepare_aircraft_tracking_flight(session, result, address)
-        else:
-            context._preview_reasons.add("fr24_schedule_unverified")
-    except TimeoutError:
-        diagnostics["outcome"] = "deadline"
-        context._preview_reasons.add("fr24_schedule_timeout")
-    except Exception:
-        diagnostics["outcome"] = "unexpected_error"
-        context._preview_reasons.add("fr24_schedule_failed")
-    logger.info("globe_schedule aircraft=%s route=%s track_ready=%s reasons=%s elapsed_ms=%d diagnostics=%s",
-                address, context.route_status, result.tracking_flight is not None,
-                ",".join(sorted(context._preview_reasons)) or "verified",
-                round((time.monotonic() - started) * 1000), diagnostics)
-    return result
-
-
-def _prepare_aircraft_tracking_flight(session, result, icao24):
-    from ..utils import get_time
-
-    context = result.context
     match = context._resolver_match
     if match and context.origin and context.destination:
         try:
@@ -542,10 +405,11 @@ def _prepare_aircraft_tracking_flight(session, result, icao24):
     if context.route_status != "available" or result.tracking_flight is None:
         reasons = sorted(context._preview_reasons)
         if context.route_status == "available":
-            reasons = [reason for reason in reasons if reason.startswith(("stored_", "tracking_", "fr24_"))]
+            reasons = [reason for reason in reasons if reason.startswith(("stored_", "tracking_"))]
         logger.info("globe_preview aircraft=%s route=%s track_ready=%s reasons=%s",
                     icao24.lower(), context.route_status, result.tracking_flight is not None,
                     ",".join(reasons or ["no_exact_tracking_match"]))
+    return result
 
 
 @router.get("/live-positions/resolve", response_model=FlightRead)
