@@ -322,8 +322,10 @@ async def resolve_aircraft_tracking_preview(
     private_fast = bool(fast and exact_only and settings.FR24_GLOBE_PREVIEW_QA_USER_ID
                         and user.id == settings.FR24_GLOBE_PREVIEW_QA_USER_ID)
     preview_deadline = asyncio.get_running_loop().time() + 2.6
+    fr24_position = None
 
     async def fr24():
+        nonlocal fr24_position
         from ..services.flight.aircraft_context import SelectedAircraftPositions
         from ..services.flight.fr24_route import lookup_route
 
@@ -340,7 +342,9 @@ async def resolve_aircraft_tracking_preview(
                         return None, "selected_position_unavailable", None
                 callsign = (position.callsign or "").strip().upper()
                 airline = FlightService._iata_for_airline_prefix(callsign[:3])
-                route, reason = await lookup_route(position, settings.FR24_GLOBE_PREVIEW_TOKEN, airline)
+                fr24_position = position
+                route, reason = await lookup_route(position, settings.FR24_GLOBE_PREVIEW_TOKEN, airline,
+                                                   include_leg=True)
                 return route, f"selected_{reason}" if selected else reason, getattr(reason, "retry_after", None)
         except TimeoutError:
             return None, "preview_deadline", None
@@ -426,6 +430,22 @@ async def resolve_aircraft_tracking_preview(
         # FR24 airports alone cannot authorize a tracking handoff.
         context._resolver_match = None
         context._preview_reasons.add("fr24_display_only")
+    if route and len(route) == 4 and not context._resolver_match and fr24_position is not None:
+        from ..services.flight.fr24_route import enrich_schedule
+
+        try:
+            async with asyncio.timeout(1.2):
+                enriched = await enrich_schedule(fr24_position, route)
+            if enriched:
+                (context.origin, context.destination), context._resolver_match = enriched
+                context.route_status = "available"
+                context._preview_reasons.discard("fr24_display_only")
+            else:
+                context._preview_reasons.add("fr24_schedule_unverified")
+        except TimeoutError:
+            context._preview_reasons.add("fr24_schedule_timeout")
+        except Exception:
+            context._preview_reasons.add("fr24_schedule_failed")
     result = AircraftTrackingPreview(context=context)
     result.nearby_route = nearby_result
     match = context._resolver_match

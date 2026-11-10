@@ -1,4 +1,4 @@
-"""Display-only commercial globe route fallback; no tracking or schedule writes."""
+"""Verified commercial globe route fallback and exact schedule enrichment."""
 
 import asyncio
 import math
@@ -27,6 +27,12 @@ def match_route(rows, callsign, address, observed_at, airline):
 
 
 def _match_route(rows, callsign, address, observed_at, airline, *, registration=None, nonstandard=False):
+    match, reason = _match_leg(rows, callsign, address, observed_at, airline,
+                               registration=registration, nonstandard=nonstandard)
+    return match[:2] if match else None, reason
+
+
+def _match_leg(rows, callsign, address, observed_at, airline, *, registration=None, nonstandard=False):
     if not isinstance(rows, list):
         return None, "invalid_response"
     if not rows:
@@ -70,9 +76,10 @@ def _match_route(rows, callsign, address, observed_at, airline, *, registration=
         if (not all(isinstance(code, str) and re.fullmatch(r"[A-Z]{3,4}", code) for code in codes)
                 or codes[0] == codes[1]):
             return None, "invalid_airports"
-        if flight_id in matches and matches[flight_id] != codes:
-            return None, "conflicting_airports"
-        matches[flight_id] = codes
+        leg = (*codes, row["flight"], _timestamp(row.get("datetime_takeoff")) or start)
+        if flight_id in matches and matches[flight_id] != leg:
+            return None, "conflicting_leg"
+        matches[flight_id] = leg
     if len(matches) == 1:
         return next(iter(matches.values())), "matched"
     return None, "ambiguous_leg" if matches else miss
@@ -142,7 +149,7 @@ def _remember_route(key, route):
     _verified_routes.update(update)
 
 
-async def lookup_route(position, token, airline):
+async def lookup_route(position, token, airline, *, include_leg=False):
     global _local_backoff_until
     callsign = (position.callsign or "").strip().upper()
     address = position.icao24.lower()
@@ -174,7 +181,7 @@ async def lookup_route(position, token, airline):
         key += f":nonstandard:{registration or ''}"
     route = await asyncio.to_thread(_cached_route, key)
     if route:
-        return route, "matched_repeat"
+        return route if include_leg else route[:2], "matched_repeat"
     if time.monotonic() < _local_backoff_until:
         return None, RetryReason("provider_backoff", _local_backoff_until - time.monotonic())
     budget_reason = await asyncio.to_thread(_reserve_request)
@@ -203,11 +210,11 @@ async def lookup_route(position, token, airline):
             rows = payload.get("data") if isinstance(payload, dict) else None
             if isinstance(rows, list) and len(rows) >= 20:
                 return None, "result_limit"
-            route, reason = _match_route(rows, callsign, address, observed_at, airline,
+            route, reason = _match_leg(rows, callsign, address, observed_at, airline,
                                          registration=registration, nonstandard=nonstandard)
         if route:
             await asyncio.to_thread(_remember_route, key, route)
-        return route, reason
+        return (route if include_leg else route[:2]) if route else None, reason
     except httpx.HTTPStatusError as error:
         status = error.response.status_code
         if status == 429:
@@ -222,3 +229,49 @@ async def lookup_route(position, token, airline):
         return None, "provider_transport_error"
     except ValueError:
         return None, "invalid_response"
+
+
+async def enrich_schedule(position, leg):
+    """Look up the verified FR24 flight number using the search provider."""
+    from .aircraft_context import matched_route, schedule_window
+    from .api_client import AerodataboxClient
+    from .service import GlobalLiveFlightResolveMatch, NormalizedGlobalFlightResolveCandidate
+
+    origin, destination, number, leg_start = leg
+    observed = datetime.fromtimestamp(position.time_position, timezone.utc)
+    day = datetime.fromtimestamp(leg_start, timezone.utc).date()
+    dates = [(day + timedelta(days=offset)).isoformat() for offset in (0, -1, 1)]
+    client = AerodataboxClient()
+    try:
+        batches = await asyncio.gather(*(client.get_flight(number, day, with_location=True)
+                                         for day in dates), return_exceptions=True)
+    finally:
+        await client.client.aclose()
+
+    # A failed date lookup leaves ambiguity unresolved. Keep the FR24 route
+    # alone rather than trusting a partial view of repeated flight numbers.
+    if any(isinstance(rows, BaseException) for rows in batches):
+        return None
+    matches = {}
+    for date, rows in zip(dates, batches):
+        for flight in rows:
+            if (flight.number.replace(" ", "").upper() != number or flight.isCargo is not False
+                    or not flight.aircraft or (flight.aircraft.modeS or "").lower() != position.icao24
+                    or not schedule_window(flight, position, observed, arrival_grace=timedelta(minutes=30))):
+                continue
+            airports = [getattr(movement, "airport", None) for movement in (flight.departure, flight.arrival)]
+            if not all(airport and code in (airport.iata, airport.icao)
+                       for airport, code in zip(airports, (origin, destination))):
+                continue
+            endpoints = matched_route(flight, position, datetime.now(timezone.utc), resolver_number=number)
+            if not endpoints or not endpoints[0].scheduled_time_local:
+                continue
+            departure = _timestamp(flight.departure.scheduledTime.utc)
+            if not departure or abs(departure - leg_start) > 6 * 3600:
+                continue
+            arrival = _timestamp(flight.arrival.scheduledTime.utc) if flight.arrival.scheduledTime else None
+            matches.setdefault((departure, arrival), (endpoints, GlobalLiveFlightResolveMatch(
+                candidate=NormalizedGlobalFlightResolveCandidate(number, position.icao24),
+                departure_date=date, live_flights=[flight], live_flight=flight,
+            )))
+    return next(iter(matches.values())) if len(matches) == 1 else None

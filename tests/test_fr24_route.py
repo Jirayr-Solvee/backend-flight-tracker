@@ -1,7 +1,7 @@
 import unittest
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -81,6 +81,45 @@ class FlightradarRouteTests(unittest.TestCase):
 
 
 class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_enriches_only_unambiguous_exact_leg_with_original_schedule(self):
+        from core.services.flight import api_client
+
+        now = datetime.now(timezone.utc)
+        position = SimpleNamespace(icao24="4d227a", callsign="RYR1TM", on_ground=False,
+                                   aircraft_categories=[], time_position=int(now.timestamp()),
+                                   lat=40.0, lon=44.0)
+
+        def movement(iata, icao, offset):
+            scheduled = now + timedelta(minutes=offset)
+            return SimpleNamespace(
+                airport=SimpleNamespace(iata=iata, icao=icao, name=iata, municipalityName=None),
+                scheduledTime=SimpleNamespace(utc=scheduled.isoformat(), local=scheduled.isoformat()),
+                revisedTime=SimpleNamespace(local=now.isoformat()),
+            )
+
+        def flight(address="4D227A", airport="GMFF", offset=-60):
+            return SimpleNamespace(
+                number="FR 5223", callSign="RYR1TM", aircraft=SimpleNamespace(modeS=address),
+                isCargo=False, status=SimpleNamespace(value="EnRoute"),
+                lastUpdatedUtc=now.isoformat(), location=None,
+                departure=movement("BVA", "LFOB", offset), arrival=movement("FEZ", airport, 120),
+            )
+
+        leg = ("LFOB", "GMFF", "FR5223", (now - timedelta(minutes=50)).timestamp())
+        exact = flight()
+        client = SimpleNamespace(get_flight=AsyncMock(), client=SimpleNamespace(aclose=AsyncMock()))
+        with patch.object(api_client, "AerodataboxClient", return_value=client):
+            client.get_flight.side_effect = [[exact, flight(address="4CA708"), flight(airport="GMAD")], [], []]
+            endpoints, match = await fr24_route.enrich_schedule(position, leg)
+            self.assertIs(match.live_flight, exact)
+            self.assertEqual(endpoints[0].scheduled_time_local, exact.departure.scheduledTime.local)
+            self.assertEqual(endpoints[1].scheduled_time_local, exact.arrival.scheduledTime.local)
+            self.assertTrue(all(call.args[0] == "FR5223" for call in client.get_flight.await_args_list))
+            client.get_flight.side_effect = [[exact, flight(offset=-120)], [], []]
+            self.assertIsNone(await fr24_route.enrich_schedule(position, leg))
+            client.get_flight.side_effect = [[flight(address="4CA708"), flight(airport="GMAD")], [], []]
+            self.assertIsNone(await fr24_route.enrich_schedule(position, leg))
+
     async def test_preview_only_sends_retry_hint_when_route_is_missing(self):
         from fastapi import Response
 
@@ -121,7 +160,7 @@ class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.context.origin.code, "LFOB")
             self.assertIsNone(result.tracking_flight)
             selected.assert_awaited_once_with(position.icao24)
-            lookup.assert_awaited_once_with(position, "synthetic", "FR")
+            lookup.assert_awaited_once_with(position, "synthetic", "FR", include_leg=True)
             selected.return_value = SimpleNamespace(icao24="4ca708")
             result = await fixture.flights.resolve_aircraft_tracking_preview(
                 position.icao24, SimpleNamespace(id="qa"), session, fast=True, exact_only=True
@@ -138,7 +177,7 @@ class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(started.wait(), timeout=0.5)
             return AircraftContext(icao24=position.icao24)
 
-        async def fallback(*args):
+        async def fallback(*args, **kwargs):
             started.set()
             return ("LFOB", "GMFF"), "matched"
 
@@ -237,7 +276,7 @@ class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.context.route_status, "available" if allowed else "unavailable")
                 self.assertIsNone(result.tracking_flight)
                 self.assertIsNone(result.nearby_route)
-            lookup.assert_awaited_once_with(position, "synthetic", "FR")
+            lookup.assert_awaited_once_with(position, "synthetic", "FR", include_leg=True)
             primary = AircraftContext(icao24=position.icao24, route_status="available")
             with patch.object(AircraftContextService, "get", AsyncMock(return_value=primary)):
                 result = await fixture.flights.resolve_aircraft_tracking_preview(
