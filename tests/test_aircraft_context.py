@@ -226,6 +226,16 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(AircraftContextService.reusable_schedule(
                     partial.model_copy(update={"callSign": None}), neighbor, now))
 
+        neighbor = planes[1].model_copy(update={"callsign": "THY1762"})
+        valid = flights[neighbor.icao24].model_copy(update={"callSign": neighbor.callsign})
+        wrong = valid.model_copy(update={"aircraft": valid.aircraft.model_copy(update={"modeS": "abcdef"})})
+        match = GlobalLiveFlightResolveMatch(
+            NormalizedGlobalFlightResolveCandidate(neighbor.callsign, neighbor.icao24),
+            now.date().isoformat(), [wrong, valid], wrong)
+        with patch.object(FlightService, "_fetch_global_live_flight_match_for_candidate", AsyncMock(return_value=match)):
+            route = await AircraftContextService.nearby_route(planes[0].icao24, [planes[0], neighbor], active=True)
+        self.assertEqual((route.callsign, route.origin.code, route.destination.code), ("THY1762", "HEL", "IST"))
+
     async def test_priority_precheck_only_marks_complete_airline_schedules_and_reuses_them_on_tap(self):
         now = int(time.time())
         airline = position(1, lat=48, lon=4, callsign="AF101", time_position=now)

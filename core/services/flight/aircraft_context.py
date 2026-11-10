@@ -386,9 +386,17 @@ class AircraftContextService:
                     candidate=candidate, require_on_route=True)
                 if not match:
                     return None
-                flight = match.live_flight
-                endpoints = cls.reusable_schedule(flight, position, now)
-                if endpoints:
+                # The number resolver returns a ranked row plus the full
+                # batch. A codeshare or another leg can outrank the usable
+                # row; validate all rows and only show an unambiguous route.
+                routes = {}
+                for flight in match.live_flights:
+                    endpoints = cls.reusable_schedule(flight, position, now)
+                    if endpoints:
+                        key = tuple((e.code, e.scheduled_time_local) for e in endpoints)
+                        routes[key] = endpoints
+                if len(routes) == 1:
+                    endpoints = next(iter(routes.values()))
                     return NearbyAircraftRoute(callsign=position.callsign, origin=endpoints[0], destination=endpoints[1])
                 return None
 
