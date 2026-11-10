@@ -319,7 +319,7 @@ async def resolve_aircraft_tracking_preview(
             def leg_matches(stored, observed, endpoint):
                 scheduled_utc = get_time(observed.scheduledTime, "utc")
                 return (stored and stored.airport and endpoint.code and scheduled_utc
-                        and endpoint.code in (stored.airport.iata, stored.airport.icao)
+                        and endpoint.code == stored.airport.iata
                         and stored.scheduled_time_utc == scheduled_utc)
             if (flight and (flight.aircraft_modeS or "").strip().lower() == icao24.lower()
                     and leg_matches(flight.departure, match.live_flight.departure, context.origin)
