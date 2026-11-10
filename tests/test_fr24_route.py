@@ -58,6 +58,31 @@ class FlightradarRouteTests(unittest.TestCase):
 
 
 class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_preview_runs_both_lookups_in_parallel(self):
+        import asyncio
+
+        started = asyncio.Event()
+        position = SimpleNamespace(icao24="4d227a", callsign="RYR1TM")
+        async def exact(*args, **kwargs):
+            await asyncio.wait_for(started.wait(), timeout=0.5)
+            return AircraftContext(icao24=position.icao24)
+
+        async def fallback(*args):
+            started.set()
+            return ("LFOB", "GMFF"), "matched"
+
+        with (patch.object(fixture.settings, "FR24_GLOBE_PREVIEW_TOKEN", "synthetic"),
+              patch.object(fixture.settings, "FR24_GLOBE_PREVIEW_QA_USER_ID", "qa"),
+              patch.object(FlightService, "_global_positions_cache", (None, [position])),
+              patch.object(AircraftContextService, "get", exact),
+              patch.object(fr24_route, "lookup_route", fallback)):
+            result = await fixture.flights.resolve_aircraft_tracking_preview(
+                position.icao24, SimpleNamespace(id="qa"), Mock(), fast=True, exact_only=True
+            )
+        self.assertEqual(result.context.origin.code, "LFOB")
+        self.assertIsNone(result.tracking_flight)
+        self.assertNotIn("fast_preview_deadline", result.context._preview_reasons)
+
     async def test_nonstandard_callsign_uses_commercial_filters_and_exact_identity(self):
         observed = int(time.time()) - 2
         def iso(timestamp):
