@@ -95,6 +95,8 @@ class NearbyAircraftRoute(SQLModel):
     callsign: str
     origin: AircraftRouteEndpoint
     destination: AircraftRouteEndpoint
+    latitude: float | None = None
+    longitude: float | None = None
 
 
 class AircraftTrackingPreview(SQLModel):
@@ -373,7 +375,8 @@ class AircraftContextService:
         for position in candidates:
             route = cls.verified_schedule(position, now, entries)
             if route and route._resolver_match and route.origin and route.destination:
-                return NearbyAircraftRoute(callsign=position.callsign, origin=route.origin, destination=route.destination)
+                return NearbyAircraftRoute(callsign=position.callsign, origin=route.origin, destination=route.destination,
+                                           latitude=position.lat, longitude=position.lon)
         if not active:
             return None
 
@@ -399,7 +402,8 @@ class AircraftContextService:
                         routes[key] = endpoints
                 if len(routes) == 1:
                     endpoints = next(iter(routes.values()))
-                    return NearbyAircraftRoute(callsign=position.callsign, origin=endpoints[0], destination=endpoints[1])
+                    return NearbyAircraftRoute(callsign=position.callsign, origin=endpoints[0], destination=endpoints[1],
+                                               latitude=position.lat, longitude=position.lon)
                 return None
 
         eligible = {p.icao24: p for p in reversed(candidates)
@@ -593,6 +597,9 @@ class AircraftContextService:
             # Older pool entries contain display fields only, not an exact
             # provider record that can be handed off to Track this flight.
             schedule = None
+        if schedule and not include_trace:
+            # A verified route needs neither a provider call nor a lookup slot.
+            return schedule
         if cached and time.monotonic() - cached[0] < 60:
             result = cached[1].model_copy(deep=True)
             if schedule:
