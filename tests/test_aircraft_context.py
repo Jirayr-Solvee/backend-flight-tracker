@@ -79,6 +79,25 @@ class AircraftTraceTests(unittest.TestCase):
         flight.status.value = "Arrived"
         self.assertIsNone(matched_route(flight, aircraft, now))
 
+    def test_passenger_schedule_without_location_requires_corroboration(self):
+        now = datetime.now(timezone.utc)
+        def leg(code, stamp):
+            return Obj(airport=Obj(iata=code, icao=None, name=code, municipalityName=None),
+                       scheduledTime=Obj(utc=stamp.isoformat(), local=stamp.isoformat()))
+        flight = Obj(aircraft=Obj(modeS="ABC123", reg=None), status=Obj(value="EnRoute"),
+                     lastUpdatedUtc=now.isoformat(), location=None, callSign="UAL957", isCargo=False,
+                     departure=leg("LHR", now-timedelta(hours=1)), arrival=leg("JFK", now+timedelta(hours=1)))
+        aircraft = position(1, icao24="abc123", callsign="UAL957")
+        self.assertIsNotNone(matched_route(flight, aircraft, now))
+        flight.callSign = "UAL958"
+        self.assertIsNone(matched_route(flight, aircraft, now))
+        flight.callSign = "UAL957"
+        flight.isCargo = True
+        self.assertIsNone(matched_route(flight, aircraft, now))
+        flight.isCargo = False
+        flight.arrival = leg("JFK", now-timedelta(hours=3))
+        self.assertIsNone(matched_route(flight, aircraft, now))
+
 
 class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -96,7 +115,8 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
              patch("core.services.flight.aircraft_context.AerodataboxClient", return_value=client):
             result = AircraftContext(icao24=aircraft.icao24)
             await AircraftContextService.route(result, aircraft, now)
-        self.assertEqual([call.args[0] for call in client.get_flight.await_args_list], ["UA957", "UA957"])
+        self.assertEqual([call.args[0] for call in client.get_flight.await_args_list],
+                         ["UA957", "UA957", "UAL957", "UAL957"])
         self.assertEqual(aircraft.callsign, "UAL957")
         self.assertIsNone(result.origin)
         client.client.aclose.assert_awaited_once()

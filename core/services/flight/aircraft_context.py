@@ -175,21 +175,40 @@ def matched_route(flight, position, now: datetime):
     except (ValueError, TypeError):
         return None
     location = flight.location
-    if not location or location.lat is None or location.lon is None or not location.reportedAtUtc:
-        return None
-    if not -90 <= location.lat <= 90 or not -180 <= location.lon <= 180:
-        return None
-    try:
-        reported = datetime.fromisoformat(location.reportedAtUtc.replace("Z", "+00:00"))
-        if reported.tzinfo is None or not -30 <= (now - reported).total_seconds() <= 900:
+    if location is None:
+        # Some scheduled passenger legs have no provider position. Require
+        # matching live callsign and Mode S, not just a flight number or tail.
+        if not aircraft.modeS or not position.callsign or normalize(getattr(flight, "callSign", None)) != normalize(position.callsign):
             return None
-        lat1, lat2 = math.radians(position.lat), math.radians(location.lat)
-        dlon = math.radians(position.lon - location.lon)
-        a = math.sin((lat2-lat1)/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
-        if not math.isfinite(a) or 6371 * 2 * math.asin(math.sqrt(min(1, max(0, a)))) > 200:
+        if set(position.aircraft_categories or ()) & {"military", "cargo", "helicopters", "interesting"} or getattr(flight, "isCargo", None) is not False:
             return None
-    except (ValueError, TypeError):
-        return None
+        def scheduled_utc(leg):
+            stamp = getattr(getattr(leg, "scheduledTime", None), "utc", None)
+            value = datetime.fromisoformat(stamp.replace("Z", "+00:00")) if stamp else None
+            return value if value and value.tzinfo else None
+        try:
+            departure = scheduled_utc(flight.departure)
+            arrival = scheduled_utc(flight.arrival)
+            if not departure or not arrival or not departure < arrival or not departure - timedelta(minutes=30) <= now <= arrival + timedelta(hours=2):
+                return None
+        except (ValueError, TypeError):
+            return None
+    else:
+        if location.lat is None or location.lon is None or not location.reportedAtUtc:
+            return None
+        if not -90 <= location.lat <= 90 or not -180 <= location.lon <= 180:
+            return None
+        try:
+            reported = datetime.fromisoformat(location.reportedAtUtc.replace("Z", "+00:00"))
+            if reported.tzinfo is None or not -30 <= (now - reported).total_seconds() <= 900:
+                return None
+            lat1, lat2 = math.radians(position.lat), math.radians(location.lat)
+            dlon = math.radians(position.lon - location.lon)
+            a = math.sin((lat2-lat1)/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
+            if not math.isfinite(a) or 6371 * 2 * math.asin(math.sqrt(min(1, max(0, a)))) > 200:
+                return None
+        except (ValueError, TypeError):
+            return None
     def endpoint(data):
         airport = data.airport
         clean = lambda value: value.strip()[:120] if isinstance(value, str) and value.strip() else None
@@ -334,20 +353,24 @@ class AircraftContextService:
         from .service import FlightService
         if not FlightService._looks_like_route_callsign(position):
             return
-        code = (position.callsign or position.display_code).strip().upper()
+        raw = (position.callsign or position.display_code).strip().upper()
         # The provider lookup is by scheduled flight number, not ADS-B callsign.
-        code = FlightService._normalized_callsign_for_tracking(code) or code
+        code = FlightService._normalized_callsign_for_tracking(raw) or raw
         client = AerodataboxClient()
         try:
             async with asyncio.timeout(12):
                 matches = {}
-                for date in (now.date(), now.date() - timedelta(days=1)):
-                    flights = await client.get_flight(code, date.isoformat(), with_location=True)
-                    for flight in flights:
-                        endpoints = matched_route(flight, position, now)
-                        if endpoints:
-                            key = tuple((e.code, e.name) for e in endpoints)
-                            matches[key] = endpoints
+                dates = (now.date(), now.date() - timedelta(days=1))
+                for number in dict.fromkeys((code, raw)):
+                    for date in dates:
+                        flights = await client.get_flight(number, date.isoformat(), with_location=True)
+                        for flight in flights:
+                            endpoints = matched_route(flight, position, now)
+                            if endpoints:
+                                key = tuple((e.code, e.name) for e in endpoints)
+                                matches[key] = endpoints
+                    if matches:
+                        break
                 if len(matches) == 1:
                     result.origin, result.destination = next(iter(matches.values()))
                     result.route_status = "available"
