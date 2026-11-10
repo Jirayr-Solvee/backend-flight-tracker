@@ -25,7 +25,7 @@ def match_route(rows, callsign, address, observed_at, airline):
     return _match_route(rows, callsign, address, observed_at, airline)[0]
 
 
-def _match_route(rows, callsign, address, observed_at, airline):
+def _match_route(rows, callsign, address, observed_at, airline, *, registration=None, nonstandard=False):
     if not isinstance(rows, list):
         return None, "invalid_response"
     if not rows:
@@ -35,15 +35,19 @@ def _match_route(rows, callsign, address, observed_at, airline):
     for row in rows:
         if not isinstance(row, dict):
             continue
-        if (str(row.get("callsign")).strip().upper() != callsign
-                or str(row.get("hex")).lower() != address):
+        if str(row.get("hex")).lower() != address:
+            continue
+        if registration:
+            if str(row.get("reg")).strip().upper() != registration:
+                continue
+        elif str(row.get("callsign")).strip().upper() != callsign:
             continue
         if airline:
             carrier_matches = re.fullmatch(re.escape(airline) + r"\d{1,4}[A-Z]?", str(row.get("flight")))
         else:
             operator = row.get("operated_as") or row.get("operating_as")
             carrier_matches = (
-                operator == callsign[:3]
+                (bool(re.fullmatch(r"[A-Z]{3}", str(operator))) if nonstandard else operator == callsign[:3])
                 and re.fullmatch(r"[A-Z0-9]{2}\d{1,4}[A-Z]?", str(row.get("flight")))
             )
         if not carrier_matches:
@@ -107,8 +111,15 @@ async def lookup_route(position, token, airline):
         return None, "not_configured"
     if position.on_ground or "military" in position.aircraft_categories:
         return None, "ineligible_aircraft"
-    if not re.fullmatch(r"[A-Z]{3}[0-9][A-Z0-9]{0,4}", callsign):
-        return None, "unsupported_callsign"
+    nonstandard = not re.fullmatch(r"[A-Z]{3}[0-9][A-Z0-9]{0,4}", callsign)
+    registration = None
+    if nonstandard:
+        candidate = (getattr(position, "registration", None) or "").strip().upper()
+        if re.fullmatch(r"[A-Z0-9]{1,5}-?[A-Z0-9]{1,5}", candidate):
+            registration = candidate
+        if not registration and not re.fullmatch(r"[A-Z0-9]{1,8}", callsign):
+            return None, "missing_usable_aircraft_identifier"
+        airline = None
     if not re.fullmatch(r"[0-9a-f]{6}", address):
         return None, "invalid_aircraft_address"
     if not observed_at:
@@ -119,6 +130,8 @@ async def lookup_route(position, token, airline):
     # Identical ADS-B observations only: never carry a route to a new observation
     # (even on the same airframe and callsign). Read before the provider cooldown.
     key = f"{address}:{callsign}:{observed_at}:{airline or ''}"
+    if nonstandard:
+        key += f":nonstandard:{registration or ''}"
     route = await asyncio.to_thread(_cached_route, key)
     if route:
         return route, "matched_repeat"
@@ -128,11 +141,14 @@ async def lookup_route(position, token, airline):
     _cooldown_reason = "request_cooldown"
     observed = datetime.fromtimestamp(observed_at, timezone.utc)
     fmt = "%Y-%m-%dT%H:%M:%S"
+    identity_filter = {"registrations": registration} if registration else {"callsigns": callsign}
+    if nonstandard:
+        identity_filter["categories"] = "P,C"
     try:
         async with asyncio.timeout(2), httpx.AsyncClient(timeout=1.8) as client:
             response = await client.get(
                 "https://fr24api.flightradar24.com/api/flight-summary/light",
-                params={"callsigns": callsign, "limit": 20,
+                params={**identity_filter, "limit": 20,
                         "flight_datetime_from": (observed - timedelta(hours=20)).strftime(fmt),
                         "flight_datetime_to": now.strftime(fmt)},
                 headers={"Authorization": f"Bearer {token}", "Accept": "application/json",
@@ -146,7 +162,8 @@ async def lookup_route(position, token, airline):
             rows = payload.get("data") if isinstance(payload, dict) else None
             if isinstance(rows, list) and len(rows) >= 20:
                 return None, "result_limit"
-            route, reason = _match_route(rows, callsign, address, observed_at, airline)
+            route, reason = _match_route(rows, callsign, address, observed_at, airline,
+                                         registration=registration, nonstandard=nonstandard)
         if route:
             await asyncio.to_thread(_remember_route, key, route)
         return route, reason

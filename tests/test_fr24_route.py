@@ -58,6 +58,38 @@ class FlightradarRouteTests(unittest.TestCase):
 
 
 class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_nonstandard_callsign_uses_commercial_filters_and_exact_identity(self):
+        observed = int(time.time()) - 2
+        def iso(timestamp):
+            return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+        position = SimpleNamespace(icao24="4d227a", callsign="FR5223", on_ground=False,
+                                   aircraft_categories=[], time_position=observed)
+        row = dict(FlightradarRouteTests.row, reg="9H-QCE", operated_as="RYR",
+                   first_seen=iso(observed - 10), last_seen=iso(observed + 1))
+        client = AsyncMock()
+        with (patch.object(fr24_route, "_next_request", 0),
+              patch.object(fr24_route, "_cached_route", return_value=None),
+              patch.object(fr24_route, "_remember_route"),
+              patch.object(fr24_route.httpx, "AsyncClient") as factory):
+            factory.return_value.__aenter__.return_value = client
+            for registration, provider_row, expected_filter, expected_route in (
+                ("9H-QCE", row, {"registrations": "9H-QCE"}, ("LFOB", "GMFF")),
+                ("9H-QCE", dict(row, hex="4CA708"), {"registrations": "9H-QCE"}, None),
+                (None, dict(row, callsign="FR5223"), {"callsigns": "FR5223"}, ("LFOB", "GMFF")),
+                (None, row, {"callsigns": "FR5223"}, None),
+            ):
+                position.registration = registration
+                fr24_route._next_request = 0
+                response = Mock(status_code=200)
+                response.json.return_value = {"data": [provider_row]}
+                client.get.return_value = response
+                route, _ = await fr24_route.lookup_route(position, "synthetic", None)
+                self.assertEqual(route, expected_route)
+                params = client.get.await_args.kwargs["params"]
+                self.assertEqual({k: params[k] for k in ("registrations", "callsigns") if k in params},
+                                 expected_filter)
+                self.assertEqual(params["categories"], "P,C")
+
     async def test_verified_repeat_is_shared_and_does_not_cross_observations(self):
         observed = int(time.time()) - 2
         position = SimpleNamespace(icao24="4d227a", callsign="RYR1TM", on_ground=False,
