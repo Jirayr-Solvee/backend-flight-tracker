@@ -81,6 +81,54 @@ class FlightradarRouteTests(unittest.TestCase):
 
 
 class PrivateGlobePreviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deferred_preview_and_schedule_are_allowlisted(self):
+        from fastapi import HTTPException, Response
+
+        address = "4d227a"
+        position = SimpleNamespace(icao24=address, callsign="RYR1TM")
+        leg = ("LFOB", "GMFF", "FR5223", 123)
+        session = Mock()
+        with (patch.object(fixture.settings, "FR24_GLOBE_PREVIEW_TOKEN", "synthetic"),
+              patch.object(fixture.settings, "FR24_GLOBE_PREVIEW_QA_USER_ID", "qa"),
+              patch.object(FlightService, "_global_positions_cache", (None, [position])),
+              patch.object(AircraftContextService, "get", AsyncMock(
+                  return_value=AircraftContext(icao24=address))),
+              patch.object(fr24_route, "lookup_route", AsyncMock(return_value=(leg, "matched"))),
+              patch.object(fr24_route, "issue_schedule_ticket", return_value="test-ticket"),
+              patch.object(fr24_route, "claim_schedule_ticket", side_effect=[(position, leg), None]) as claim,
+              patch.object(fr24_route, "enrich_schedule", AsyncMock(return_value=None)) as enrich):
+            response = Response()
+            result = await fixture.flights.resolve_aircraft_tracking_preview(
+                address, SimpleNamespace(id="qa"), session, fast=True, exact_only=True,
+                response=response, defer_schedule=True)
+            self.assertEqual(result.context.origin.code, "LFOB")
+            self.assertIsNone(result.tracking_flight)
+            enrich.assert_not_awaited()
+            ticket = response.headers["X-Sofly-Schedule-Ticket"]
+            with self.assertRaises(HTTPException):
+                await fixture.flights.complete_aircraft_tracking_schedule(
+                    address, ticket, SimpleNamespace(id="other"), session)
+            claim.assert_not_called()
+            await fixture.flights.complete_aircraft_tracking_schedule(
+                address, ticket, SimpleNamespace(id="qa"), session)
+            enrich.assert_awaited_once_with(position, leg)
+            with self.assertRaises(HTTPException):
+                await fixture.flights.complete_aircraft_tracking_schedule(
+                    address, ticket, SimpleNamespace(id="qa"), session)
+
+    def test_schedule_ticket_is_single_use_and_bound_to_address(self):
+        from core.models.flight import GlobalFlightPositionRead
+        position = GlobalFlightPositionRead(id="4d227a", icao24="4d227a", callsign="RYR1TM",
+                                            display_code="RYR1TM", lat=40, lon=44, on_ground=False)
+        leg = ("LFOB", "GMFF", "FR5223", 123)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            fr24_route, "_schedule_tickets", fr24_route.SchedulePool(directory)
+        ):
+            ticket = fr24_route.issue_schedule_ticket(position, leg)
+            self.assertIsNone(fr24_route.claim_schedule_ticket("4ca708", ticket))
+            self.assertEqual(fr24_route.claim_schedule_ticket(position.icao24, ticket), (position, leg))
+            self.assertIsNone(fr24_route.claim_schedule_ticket(position.icao24, ticket))
+
     async def test_enriches_only_unambiguous_exact_leg_with_original_schedule(self):
         from core.services.flight import api_client
 

@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -88,6 +89,37 @@ def _match_leg(rows, callsign, address, observed_at, airline, *, registration=No
 _request_budget = SchedulePool(Path(tempfile.gettempdir()) / f"sofly-fr24-budget-v1-{os.getuid()}")
 _local_backoff_until = 0.0
 _verified_routes = SchedulePool(Path(tempfile.gettempdir()) / f"sofly-fr24-routes-v1-{os.getuid()}")
+_schedule_tickets = SchedulePool(Path(tempfile.gettempdir()) / f"sofly-fr24-schedule-tickets-v1-{os.getuid()}")
+
+
+def issue_schedule_ticket(position, leg):
+    ticket = uuid.uuid4().hex
+
+    def save(state):
+        now = time.time()
+        live = [(key, value) for key, value in state.items() if value[0] > now]
+        state.clear()
+        state.update(live[-63:])
+        state[ticket] = [now + 30, position.model_dump(mode="json"), leg]
+        return ticket
+
+    return _schedule_tickets.update(save)
+
+
+def claim_schedule_ticket(address, ticket):
+    from ...models.flight import GlobalFlightPositionRead
+
+    if not re.fullmatch(r"[0-9a-f]{32}", ticket):
+        return None
+
+    def claim(state):
+        value = state.get(ticket)
+        if not value or value[0] <= time.time() or value[1]["icao24"] != address:
+            return None
+        state.pop(ticket)
+        return GlobalFlightPositionRead.model_validate(value[1]), tuple(value[2])
+
+    return _schedule_tickets.update(claim)
 
 
 class RetryReason(str):
