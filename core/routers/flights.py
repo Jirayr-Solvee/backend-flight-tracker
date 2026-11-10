@@ -273,7 +273,7 @@ async def get_global_live_flight_positions(
         positions = await FlightService.get_global_flight_positions(limit=limit, regional=regional, aircraft=True)
         if schedule_priority:
             from ..services.flight.aircraft_context import AircraftContextService
-            return AircraftContextService.prioritize_schedules(positions)
+            return await AircraftContextService.prioritize_schedules(positions)
         return positions
     return await FlightService.get_global_flight_positions(limit=limit, regional=regional)
 

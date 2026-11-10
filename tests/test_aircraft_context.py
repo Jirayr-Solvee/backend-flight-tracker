@@ -1,5 +1,6 @@
 """Synthetic public aircraft only. No provider/production requests or writes."""
 import asyncio
+import tempfile
 import time
 import unittest
 from datetime import datetime, timezone, timedelta
@@ -10,6 +11,7 @@ import httpx
 from tests.test_regional_traffic import fixture, position
 from core.services.flight.aircraft_context import AircraftContext, AircraftContextService, AircraftRouteEndpoint, ObservedAircraftTrails, SelectedAircraftPositions, parse_trace, matched_route
 from core.services.flight.api_client import ADSBExchangeClient
+from core.services.flight.schedule_pool import SchedulePool
 from core.services.flight import FlightService
 
 
@@ -114,10 +116,10 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
         AircraftContextService.pending.clear()
         AircraftContextService.slots = asyncio.Semaphore(4)
         AircraftContextService.trace_backoff_until = 0
-        AircraftContextService.schedule_cache.clear()
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.object(AircraftContextService, "schedule_pool", SchedulePool(directory)))
         AircraftContextService.schedule_task = None
-        AircraftContextService.next_schedule_batch = 0
-        AircraftContextService.schedule_region_cursor = 0
+        AircraftContextService.next_schedule_check = 0
 
     async def test_priority_precheck_only_marks_complete_airline_schedules_and_reuses_them_on_tap(self):
         now = int(time.time())
@@ -135,19 +137,35 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(AircraftContextService, "route", AsyncMock(side_effect=route)) as lookup, \
              patch.object(FlightService, "_get_cached_global_positions", AsyncMock(return_value=rows)), \
              patch.object(AircraftContextService, "trace", AsyncMock()):
-            self.assertEqual(AircraftContextService.prioritize_schedules(rows), rows)
+            self.assertEqual(await AircraftContextService.prioritize_schedules(rows), rows)
             task = AircraftContextService.schedule_task
             self.assertIsNotNone(task)
-            AircraftContextService.prioritize_schedules(rows)
+            await AircraftContextService.prioritize_schedules(rows)
             self.assertIs(task, AircraftContextService.schedule_task)
             await task
-            marked = AircraftContextService.prioritize_schedules(rows)
+            other_worker = SchedulePool(AircraftContextService.schedule_pool.directory)
+            self.assertIsNone(other_worker.claim(), "All workers share the upstream budget")
+            self.enterContext(patch.object(AircraftContextService, "schedule_pool", other_worker))
+            marked = await AircraftContextService.prioritize_schedules(rows)
             self.assertEqual([p.verified_schedule for p in marked], [None, True, None])
             self.assertIsNone(airline.verified_schedule)
-            self.assertIsNone(AircraftContextService.prioritize_schedules(
-                [airline.model_copy(update={"callsign": "AF999"})])[0].verified_schedule)
+            changed = await AircraftContextService.prioritize_schedules(
+                [airline.model_copy(update={"callsign": "AF999"})])
+            self.assertIsNone(changed[0].verified_schedule)
             self.assertEqual((await AircraftContextService.get(airline.icao24)).destination.code, "BBB")
             self.assertEqual(lookup.await_count, 2)
+
+    async def test_shared_pool_fences_old_publishers_and_expires_entries(self):
+        pool = AircraftContextService.schedule_pool
+        with patch("core.services.flight.schedule_pool.time.time", return_value=100):
+            first, _, _ = pool.claim()
+            self.assertTrue(pool.publish(first, {"old": [150, None], "kept": [300, None]}))
+        with patch("core.services.flight.schedule_pool.time.time", return_value=166):
+            second, _, _ = pool.claim()
+            self.assertIsNone(pool.publish(first, {"late": [500, None]}))
+            self.assertTrue(pool.publish(second, {}, backoff=True))
+            self.assertEqual(pool.snapshot()["entries"], {"kept": [300, None]})
+            self.assertIsNone(pool.claim())
 
     async def test_route_looks_up_scheduled_flight_number_for_icao_callsign(self):
         now = datetime.now(timezone.utc)
