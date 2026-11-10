@@ -325,16 +325,35 @@ async def resolve_aircraft_tracking_preview(
             return await AircraftContextService.nearby_route(address, positions, active=True)
 
     suggestion = asyncio.create_task(nearby()) if fast and FlightService._global_positions_cache else None
-    nearby_result = None
-    try:
+    async def exact():
         try:
             async with asyncio.timeout(4 if fast else None):
-                context = await AircraftContextService.get(address, for_tracking=True)
+                return await AircraftContextService.get(address, for_tracking=True)
         except TimeoutError:
             if not fast:
                 raise
-            context = AircraftContext(icao24=address, route_status="provider_unavailable")
-            context._preview_reasons.add("fast_preview_deadline")
+            result = AircraftContext(icao24=address, route_status="provider_unavailable")
+            result._preview_reasons.add("fast_preview_deadline")
+            return result
+
+    exact_task = asyncio.create_task(exact()) if suggestion else None
+    nearby_result = None
+    try:
+        if exact_task:
+            await asyncio.wait((exact_task, suggestion), return_when=asyncio.FIRST_COMPLETED)
+        if (exact_task and not exact_task.done() and suggestion.done()
+                and not suggestion.cancelled() and suggestion.exception() is None
+                and suggestion.result() is not None):
+            # Give a nearly-ready exact match a short lead, but don't make a
+            # ready display-only route wait for the full exact deadline.
+            done, _ = await asyncio.wait((exact_task,), timeout=0.35)
+            if done:
+                context = exact_task.result()
+            else:
+                context = AircraftContext(icao24=address, route_status="provider_unavailable")
+                context._preview_reasons.add("exact_lookup_pending")
+        else:
+            context = await exact_task if exact_task else await exact()
         if fast and context.route_status != "available":
             try:
                 nearby_result = await suggestion if suggestion else await nearby()
@@ -343,9 +362,11 @@ async def resolve_aircraft_tracking_preview(
             except Exception:
                 context._preview_reasons.add("nearby_lookup_failed")
     finally:
-        if suggestion:
-            suggestion.cancel()
-            await asyncio.gather(suggestion, return_exceptions=True)
+        tasks = [task for task in (exact_task, suggestion) if task is not None]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
     result = AircraftTrackingPreview(context=context)
     result.nearby_route = nearby_result
     match = context._resolver_match

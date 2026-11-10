@@ -315,6 +315,19 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(response.context.origin)
         persist.assert_not_called()
 
+        async def pending_exact(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        with patch.object(FlightService, "_global_positions_cache", (datetime.now(timezone.utc), planes)), \
+             patch.object(AircraftContextService, "get", AsyncMock(side_effect=pending_exact)), \
+             patch.object(AircraftContextService, "nearby_route", AsyncMock(return_value=fallback)):
+            async with asyncio.timeout(1.5):
+                quick = await fixture.flights.resolve_aircraft_tracking_preview(
+                    planes[0].icao24, Obj(), Mock(), fast=True)
+        self.assertEqual(quick.nearby_route, fallback)
+        self.assertIsNone(quick.tracking_flight)
+        self.assertIn("exact_lookup_pending", quick.context._preview_reasons)
+
     async def test_route_looks_up_scheduled_flight_number_for_icao_callsign(self):
         now = datetime.now(timezone.utc)
         aircraft = position(1, icao24="abc123", callsign="UAL957")

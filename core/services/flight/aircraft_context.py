@@ -367,7 +367,8 @@ class AircraftContextService:
 
         candidates = sorted((p for p in positions if p.icao24 != icao24 and p.callsign
                              and not p.aircraft_categories and visible_aircraft(p, int(now.timestamp()))
-                             and distance_score(p) <= math.sin(250 / (2 * 6371)) ** 2), key=distance_score)
+                             and distance_score(p) <= math.sin((500 if active else 250) / (2 * 6371)) ** 2),
+                            key=distance_score)
         for position in candidates:
             route = cls.verified_schedule(position, now, entries)
             if route and route._resolver_match and route.origin and route.destination:
@@ -401,7 +402,8 @@ class AircraftContextService:
                 return None
 
         eligible = {p.icao24: p for p in reversed(candidates)
-                    if FlightService._looks_like_route_callsign(p)}
+                    if distance_score(p) <= math.sin(350 / (2 * 6371)) ** 2
+                    and FlightService._looks_like_route_callsign(p)}
         closest = sorted(eligible.values(), key=distance_score)[:3]
         tasks = [asyncio.create_task(lookup(p)) for p in closest]
         try:
