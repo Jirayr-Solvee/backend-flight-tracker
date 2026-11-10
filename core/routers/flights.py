@@ -265,11 +265,16 @@ async def get_global_live_flight_positions(
     limit: int = Query(5000, ge=1, le=20000),
     regional: bool = Query(False),
     aircraft: bool = Query(False),
+    schedule_priority: bool = Query(False),
     user: User = Depends(get_current_user),
 ):
     # Preserve the exact legacy service call for existing clients.
     if aircraft:
-        return await FlightService.get_global_flight_positions(limit=limit, regional=regional, aircraft=True)
+        positions = await FlightService.get_global_flight_positions(limit=limit, regional=regional, aircraft=True)
+        if schedule_priority:
+            from ..services.flight.aircraft_context import AircraftContextService
+            return AircraftContextService.prioritize_schedules(positions)
+        return positions
     return await FlightService.get_global_flight_positions(limit=limit, regional=regional)
 
 

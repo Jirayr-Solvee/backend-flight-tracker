@@ -271,6 +271,76 @@ class AircraftContextService:
     pending = {}
     slots = asyncio.Semaphore(4)
     trace_backoff_until = 0.0
+    schedule_cache = OrderedDict()
+    schedule_task: asyncio.Task | None = None
+    next_schedule_batch = 0.0
+    schedule_region_cursor = 0
+
+    @staticmethod
+    def schedule_key(position, now):
+        return (position.icao24, position.callsign, now.date())
+
+    @classmethod
+    def verified_schedule(cls, position, now):
+        cached = cls.schedule_cache.get(cls.schedule_key(position, now))
+        if cached and time.monotonic() < cached[0]:
+            return cached[1]
+        return None
+
+    @classmethod
+    def prioritize_schedules(cls, positions):
+        """Warm a small, shared pool on demand without delaying globe responses."""
+        from .service import FlightService
+        now = datetime.now(timezone.utc)
+        tick = time.monotonic()
+        if positions and tick >= cls.next_schedule_batch and (cls.schedule_task is None or cls.schedule_task.done()):
+            regions = {}
+            for position in positions:
+                if (not position.callsign or position.aircraft_categories
+                        or not FlightService._looks_like_route_callsign(position)
+                        or not visible_aircraft(position, int(now.timestamp()))
+                        or (position.altitude_feet or 0) < 5000
+                        or (position.ground_speed_kt or 0) < 180):
+                    continue
+                key = cls.schedule_key(position, now)
+                if (cached := cls.schedule_cache.get(key)) and tick < cached[0]:
+                    continue
+                region = FlightService._continent_key(lat=position.lat, lon=position.lon)
+                if not FlightService._is_preferred_global_airline(position, region):
+                    continue
+                regions.setdefault(region, position)
+            candidates = [regions[key] for key in sorted(regions)]
+            if candidates:
+                start = cls.schedule_region_cursor % len(candidates)
+                batch = (candidates[start:] + candidates[:start])[:4]
+                cls.schedule_region_cursor += len(batch)
+                cls.next_schedule_batch = tick + 120
+                cls.schedule_task = asyncio.create_task(cls.precheck_schedules(batch))
+        return [
+            p.model_copy(update={"verified_schedule": True}) if cls.verified_schedule(p, now) else p
+            for p in positions
+        ]
+
+    @classmethod
+    async def precheck_schedules(cls, positions):
+        for position in positions:
+            now = datetime.now(timezone.utc)
+            if not visible_aircraft(position, int(now.timestamp())):
+                continue
+            result = AircraftContext(icao24=position.icao24)
+            await cls.route(result, position, now)
+            key = cls.schedule_key(position, now)
+            complete = result.route_status == "available" and all(
+                endpoint and endpoint.code and endpoint.scheduled_time_local
+                for endpoint in (result.origin, result.destination)
+            )
+            cls.schedule_cache[key] = (time.monotonic() + (300 if complete else 600), result if complete else None)
+            cls.schedule_cache.move_to_end(key)
+            while len(cls.schedule_cache) > 256:
+                cls.schedule_cache.popitem(last=False)
+            if result.route_status == "provider_unavailable":
+                cls.next_schedule_batch = time.monotonic() + 300
+                break
 
     @classmethod
     async def get(cls, icao24: str) -> AircraftContext:
@@ -285,8 +355,12 @@ class AircraftContextService:
             return AircraftContext(icao24=icao24)
         key = (icao24, position.callsign, now.date())
         cached = cls.cache.get(key)
+        schedule = cls.verified_schedule(position, now)
         if cached and time.monotonic() - cached[0] < 60:
             result = cached[1].model_copy(deep=True)
+            if schedule:
+                result.origin, result.destination = schedule.origin, schedule.destination
+                result.route_status = schedule.route_status
             if result.trail_source != "adsbexchange":
                 samples = ObservedAircraftTrails.segments(icao24, position.callsign, int(now.timestamp()))
                 if samples:
@@ -299,7 +373,13 @@ class AircraftContextService:
                 try:
                     async with cls.slots:
                         result = AircraftContext(icao24=icao24)
-                        await asyncio.gather(cls.trace(result, now), cls.route(result, position, now))
+                        schedule = cls.verified_schedule(position, now)
+                        if schedule:
+                            result.origin, result.destination = schedule.origin, schedule.destination
+                            result.route_status = schedule.route_status
+                            await cls.trace(result, now)
+                        else:
+                            await asyncio.gather(cls.trace(result, now), cls.route(result, position, now))
                         if not result.segments:
                             result.segments = ObservedAircraftTrails.segments(icao24, position.callsign, int(now.timestamp()))
                             if result.segments:

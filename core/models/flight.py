@@ -228,6 +228,7 @@ class GlobalFlightPositionRead(SQLModel):
     aircraft_description: str | None = None
     aircraft_categories: list[str] = Field(default_factory=list)
     position_source: str | None = None
+    verified_schedule: bool | None = None
 
 
 class GlobalFlightResolveCandidate(SQLModel):

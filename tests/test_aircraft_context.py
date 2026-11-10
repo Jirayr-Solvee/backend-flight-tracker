@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 from tests.test_regional_traffic import fixture, position
-from core.services.flight.aircraft_context import AircraftContext, AircraftContextService, ObservedAircraftTrails, SelectedAircraftPositions, parse_trace, matched_route
+from core.services.flight.aircraft_context import AircraftContext, AircraftContextService, AircraftRouteEndpoint, ObservedAircraftTrails, SelectedAircraftPositions, parse_trace, matched_route
 from core.services.flight.api_client import ADSBExchangeClient
 from core.services.flight import FlightService
 
@@ -114,6 +114,40 @@ class AircraftContextAsyncTests(unittest.IsolatedAsyncioTestCase):
         AircraftContextService.pending.clear()
         AircraftContextService.slots = asyncio.Semaphore(4)
         AircraftContextService.trace_backoff_until = 0
+        AircraftContextService.schedule_cache.clear()
+        AircraftContextService.schedule_task = None
+        AircraftContextService.next_schedule_batch = 0
+        AircraftContextService.schedule_region_cursor = 0
+
+    async def test_priority_precheck_only_marks_complete_airline_schedules_and_reuses_them_on_tap(self):
+        now = int(time.time())
+        airline = position(1, lat=48, lon=4, callsign="AF101", time_position=now)
+        partial = position(2, lat=40, lon=-80, callsign="AA102", time_position=now)
+        special = position(3, lat=48, lon=4, callsign="AF103", time_position=now, aircraft_categories=["military"])
+        rows = [special, airline, partial]
+
+        async def route(result, aircraft, now):
+            result.route_status = "available"
+            result.origin = AircraftRouteEndpoint(code="AAA", scheduled_time_local="2026-11-10 10:00+00:00")
+            result.destination = AircraftRouteEndpoint(code="BBB", scheduled_time_local=(
+                "2026-11-10 13:00+00:00" if aircraft == airline else None))
+
+        with patch.object(AircraftContextService, "route", AsyncMock(side_effect=route)) as lookup, \
+             patch.object(FlightService, "_get_cached_global_positions", AsyncMock(return_value=rows)), \
+             patch.object(AircraftContextService, "trace", AsyncMock()):
+            self.assertEqual(AircraftContextService.prioritize_schedules(rows), rows)
+            task = AircraftContextService.schedule_task
+            self.assertIsNotNone(task)
+            AircraftContextService.prioritize_schedules(rows)
+            self.assertIs(task, AircraftContextService.schedule_task)
+            await task
+            marked = AircraftContextService.prioritize_schedules(rows)
+            self.assertEqual([p.verified_schedule for p in marked], [None, True, None])
+            self.assertIsNone(airline.verified_schedule)
+            self.assertIsNone(AircraftContextService.prioritize_schedules(
+                [airline.model_copy(update={"callsign": "AF999"})])[0].verified_schedule)
+            self.assertEqual((await AircraftContextService.get(airline.icao24)).destination.code, "BBB")
+            self.assertEqual(lookup.await_count, 2)
 
     async def test_route_looks_up_scheduled_flight_number_for_icao_callsign(self):
         now = datetime.now(timezone.utc)
