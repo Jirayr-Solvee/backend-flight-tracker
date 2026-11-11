@@ -39,7 +39,7 @@ PRIVACY_POLICY_HTML = """<!doctype html>
 <body>
   <main>
     <h1>Sofly Privacy Policy</h1>
-    <p>Effective date: October 15, 2026</p>
+    <p>Effective date: November 12, 2026</p>
 
     <p>
       Sofly: Track Flight Status helps people search, save, and track flight
@@ -61,6 +61,16 @@ PRIVACY_POLICY_HTML = """<!doctype html>
       status and transaction information from Apple. We use analytics and
       advertising attribution information from partners such as AppsFlyer and
       Meta to understand app usage and measure campaign performance.
+    </p>
+
+    <h2>Voice search</h2>
+    <p>
+      If you choose voice search, Sofly uses your microphone and Apple's
+      Speech Recognition service to convert your speech to text. Apple may
+      process audio off-device. Sofly uses the resulting text as a flight
+      search query, subject to the search and diagnostics practices described
+      in this policy. You can search by typing instead. For more information,
+      see <a href="https://www.apple.com/legal/privacy/data/en/ask-siri-dictation/">Apple's Speech Recognition privacy information</a>.
     </p>
 
     <h2>AI flight search</h2>
